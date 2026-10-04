@@ -16,6 +16,7 @@ packages/server/src/
   api/                  M1b  http.ts (REST + static client), ws.ts (protocol), auth.ts (password + session cookie)
   agents/               M1c  claude/ (real runtime on the Agent SDK; the listener on the Messages API with an API key, else an SDK session), fake/ (scripted runtime), shared prompts
   claudeauth/           M1e  ClaudeAuthService: web sign-in of the Claude CLI (see docs/CLAUDE-SIGNIN.md)
+  debug/                     TraceRecorder (JSONL debug trace) and the .tar.gz debug export (see docs/DEPLOY.md)
   main.ts               M2   composition root
 packages/client/        M1d  React + Vite SPA
 e2e/                    M2   Playwright tests against the server with QUORUM_RUNTIME=fake
@@ -124,6 +125,19 @@ Two implementations of `AgentRuntime`:
   merge driver and digest writer as in the PRD. Usage from result messages -> `recordUsage`.
   Read `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` for exact option names; do not guess.
 
+### debug
+
+`tracer.ts` is the debug trace: `Tracer.record(kind, data)` appends `{"t","kind",...}` lines, buffered, to rotating
+files under `<data>/debug/traces` (credential-named keys are redacted, strings over 64 KB cut). `main.ts` creates one
+and hands it to the logger (every line, debug included), `RoomService` (`room.event` per broadcast, `runtime.call`/
+`done`/`failed`), `api/http.ts` (`http` per API request, `client.log` from `POST /api/debug/client-log`) and
+`api/ws.ts` (`ws.connect`, `ws.command` with duration and error, `ws.bad_command`, `ws.disconnect`). The Claude runtime
+wraps its `query` and listener client (`agents/claude/trace.ts`): `sdk.query.start` (options without env or callbacks,
+prompt), `sdk.input`, `sdk.message` (partial stream events only counted), `sdk.query.end`, and `listener.request`/
+`response`/`error`. The client (`packages/client/src/debug.ts`) batches its errors, console warnings, socket lifecycle,
+failed requests and navigation to the client-log route. `export.ts` streams the admin-only `GET /api/debug/export`
+archive (a small ustar writer in `tar.ts`, gzip from `node:zlib`).
+
 ### client (M1d)
 
 Vite dev proxy `/api` and `/ws` to the server. Screens: Login, Rooms, Room. Room = chat pane (left) +
@@ -211,6 +225,8 @@ finished after 28 s exits anyway (compose's `stop_grace_period` is 30 s).
 | `QUORUM_<NAME>_MS` ...                         | `packages/shared/src/config.ts` | Any `DEFAULTS` key, upper-snake-cased: `QUORUM_DIGEST_ABSENCE_MS`, `QUORUM_REVIEW_WINDOW_MS`, `QUORUM_LISTENER_DEBOUNCE_MS`, ...                      |
 | `QUORUM_FAKE_EXPLORE_MS`                       | `500`                           | Fake runtime only: how long an exploration takes.                                                                                                     |
 | `QUORUM_DEBUG`                                 | unset                           | `1` enables debug logging.                                                                                                                            |
+| `QUORUM_TRACE`                                 | on                              | `0` turns off the debug trace in `<data>/debug/traces` (see `debug/`).                                                                                |
+| `QUORUM_TRACE_MAX_MB`                          | `500`                           | Space all trace files may take before the oldest are deleted.                                                                                         |
 
 The budget is a cap per Agent SDK session: the orchestrator (one long-lived session per room), and each exploration
 worker, merge run, semantic revert and digest writer, gets its own, so a room's worst case is their sum. The listener's

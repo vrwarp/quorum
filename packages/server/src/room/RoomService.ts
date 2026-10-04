@@ -1,3 +1,4 @@
+import { noopTracer, type Tracer } from '../debug/tracer.js';
 import {
   DEFAULTS,
   newId,
@@ -47,6 +48,8 @@ export interface RoomServiceOptions {
   now?: () => Date;
   /** how long a room may sit without a connected participant before its agent session is stopped (default 15 min) */
   idleStopMs?: number;
+  /** debug trace: every broadcast event and runtime call is recorded */
+  trace?: Tracer;
 }
 
 interface Connection {
@@ -66,6 +69,7 @@ export class RoomService implements RoomActions, Hub {
   private readonly git: GitProvider;
   private readonly tunables: ResolvedTunables;
   private readonly log: Logger;
+  private readonly trace: Tracer;
   private readonly clock: () => Date;
   private runtime: AgentRuntime | null = null;
 
@@ -96,6 +100,7 @@ export class RoomService implements RoomActions, Hub {
     this.git = opts.git;
     this.tunables = { ...DEFAULTS, ...(opts.tunables ?? {}) } as ResolvedTunables;
     this.log = opts.logger ?? (() => undefined);
+    this.trace = opts.trace ?? noopTracer;
     this.clock = opts.now ?? (() => new Date());
     this.idleStopMs = opts.idleStopMs ?? DEFAULT_IDLE_STOP_MS;
   }
@@ -208,16 +213,27 @@ export class RoomService implements RoomActions, Hub {
   }
 
   /** Call into the runtime; never throws (sync throws and rejections are logged). */
-  private rt(name: string, fn: (r: AgentRuntime) => unknown): void {
+  private rt(name: string, roomId: RoomId, fn: (r: AgentRuntime) => unknown): void {
     const r = this.runtime;
     if (!r) return;
+    this.trace.record('runtime.call', { name, roomId });
+    const started = Date.now();
     try {
       const out = fn(r);
       if (out && typeof (out as Promise<unknown>).then === 'function') {
-        (out as Promise<unknown>).catch((err) =>
-          this.log('error', `runtime.${name} failed`, {
-            err: String((err as Error)?.message ?? err),
-          }),
+        (out as Promise<unknown>).then(
+          () => this.trace.record('runtime.done', { name, roomId, ms: Date.now() - started }),
+          (err) => {
+            this.trace.record('runtime.failed', {
+              name,
+              roomId,
+              ms: Date.now() - started,
+              error: err,
+            });
+            this.log('error', `runtime.${name} failed`, {
+              err: String((err as Error)?.message ?? err),
+            });
+          },
         );
       }
     } catch (err) {
@@ -260,6 +276,13 @@ export class RoomService implements RoomActions, Hub {
   }
 
   private broadcast(roomId: RoomId, ev: ServerEvent, privateTo?: UserId | null): void {
+    this.trace.record('room.event', {
+      roomId,
+      type: ev.type,
+      ...(privateTo ? { privateTo } : {}),
+      receivers: this.conns.get(roomId)?.size ?? 0,
+      event: ev,
+    });
     const conns = this.conns.get(roomId);
     if (!conns) return;
     for (const c of conns.values()) {
@@ -427,7 +450,7 @@ export class RoomService implements RoomActions, Hub {
     this.cancelIdleStop(roomId);
     for (const p of this.storage.proposals.list(roomId, { states: ['open'] }))
       this.clearWindow(p.id);
-    this.rt('stopRoom', (r) => r.stopRoom(roomId));
+    this.rt('stopRoom', roomId, (r) => r.stopRoom(roomId));
   }
 
   private actorName(userId: UserId): string {
@@ -628,7 +651,7 @@ export class RoomService implements RoomActions, Hub {
       this.evaluateAll(roomId);
       this.track(this.maybeDigest(roomId, userId, lastSeen));
     }
-    if (roomWasEmpty) this.rt('startRoom', (r) => r.startRoom(roomId));
+    if (roomWasEmpty) this.rt('startRoom', roomId, (r) => r.startRoom(roomId));
     return disconnect;
   }
 
@@ -642,7 +665,7 @@ export class RoomService implements RoomActions, Hub {
       // a merge in flight is still using the room: look again later
       if (this.storage.proposals.list(roomId, { states: ['merging'] }).length > 0)
         return this.scheduleIdleStop(roomId);
-      this.rt('stopRoom', (r) => r.stopRoom(roomId));
+      this.rt('stopRoom', roomId, (r) => r.stopRoom(roomId));
     }, this.idleStopMs);
     timer.unref?.();
     this.idleTimers.set(roomId, timer);
@@ -767,7 +790,7 @@ export class RoomService implements RoomActions, Hub {
       kind: 'text',
       body,
     });
-    this.rt('onChatMessage', (r) => r.onChatMessage(roomId, message));
+    this.rt('onChatMessage', roomId, (r) => r.onChatMessage(roomId, message));
   }
 
   private createSuggestion(
@@ -792,7 +815,7 @@ export class RoomService implements RoomActions, Hub {
         note: note ?? null,
       },
     });
-    this.rt('onSuggestion', (r) => r.onSuggestion(roomId, message));
+    this.rt('onSuggestion', roomId, (r) => r.onSuggestion(roomId, message));
   }
 
   private createAsk(roomId: RoomId, userId: UserId, anchor: Anchor, question: string): void {
@@ -805,7 +828,7 @@ export class RoomService implements RoomActions, Hub {
       anchor,
       card: { type: 'ask', anchor, question },
     });
-    this.rt('onAsk', (r) => r.onAsk(roomId, message));
+    this.rt('onAsk', roomId, (r) => r.onAsk(roomId, message));
   }
 
   async postChat(
@@ -974,7 +997,7 @@ export class RoomService implements RoomActions, Hub {
       documentId: change.documentId,
       headSha: revertSha,
     });
-    this.rt('onReverted', (r) => r.onReverted(roomId, change, revertSha, userId));
+    this.rt('onReverted', roomId, (r) => r.onReverted(roomId, change, revertSha, userId));
     return revertChange;
   }
 
@@ -1352,7 +1375,7 @@ export class RoomService implements RoomActions, Hub {
         roomId,
         `Merging "${p.title}" failed: ${reason}. The proposal stays open; vote again to try once more.`,
       );
-      this.rt('onProposalEvent', (r) =>
+      this.rt('onProposalEvent', roomId, (r) =>
         r.onProposalEvent(roomId, { type: 'merge_failed', proposal: reopened, reason }),
       );
       throw err;
@@ -1441,7 +1464,7 @@ export class RoomService implements RoomActions, Hub {
       headSha: result.sha,
     });
     this.publishProposal(p.id);
-    this.rt('onProposalEvent', (r) =>
+    this.rt('onProposalEvent', roomId, (r) =>
       r.onProposalEvent(roomId, {
         type: 'merged',
         proposal: merged,
@@ -1565,7 +1588,7 @@ export class RoomService implements RoomActions, Hub {
       `Proposal "${p.title}" ${verb}${opts.note ? `: ${opts.note}` : '.'} It is archived.`,
     );
     if (reason === 'rejected') {
-      this.rt('onProposalEvent', (r) =>
+      this.rt('onProposalEvent', p.roomId, (r) =>
         r.onProposalEvent(p.roomId, {
           type: 'rejected',
           proposal: closed,
@@ -1573,7 +1596,7 @@ export class RoomService implements RoomActions, Hub {
         }),
       );
     } else {
-      this.rt('onProposalEvent', (r) =>
+      this.rt('onProposalEvent', p.roomId, (r) =>
         r.onProposalEvent(p.roomId, { type: reason, proposal: closed }),
       );
     }

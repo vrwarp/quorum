@@ -29,6 +29,11 @@ export interface ServerConfig {
   allowedOrigins: string[];
   tunables: TunableOverrides;
   clientDistDir: string;
+  /**
+   * Debug trace under `<dataDir>/debug/traces` (`QUORUM_TRACE=0` turns it off) and the space all trace files may take
+   * together before the oldest are deleted (`QUORUM_TRACE_MAX_MB`, default 500).
+   */
+  trace: { enabled: boolean; maxTotalBytes: number };
   /** Things worth telling the operator at startup (deprecated settings in use); main.ts logs each as a warning. */
   warnings: string[];
 }
@@ -146,6 +151,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     if (raw !== undefined && raw !== '') overrides[key] = parseNumber(name, raw);
   }
 
+  const traceFlag = (env.QUORUM_TRACE ?? '').trim().toLowerCase();
+  const trace = {
+    enabled: !['0', 'false', 'off', 'no'].includes(traceFlag),
+    maxTotalBytes:
+      (env.QUORUM_TRACE_MAX_MB
+        ? parseNumber('QUORUM_TRACE_MAX_MB', env.QUORUM_TRACE_MAX_MB)
+        : 500) *
+      1024 *
+      1024,
+  };
+
   const clientDistDir = env.QUORUM_CLIENT_DIST
     ? path.resolve(env.QUORUM_CLIENT_DIST)
     : fileURLToPath(new URL('../../client/dist', import.meta.url));
@@ -164,6 +180,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedOrigins,
     tunables: overrides as TunableOverrides,
     clientDistDir,
+    trace,
     warnings,
   };
 }

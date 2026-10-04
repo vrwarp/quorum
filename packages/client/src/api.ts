@@ -6,6 +6,7 @@ import type {
   Room,
   RoomState,
 } from '@quorum/shared';
+import { clientLog } from './debug';
 
 export class ApiError extends Error {
   constructor(
@@ -30,6 +31,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       /* ignore non-JSON error bodies */
     }
+    // 401 is how a logged-out page finds out; it is not worth a trace line
+    if (res.status !== 401)
+      clientLog('warn', 'request failed', {
+        method: init.method ?? 'GET',
+        path,
+        status: res.status,
+        msg,
+      });
     throw new ApiError(res.status, msg);
   }
   const text = await res.text();
@@ -101,6 +110,24 @@ export const claudeLoginCode = (loginId: string, code: string) =>
 export const claudeLoginCancel = (loginId: string) =>
   post<{ ok: true }>('/api/claude/login/cancel', { loginId });
 export const claudeLogout = () => post<ClaudeStatus>('/api/claude/logout');
+
+export interface DebugStatus {
+  tracing: boolean;
+  exportAvailable: boolean;
+  traceFiles: number;
+  traceBytes: number;
+  oldestTrace: string | null;
+}
+
+export const debugStatus = () => request<DebugStatus>('/api/debug/status');
+/** Address of the compressed debug export (admin only); a plain link downloads it. */
+export function debugExportUrl(opts: { sinceHours?: number; repos?: boolean } = {}): string {
+  const q = new URLSearchParams();
+  if (opts.sinceHours) q.set('sinceHours', String(opts.sinceHours));
+  if (opts.repos === false) q.set('repos', '0');
+  const qs = q.toString();
+  return `/api/debug/export${qs ? `?${qs}` : ''}`;
+}
 
 /** Value of `name` in the query string or fragment of a pasted address, percent-decoded; null when absent or empty. */
 function addressParam(text: string, name: string): string | null {

@@ -201,3 +201,35 @@ test('a sign-in left half done is cancelled: by Cancel, and by leaving the scree
   await expect(admin.page.getByTestId('room-create-name')).toBeVisible();
   await expect.poll(() => calls.cancels).toEqual(['login_1', 'login_2']);
 });
+
+test('Diagnostics: the admin downloads a compressed debug export; nobody else sees the card', async ({
+  app,
+}) => {
+  const admin = await app.login(ADMIN);
+  await admin.page.goto('/settings');
+  await expect(admin.page.getByTestId('debug-status')).toContainText('Tracing on', {
+    timeout: 30_000,
+  });
+  await admin.page.getByTestId('debug-window').selectOption({ label: 'Last 24 hours' });
+  await admin.page.getByTestId('debug-repos').uncheck();
+  await expect(admin.page.getByTestId('debug-export')).toHaveAttribute(
+    'href',
+    '/api/debug/export?sinceHours=24&repos=0',
+  );
+  const download = admin.page.waitForEvent('download');
+  await admin.page.getByTestId('debug-export').click();
+  const file = await download;
+  expect(file.suggestedFilename()).toMatch(/^quorum-debug-.*\.tar\.gz$/);
+  const stream = await file.createReadStream();
+  const head: Buffer = await new Promise((resolve, reject) => {
+    stream.once('data', (c) => resolve(c as Buffer));
+    stream.once('error', reject);
+  });
+  expect([head[0], head[1]]).toEqual([0x1f, 0x8b]); // gzip magic
+  stream.destroy();
+
+  const dave = await app.login('Dave');
+  await dave.page.goto('/settings');
+  await expect(dave.page.getByTestId('claude-admin-note')).toBeVisible();
+  await expect(dave.page.getByTestId('debug-export')).toHaveCount(0);
+});

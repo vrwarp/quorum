@@ -9,12 +9,17 @@ import { RoomService } from './room/index.js';
 import { createAgentRuntime } from './agents/index.js';
 import { ClaudeAuthService } from './claudeauth/index.js';
 import { createHttpServer, attachWebSocket } from './api/index.js';
+import { TraceRecorder, noopTracer, type Tracer } from './debug/index.js';
+
+/** The trace of the running server; the logger copies every line (debug ones included) into it. */
+let activeTracer: Tracer = noopTracer;
 
 export function logger(
   level: 'debug' | 'info' | 'warn' | 'error',
   msg: string,
   meta?: Record<string, unknown>,
 ) {
+  activeTracer.record('log', { level, msg, ...(meta ? { meta } : {}) });
   if (level === 'debug' && !process.env.QUORUM_DEBUG) return;
   const line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`;
   if (level === 'error' || level === 'warn') console.error(line);
@@ -33,10 +38,29 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
   const config = loadConfig(env);
   for (const warning of config.warnings) logger('warn', warning);
   mkdirSync(config.dataDir, { recursive: true });
-  const storage = openStorage(path.join(config.dataDir, 'quorum.sqlite'));
+  const tracer = config.trace.enabled
+    ? new TraceRecorder({
+        dir: path.join(config.dataDir, 'debug', 'traces'),
+        maxTotalBytes: config.trace.maxTotalBytes,
+      })
+    : null;
+  const trace: Tracer = tracer ?? noopTracer;
+  activeTracer = trace;
+  // the last lines before a crash are the ones that matter most: write them out whatever ends the process
+  const flushTrace = () => tracer?.flush();
+  process.on('exit', flushTrace);
+  trace.record('server.start', {
+    pid: process.pid,
+    node: process.version,
+    runtime: config.runtime,
+    port: config.port,
+    tunables: config.tunables,
+  });
+  const databasePath = path.join(config.dataDir, 'quorum.sqlite');
+  const storage = openStorage(databasePath);
   const git = createGitProvider(config.dataDir, { logger });
   const claudeAuth = new ClaudeAuthService({ config, logger });
-  const service = new RoomService({ storage, git, tunables: config.tunables, logger });
+  const service = new RoomService({ storage, git, tunables: config.tunables, logger, trace });
   const runtime = createAgentRuntime(config.runtime, service, {
     dataDir: config.dataDir,
     tunables: config.tunables,
@@ -51,16 +75,26 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     claudeEnv: () => claudeAuth.env(),
     claudeAvailable: async () => (await claudeAuth.status()).signedIn,
     onCredentialsChanged: (listener) => claudeAuth.onChange(listener),
+    trace: tracer ?? undefined,
   });
   service.setRuntime(runtime);
   await service.start();
 
-  const server = createHttpServer({ service, storage, config, logger, claudeAuth });
+  const server = createHttpServer({
+    service,
+    storage,
+    config,
+    logger,
+    claudeAuth,
+    trace,
+    debugExport: { config, traces: tracer, databasePath },
+  });
   const sockets = attachWebSocket(server, {
     service,
     storage,
     logger,
     allowedOrigins: config.allowedOrigins,
+    trace,
   });
 
   await new Promise<void>((resolve) => server.listen(config.port, resolve));
@@ -85,6 +119,10 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
         server.closeAllConnections();
       });
       storage.close();
+      trace.record('server.stop', {});
+      tracer?.close();
+      process.off('exit', flushTrace);
+      if (activeTracer === trace) activeTracer = noopTracer;
       process.off('SIGINT', shutdown);
       process.off('SIGTERM', shutdown);
     })());

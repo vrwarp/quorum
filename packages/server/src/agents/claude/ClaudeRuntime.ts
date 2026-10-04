@@ -33,6 +33,7 @@ import { Orchestrator } from './orchestrator.js';
 import { createSdkListenerClient } from './sdkListener.js';
 import type { ClaudeProcessConfig, QueryFn, SandboxMode } from './sdk.js';
 import { tryApplySuggestion, type SuggestionOutcome } from './suggestions.js';
+import { tracedListenerClient, tracedQueryFn, type TraceSink } from './trace.js';
 import type { ExplorationRequest } from './tools.js';
 import {
   runMergeDriver,
@@ -71,6 +72,8 @@ export interface ClaudeRuntimeOptions extends AgentRuntimeOptions {
   claudeAvailable?: () => Promise<boolean>;
   /** Subscribe to sign-in / sign-out. The runtime calls its listener with no arguments; a returned function unsubscribes. */
   onCredentialsChanged?: (listener: () => void) => void | (() => unknown);
+  /** Debug trace: every Agent SDK session and listener request is recorded here (see debug/tracer.ts). */
+  trace?: TraceSink;
 }
 
 export interface ClaudeRuntimeDeps {
@@ -164,7 +167,9 @@ export class ClaudeRuntime implements AgentRuntime {
   ) {
     this.log = options.logger ?? noopLogger;
     this.tunables = resolveTunables(options);
-    this.queryFn = deps.queryFn ?? query;
+    this.queryFn = options.trace
+      ? tracedQueryFn(deps.queryFn ?? query, options.trace)
+      : (deps.queryFn ?? query);
     const claudeEnv = options.claudeEnv;
     this.idleAfterMs = options.idleAfterMs ?? DEFAULT_IDLE_AFTER_MS;
     this.claude = {
@@ -456,7 +461,9 @@ export class ClaudeRuntime implements AgentRuntime {
     const listener = new Listener({
       roomId,
       actions: this.actions,
-      client: this.client(),
+      client: this.options.trace
+        ? tracedListenerClient(this.client(), this.options.trace, roomId)
+        : this.client(),
       tunables: this.options.tunables,
       logger: this.log,
       onIntents: (batch) => this.forwardIntents(roomId, orchestrator, ops, batch),
