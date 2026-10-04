@@ -62,9 +62,14 @@ export interface DocumentContent {
   sha: string;
   content: string;
 }
+export interface RoleUsage {
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+}
 export interface UsageResponse {
   totalCostUsd: number;
-  byRole: Record<string, number>;
+  byRole: Record<string, RoleUsage>;
 }
 
 export const login = (req: LoginRequest) => post<LoginResponse>('/api/login', req);
