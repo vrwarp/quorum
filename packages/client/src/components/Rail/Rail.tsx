@@ -40,7 +40,11 @@ export function Rail(props: {
           </h3>
           {list.length === 0 && <p className="muted small-text">None</p>}
           {list.map((p) => (
-            <div key={p.id} className={`rail-item state-${p.state}`} data-testid={`rail-proposal-${p.id}`}>
+            <div
+              key={p.id}
+              className={`rail-item state-${p.state}`}
+              data-testid={`rail-proposal-${p.id}`}
+            >
               <div className="rail-item-head">
                 <span className="pill">{p.kind}</span>
                 <span className={`pill state-${p.state}`}>{p.state}</span>
@@ -60,7 +64,9 @@ export function Rail(props: {
                     >
                       {o.label}: <code>{o.branch}</code>
                     </button>
-                    {props.activeOptionId === o.id && <ProposalDiffButton proposal={p} option={o} label="diff vs main" />}
+                    {props.activeOptionId === o.id && (
+                      <ProposalDiffButton proposal={p} option={o} label="diff vs main" />
+                    )}
                   </li>
                 ))}
               </ul>

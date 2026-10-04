@@ -1,6 +1,10 @@
 import type { ClientCommand, RoomId, ServerEvent, UserId } from '@quorum/shared';
 
-export type Logger = (level: 'debug' | 'info' | 'warn' | 'error', msg: string, meta?: Record<string, unknown>) => void;
+export type Logger = (
+  level: 'debug' | 'info' | 'warn' | 'error',
+  msg: string,
+  meta?: Record<string, unknown>,
+) => void;
 
 export type RoomErrorCode = 'not_found' | 'forbidden' | 'invalid' | 'conflict' | 'internal';
 

@@ -9,7 +9,10 @@ import { createGitProvider } from './index.js';
 let root: string;
 let repo: RoomRepository;
 
-const user: CommitMeta = { actor: { kind: 'user', userId: 'user_1', displayName: 'Ann' }, triggerMessageIds: [] };
+const user: CommitMeta = {
+  actor: { kind: 'user', userId: 'user_1', displayName: 'Ann' },
+  triggerMessageIds: [],
+};
 const agent: CommitMeta = {
   actor: { kind: 'agent', role: 'orchestrator' },
   triggerMessageIds: ['msg_1', 'msg_2'],
@@ -17,8 +20,12 @@ const agent: CommitMeta = {
 };
 
 const sh = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' });
-const main = (r: RoomRepository, files: Record<string, string | null>, subject: string, meta: CommitMeta = agent) =>
-  r.withMainLock(() => r.commitToMain(files, subject, meta));
+const main = (
+  r: RoomRepository,
+  files: Record<string, string | null>,
+  subject: string,
+  meta: CommitMeta = agent,
+) => r.withMainLock(() => r.commitToMain(files, subject, meta));
 
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'quorum-git-'));
@@ -36,7 +43,9 @@ describe('init', () => {
     expect(head).toMatch(/^[0-9a-f]{40}$/);
     expect(sh(repo.bareDir, 'config', 'user.email').trim()).toBe('quorum@localhost');
     expect(sh(repo.bareDir, 'config', 'core.hooksPath').trim()).toMatch(/hooks$/);
-    expect(existsSync(join(sh(repo.bareDir, 'config', 'core.hooksPath').trim(), 'pre-commit'))).toBe(true);
+    expect(
+      existsSync(join(sh(repo.bareDir, 'config', 'core.hooksPath').trim(), 'pre-commit')),
+    ).toBe(true);
 
     await repo.init();
     // a fresh provider on the same directory finds the existing repo
@@ -55,7 +64,13 @@ describe('commitToMain and trailers', () => {
   it('commits and round-trips trailers through show/log', async () => {
     const sha = await main(repo, { 'A.md': '# A\n\nhello\n' }, 'Add A', agent);
     const c = await repo.show(sha);
-    expect(c).toMatchObject({ sha, subject: 'Add A', body: '', authorName: 'Quorum', files: ['A.md'] });
+    expect(c).toMatchObject({
+      sha,
+      subject: 'Add A',
+      body: '',
+      authorName: 'Quorum',
+      files: ['A.md'],
+    });
     expect(c.trailers).toEqual({
       actor: 'agent:orchestrator',
       triggerMessageIds: ['msg_1', 'msg_2'],
@@ -105,7 +120,8 @@ describe('commitToMain and trailers', () => {
 
 describe('formatter', () => {
   it('normalizes markdown with prettier (preserve wrap) in commitToMain', async () => {
-    const raw = '# T\n\nSome *emphasis* here\nsecond line stays on its own line   \n\n\n\n* item   \n';
+    const raw =
+      '# T\n\nSome *emphasis* here\nsecond line stays on its own line   \n\n\n\n* item   \n';
     await main(repo, { 'F.md': raw }, 'Add F');
     const stored = (await repo.readFile('F.md'))!;
     expect(stored).toContain('_emphasis_');
@@ -116,7 +132,9 @@ describe('formatter', () => {
   });
 
   it('uses a custom formatter when provided', async () => {
-    const r = await createGitProvider(root, { formatter: (m) => m.toUpperCase() }).open('room_custom');
+    const r = await createGitProvider(root, { formatter: (m) => m.toUpperCase() }).open(
+      'room_custom',
+    );
     await main(r, { 'U.md': 'abc\n', 'data.txt': 'abc\n' }, 'Add');
     expect(await r.readFile('U.md')).toBe('ABC\n');
     expect(await r.readFile('data.txt')).toBe('abc\n');
@@ -153,7 +171,12 @@ describe('branches and merging', () => {
     expect(await repo.mergeBase('main', 'a/topic/x')).toBe(base);
 
     const out = await repo.withMainLock(() => repo.beginMerge('a/topic/x'));
-    expect(out).toEqual({ status: 'fast-forward', newMainSha: head, worktreePath: null, conflictedFiles: [] });
+    expect(out).toEqual({
+      status: 'fast-forward',
+      newMainSha: head,
+      worktreePath: null,
+      conflictedFiles: [],
+    });
     expect(await repo.headSha('main')).toBe(head);
     expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\none\n\ntwo\n');
 
@@ -169,7 +192,12 @@ describe('branches and merging', () => {
     const { worktreePath } = await repo.createBranch('a/t/x');
     writeFileSync(join(worktreePath, 'A.md'), '# A\n\nONE\n\ntwo\n\nthree\n');
     await repo.commitWorktree(worktreePath, 'Branch edit', agent);
-    const mainHead = await main(repo, { 'A.md': '# A\n\none\n\ntwo\n\nTHREE\n' }, 'Main edit', user);
+    const mainHead = await main(
+      repo,
+      { 'A.md': '# A\n\none\n\ntwo\n\nTHREE\n' },
+      'Main edit',
+      user,
+    );
 
     const out = await repo.withMainLock(() => repo.beginMerge('a/t/x'));
     expect(out.status).toBe('clean');
@@ -178,11 +206,15 @@ describe('branches and merging', () => {
     expect(out.worktreePath).toMatch(/worktrees\/merge-a__t__x-/);
     expect(await repo.headSha('main')).toBe(mainHead); // main untouched until finish
 
-    const sha = await repo.withMainLock(() => repo.finishMerge(out.worktreePath!, 'Merge x', agent));
+    const sha = await repo.withMainLock(() =>
+      repo.finishMerge(out.worktreePath!, 'Merge x', agent),
+    );
     expect(await repo.headSha('main')).toBe(sha);
     expect(existsSync(out.worktreePath!)).toBe(false);
     expect(await repo.readFile('A.md')).toBe('# A\n\nONE\n\ntwo\n\nTHREE\n');
-    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nONE\n\ntwo\n\nTHREE\n');
+    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe(
+      '# A\n\nONE\n\ntwo\n\nTHREE\n',
+    );
     const c = await repo.show(sha);
     expect(c.trailers.actor).toBe('agent:orchestrator');
     expect(c.files).toEqual(['A.md']);
@@ -293,8 +325,18 @@ describe('revert', () => {
 describe('history queries', () => {
   it('logLines, blame, diff, rewrittenLineCount, tag', async () => {
     const c1 = await main(repo, { 'A.md': '# A\n\nalpha\n\nbeta\n\ngamma\n' }, 'Add A', agent);
-    const c2 = await main(repo, { 'A.md': '# A\n\nalpha\n\nBETA\n\ngamma\n\ndelta\n' }, 'Edit beta', user);
-    const c3 = await main(repo, { 'A.md': '# A\n\nalpha\n\nBETA\n\ngamma\n\ndelta\n\nepsilon\n' }, 'Add epsilon', agent);
+    const c2 = await main(
+      repo,
+      { 'A.md': '# A\n\nalpha\n\nBETA\n\ngamma\n\ndelta\n' },
+      'Edit beta',
+      user,
+    );
+    const c3 = await main(
+      repo,
+      { 'A.md': '# A\n\nalpha\n\nBETA\n\ngamma\n\ndelta\n\nepsilon\n' },
+      'Add epsilon',
+      agent,
+    );
 
     const betaHistory = await repo.logLines('A.md', 5, 5);
     expect(betaHistory.map((c) => c.sha)).toEqual([c2, c1]);
@@ -316,7 +358,9 @@ describe('history queries', () => {
     expect(await repo.changedFiles(c1, c3)).toEqual(['A.md']);
 
     await repo.tag('milestone/1', 'First milestone', c2);
-    expect(sh(repo.bareDir, 'tag', '-l', '--format=%(objecttype) %(refname:short)')).toContain('tag milestone/1');
+    expect(sh(repo.bareDir, 'tag', '-l', '--format=%(objecttype) %(refname:short)')).toContain(
+      'tag milestone/1',
+    );
     expect(await repo.headSha('milestone/1')).toBe(c2);
   });
 });

@@ -67,7 +67,9 @@ export function Canvas(props: {
         setLoaded({ key, content: r.content });
         setError(null);
       })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : 'Failed to load document'));
+      .catch(
+        (e) => !cancelled && setError(e instanceof Error ? e.message : 'Failed to load document'),
+      );
     return () => {
       cancelled = true;
     };
@@ -83,7 +85,13 @@ export function Canvas(props: {
     if (!doc || viewingBranch) return set;
     for (const m of state.messages) {
       const c = m.card;
-      if (c && c.type === 'suggestion' && c.status === 'pending' && c.anchor.documentId === doc.id && c.anchor.baseSha === doc.headSha) {
+      if (
+        c &&
+        c.type === 'suggestion' &&
+        c.status === 'pending' &&
+        c.anchor.documentId === doc.id &&
+        c.anchor.baseSha === doc.headSha
+      ) {
         set.add(c.anchor.startLine);
       }
     }
@@ -111,7 +119,11 @@ export function Canvas(props: {
         return;
       }
       const rect = sel.getRangeAt(0).getBoundingClientRect();
-      setFloating({ line: Number(blockEl.dataset.line), x: rect.left + rect.width / 2, y: rect.top });
+      setFloating({
+        line: Number(blockEl.dataset.line),
+        x: rect.left + rect.width / 2,
+        y: rect.top,
+      });
     };
     document.addEventListener('selectionchange', onSel);
     return () => document.removeEventListener('selectionchange', onSel);
@@ -139,7 +151,12 @@ export function Canvas(props: {
           <span>
             Viewing branch <code>{branch.branch}</code> (option {branch.label}), read-only.
           </span>
-          <button type="button" className="btn small" data-testid="branch-exit" onClick={onExitBranch}>
+          <button
+            type="button"
+            className="btn small"
+            data-testid="branch-exit"
+            onClick={onExitBranch}
+          >
             Back to main
           </button>
         </div>
@@ -168,7 +185,8 @@ export function Canvas(props: {
               onActivate={() => setActive({ line: l.line, ask: false })}
               onClose={() => setActive((cur) => (cur?.line === l.line ? null : cur))}
               onSuggest={(replacement) => {
-                if (send({ type: 'suggestion.create', anchor: makeAnchor(l), replacement })) setActive(null);
+                if (send({ type: 'suggestion.create', anchor: makeAnchor(l), replacement }))
+                  setActive(null);
               }}
               onAsk={(question) => {
                 if (send({ type: 'ask.create', anchor: makeAnchor(l), question })) setActive(null);

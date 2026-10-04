@@ -44,7 +44,12 @@ export function RoomsScreen() {
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
-        <button className="btn primary" data-testid="room-create-submit" type="submit" disabled={!name.trim()}>
+        <button
+          className="btn primary"
+          data-testid="room-create-submit"
+          type="submit"
+          disabled={!name.trim()}
+        >
           Create room
         </button>
       </form>
@@ -74,7 +79,10 @@ export function RoomsScreen() {
                 >
                   {r.name}
                 </a>
-                <span className="muted small-text"> {new Date(r.createdAt).toLocaleDateString()}</span>
+                <span className="muted small-text">
+                  {' '}
+                  {new Date(r.createdAt).toLocaleDateString()}
+                </span>
               </li>
             ))}
         </ul>

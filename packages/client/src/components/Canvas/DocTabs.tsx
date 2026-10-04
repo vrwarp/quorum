@@ -58,7 +58,12 @@ export function DocTabs(props: {
             {d.title}
           </button>
         ))}
-        <button type="button" className="btn small" data-testid="doc-create" onClick={() => setCreating((v) => !v)}>
+        <button
+          type="button"
+          className="btn small"
+          data-testid="doc-create"
+          onClick={() => setCreating((v) => !v)}
+        >
           New document
         </button>
         {selected && (
@@ -79,8 +84,20 @@ export function DocTabs(props: {
       </div>
       {creating && (
         <form className="inline-form" onSubmit={create}>
-          <input data-testid="doc-create-title" aria-label="Document title" placeholder="Title" value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
-          <button type="submit" className="btn small primary" data-testid="doc-create-submit" disabled={!title.trim()}>
+          <input
+            data-testid="doc-create-title"
+            aria-label="Document title"
+            placeholder="Title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            autoFocus
+          />
+          <button
+            type="submit"
+            className="btn small primary"
+            data-testid="doc-create-submit"
+            disabled={!title.trim()}
+          >
             Create
           </button>
         </form>
@@ -92,10 +109,20 @@ export function DocTabs(props: {
             onSubmit={(e) => {
               e.preventDefault();
               const t = renaming.trim();
-              if (t && t !== selected.title && send({ type: 'document.rename', documentId: selected.id, title: t })) setMenu(false);
+              if (
+                t &&
+                t !== selected.title &&
+                send({ type: 'document.rename', documentId: selected.id, title: t })
+              )
+                setMenu(false);
             }}
           >
-            <input data-testid="doc-rename-input" aria-label="New title" value={renaming} onChange={(e) => setRenaming(e.target.value)} />
+            <input
+              data-testid="doc-rename-input"
+              aria-label="New title"
+              value={renaming}
+              onChange={(e) => setRenaming(e.target.value)}
+            />
             <button type="submit" className="btn small" data-testid="doc-rename-submit">
               Rename
             </button>

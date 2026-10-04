@@ -14,7 +14,7 @@ The server must serve `index.html` for unknown paths.
 
 ## Source map
 
-- `src/api.ts` typed fetch helpers; `src/ws.ts` reconnecting WebSocket; `src/store.tsx` context + reducer
+- `src/api.ts` typed fetch helpers; `src/ws.ts` reconnecting WebSocket; `src/store.tsx` context + reducer (`src/store.test.ts` runs it against the server's event shapes under `npm test`)
 - `src/LoginScreen.tsx`, `RoomsScreen.tsx`, `RoomScreen.tsx`, `SettingsScreen.tsx` (Claude account sign-in)
 - `src/components/Chat`, `Canvas`, `Rail`, `Diff`
 
@@ -36,7 +36,7 @@ the editor with the ask prompt already revealed. Questions are sent with the anc
 | `card-change`, `card-suggestion`, `card-ask`, `card-review`, `card-quorum`, `card-digest`, `card-merge` | cards (also `card-exploration`, `card-agent-status`) |
 | `vote-<optionId>` | Quorum vote button; `tally-<optionId>` vote count; `diff-<optionId>` option diff button |
 | `review-approve`, `review-reject` | Review card buttons; `review-countdown` |
-| `revert-<sha>` | Change card revert button (disabled once reverted) |
+| `revert-<sha>` | Revert button on a Change card or a Merge card (disabled once reverted) |
 | `doc-tab-<documentId>` | document tab |
 | `doc-create`, `doc-create-title`, `doc-create-submit` | new document |
 | `doc-menu`, `doc-rename-input`, `doc-rename-submit`, `doc-archive` | rename/archive menu |
@@ -61,5 +61,6 @@ the editor with the ask prompt already revealed. Questions are sent with the anc
 - `GET /api/me` returns 401 when unauthenticated; errors are JSON `{error}` or `{message}`.
 - `/api/claude/*` (status, login/start, login/code, login/cancel, logout) needs a session; 503 when the server has no sign-in service. Error bodies are `{error: code, message}`; the client shows `message` when present.
 - Document fetch is `?ref=main` or `?ref=<branch>`; `ref` omitted is not used.
-- WebSocket uses the cookie (no `token` query); server sends `hello` first, then events; `hello` replaces state.
+- WebSocket uses the cookie (no `token` query); server sends `hello` first, then events. `hello` replaces the room snapshot (documents, proposals, presence, rule) and is merged into the transcript: its messages win, earlier pages and events that raced ahead of it (a private digest) stay.
+- `document.created` is an upsert (it is also how a rename arrives); `chat.updated` only replaces a message already on screen; `room.updated` carries a changed voting rule.
 - `GET /api/rooms/:id/messages?before=` returns older messages oldest-first.

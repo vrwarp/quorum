@@ -1,6 +1,7 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { openStorage } from './db/index.js';
 import { createGitProvider } from './git/index.js';
@@ -9,15 +10,11 @@ import { createAgentRuntime } from './agents/index.js';
 import { ClaudeAuthService } from './claudeauth/index.js';
 import { createHttpServer, attachWebSocket } from './api/index.js';
 
-// node:sqlite still prints an ExperimentalWarning on Node 22; silence just that one.
-const originalEmit = process.emitWarning.bind(process);
-process.emitWarning = ((warning: unknown, ...rest: unknown[]) => {
-  const text = typeof warning === 'string' ? warning : (warning as Error)?.message ?? '';
-  if (text.includes('SQLite is an experimental feature')) return;
-  return (originalEmit as (...a: unknown[]) => void)(warning, ...rest);
-}) as typeof process.emitWarning;
-
-export function logger(level: 'debug' | 'info' | 'warn' | 'error', msg: string, meta?: Record<string, unknown>) {
+export function logger(
+  level: 'debug' | 'info' | 'warn' | 'error',
+  msg: string,
+  meta?: Record<string, unknown>,
+) {
   if (level === 'debug' && !process.env.QUORUM_DEBUG) return;
   const line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}`;
   if (level === 'error' || level === 'warn') console.error(line);
@@ -37,34 +34,68 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     logger,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     maxBudgetUsd: config.maxBudgetUsdPerRoom,
+    // Claude credentials (used by the claude runtime; the fake runtime ignores them): the Agent SDK launches
+    // config.claudeBinary with the sign-in service's environment (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN); the agent
+    // is "unavailable" until a credential exists; a web sign-in or sign-out restarts or stops the room sessions.
+    claudeBinary: config.claudeBinary,
+    claudeEnv: () => claudeAuth.env(),
+    claudeAvailable: async () => (await claudeAuth.status()).signedIn,
+    onCredentialsChanged: (listener) => claudeAuth.onChange(listener),
   });
-  // TODO(integrator): pass claudeAuth.env() into the Claude runtime's SDK env (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN)
-  // and call claudeAuth.onChange(() => <restart room sessions>) so a web sign-in or sign-out takes effect.
   service.setRuntime(runtime);
   await service.start?.();
 
   const server = createHttpServer({ service, storage, config, logger, claudeAuth });
-  attachWebSocket(server, { service, storage, logger });
+  const sockets = attachWebSocket(server, { service, storage, logger });
 
   await new Promise<void>((resolve) => server.listen(config.port, resolve));
   logger('info', `quorum listening on http://localhost:${config.port} (runtime=${config.runtime})`);
 
+  let closing: Promise<void> | null = null;
+  /** Stops agents, the room service, sockets and the listener, then the database. Safe to call twice. */
+  const close = () =>
+    (closing ??= (async () => {
+      claudeAuth.cancelAll();
+      await runtime.stopAll().catch(() => undefined);
+      // The service first: once closed it ignores presence changes, so sockets that close one by one cannot "complete"
+      // a vote among whoever happens to be left. Then the sockets, which record last-seen times while storage is open.
+      await service.close();
+      await sockets.close();
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      });
+      storage.close();
+      process.off('SIGINT', shutdown);
+      process.off('SIGTERM', shutdown);
+    })());
+
   const shutdown = async () => {
     logger('info', 'shutting down');
-    claudeAuth.cancelAll();
-    await runtime.stopAll().catch(() => undefined);
-    await service.close();
-    server.close();
-    storage.close();
+    setTimeout(() => {
+      logger('warn', 'shutdown timed out; exiting');
+      process.exit(1);
+    }, 10_000).unref();
+    await close();
     process.exit(0);
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
-  return { server, service, runtime, storage, config };
+  return { server, service, runtime, storage, config, close };
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname;
-if (isMain) {
+/** True when this file is the process entry point (also when started through a symlink or from a path with spaces). */
+function isEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   startServer().catch((err) => {
     logger('error', 'failed to start', { err: String(err?.stack ?? err) });
     process.exit(1);

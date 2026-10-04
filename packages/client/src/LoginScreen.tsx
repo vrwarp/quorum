@@ -53,7 +53,12 @@ export function LoginScreen({ onLogin }: { onLogin: (u: Me) => void }) {
             {error}
           </p>
         )}
-        <button className="btn primary" data-testid="login-submit" type="submit" disabled={busy || !displayName.trim()}>
+        <button
+          className="btn primary"
+          data-testid="login-submit"
+          type="submit"
+          disabled={busy || !displayName.trim()}
+        >
           Join
         </button>
       </form>

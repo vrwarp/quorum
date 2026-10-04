@@ -1,4 +1,17 @@
-import type { Anchor, Document, DocumentId, OptionId, PresenceEntry, Proposal, ProposalId, RoomId, Sha, UserId, VotingRule } from './domain.js';
+import type {
+  Anchor,
+  Document,
+  DocumentId,
+  OptionId,
+  PresenceEntry,
+  Proposal,
+  ProposalId,
+  Room,
+  RoomId,
+  Sha,
+  UserId,
+  VotingRule,
+} from './domain.js';
 import type { Message, RoomState } from './messages.js';
 
 /** WebSocket: server -> client */
@@ -7,6 +20,7 @@ export type ServerEvent =
   | { type: 'chat.message'; message: Message }
   | { type: 'chat.updated'; message: Message } // card status changes (suggestion applied, etc.)
   | { type: 'presence.update'; presence: PresenceEntry[] }
+  | { type: 'room.updated'; room: Room } // the voting rule changed
   | { type: 'document.updated'; documentId: DocumentId; headSha: Sha }
   | { type: 'document.created'; document: Document & { headSha: Sha | null } }
   | { type: 'document.archived'; documentId: DocumentId }
@@ -19,7 +33,13 @@ export type ClientCommand =
   | { type: 'chat.send'; cid?: string; body: string }
   | { type: 'suggestion.create'; cid?: string; anchor: Anchor; replacement: string; note?: string }
   | { type: 'ask.create'; cid?: string; anchor: Anchor; question: string }
-  | { type: 'vote.cast'; cid?: string; proposalId: ProposalId; decision: 'approve' | 'reject'; optionId?: OptionId }
+  | {
+      type: 'vote.cast';
+      cid?: string;
+      proposalId: ProposalId;
+      decision: 'approve' | 'reject';
+      optionId?: OptionId;
+    }
   | { type: 'revert.request'; cid?: string; sha: Sha }
   | { type: 'document.create'; cid?: string; title: string }
   | { type: 'document.rename'; cid?: string; documentId: DocumentId; title: string }

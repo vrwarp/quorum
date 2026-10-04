@@ -8,7 +8,15 @@ import WebSocket from 'ws';
 import type { ServerEvent } from '@quorum/shared';
 import { RoomService } from '../room/RoomService.js';
 import { FakeGit, MemoryStorage, StubRuntime } from '../room/testing/index.js';
-import { createAuth, parseClientCommand, tokenFromRequest, verifyPassword, attachWebSocket, createHttpServer, type WsHandle } from './index.js';
+import {
+  createAuth,
+  parseClientCommand,
+  tokenFromRequest,
+  verifyPassword,
+  attachWebSocket,
+  createHttpServer,
+  type WsHandle,
+} from './index.js';
 
 describe('verifyPassword / auth', () => {
   it('compares passwords exactly', () => {
@@ -34,7 +42,8 @@ describe('verifyPassword / auth', () => {
   });
 
   it('accepts the token from bearer, query or cookie', () => {
-    const mk = (headers: Record<string, string>, url = '/') => tokenFromRequest({ headers, url } as never);
+    const mk = (headers: Record<string, string>, url = '/') =>
+      tokenFromRequest({ headers, url } as never);
     expect(mk({ authorization: 'Bearer abc' })).toBe('abc');
     expect(mk({}, '/ws?roomId=r&token=qq')).toBe('qq');
     expect(mk({ cookie: 'x=1; quorum_session=ck; y=2' })).toBe('ck');
@@ -57,7 +66,14 @@ describe('verifyPassword / auth', () => {
 });
 
 describe('command validation', () => {
-  const anchor = { documentId: 'doc_1', baseSha: 'abc', startLine: 1, endLine: 2, textHash: 'h', text: 't' };
+  const anchor = {
+    documentId: 'doc_1',
+    baseSha: 'abc',
+    startLine: 1,
+    endLine: 2,
+    textHash: 'h',
+    text: 't',
+  };
   it('accepts every command type', () => {
     const cmds = [
       { type: 'chat.send', body: 'hi' },
@@ -70,16 +86,35 @@ describe('command validation', () => {
       { type: 'document.archive', documentId: 'd' },
       { type: 'room.setRule', votingRule: 'majority' },
     ];
-    for (const c of cmds) expect(parseClientCommand(JSON.stringify({ ...c, cid: 'c1' })).ok, c.type).toBe(true);
+    for (const c of cmds)
+      expect(parseClientCommand(JSON.stringify({ ...c, cid: 'c1' })).ok, c.type).toBe(true);
   });
 
   it('rejects malformed commands and keeps the cid', () => {
     expect(parseClientCommand('not json')).toMatchObject({ ok: false });
-    expect(parseClientCommand(JSON.stringify({ type: 'nope', cid: 'x' }))).toMatchObject({ ok: false, cid: 'x' });
-    expect(parseClientCommand(JSON.stringify({ type: 'chat.send', body: '', cid: 'x' }))).toMatchObject({ ok: false, cid: 'x' });
-    expect(parseClientCommand(JSON.stringify({ type: 'vote.cast', proposalId: 'p', decision: 'maybe' })).ok).toBe(false);
-    expect(parseClientCommand(JSON.stringify({ type: 'suggestion.create', anchor: { ...anchor, startLine: 0 }, replacement: 'x' })).ok).toBe(false);
-    expect(parseClientCommand(JSON.stringify({ type: 'room.setRule', votingRule: 'dictator' })).ok).toBe(false);
+    expect(parseClientCommand(JSON.stringify({ type: 'nope', cid: 'x' }))).toMatchObject({
+      ok: false,
+      cid: 'x',
+    });
+    expect(
+      parseClientCommand(JSON.stringify({ type: 'chat.send', body: '', cid: 'x' })),
+    ).toMatchObject({ ok: false, cid: 'x' });
+    expect(
+      parseClientCommand(JSON.stringify({ type: 'vote.cast', proposalId: 'p', decision: 'maybe' }))
+        .ok,
+    ).toBe(false);
+    expect(
+      parseClientCommand(
+        JSON.stringify({
+          type: 'suggestion.create',
+          anchor: { ...anchor, startLine: 0 },
+          replacement: 'x',
+        }),
+      ).ok,
+    ).toBe(false);
+    expect(
+      parseClientCommand(JSON.stringify({ type: 'room.setRule', votingRule: 'dictator' })).ok,
+    ).toBe(false);
   });
 });
 
@@ -107,7 +142,7 @@ describe('http + websocket', () => {
   });
 
   afterEach(async () => {
-    ws.close();
+    await ws.close();
     await service.close();
     await new Promise<void>((r) => {
       server.close(() => r());
@@ -123,19 +158,31 @@ describe('http + websocket', () => {
       body: JSON.stringify({ password: 'pw', displayName: name }),
     });
     const cookie = res.headers.get('set-cookie')!;
-    return { res, cookie: cookie.split(';')[0]!, token: decodeURIComponent(cookie.split(';')[0]!.split('=')[1]!) };
+    return {
+      res,
+      cookie: cookie.split(';')[0]!,
+      token: decodeURIComponent(cookie.split(';')[0]!.split('=')[1]!),
+    };
   }
 
   it('serves health, login, me, and gates API routes', async () => {
     expect(await (await fetch(`http://${base}/api/health`)).json()).toEqual({ ok: true });
-    const bad = await fetch(`http://${base}/api/login`, { method: 'POST', body: JSON.stringify({ password: 'x', displayName: 'A' }) });
+    const bad = await fetch(`http://${base}/api/login`, {
+      method: 'POST',
+      body: JSON.stringify({ password: 'x', displayName: 'A' }),
+    });
     expect(bad.status).toBe(401);
     expect((await fetch(`http://${base}/api/me`)).status).toBe(401);
     const { res, cookie, token } = await login();
     expect(res.status).toBe(200);
     expect(res.headers.get('set-cookie')).toMatch(/HttpOnly/);
-    expect(await (await fetch(`http://${base}/api/me`, { headers: { cookie } })).json()).toMatchObject({ displayName: 'Ann' });
-    expect((await fetch(`http://${base}/api/me`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
+    expect(
+      await (await fetch(`http://${base}/api/me`, { headers: { cookie } })).json(),
+    ).toMatchObject({ displayName: 'Ann' });
+    expect(
+      (await fetch(`http://${base}/api/me`, { headers: { authorization: `Bearer ${token}` } }))
+        .status,
+    ).toBe(200);
     const unknown = await fetch(`http://${base}/api/nope`, { headers: { cookie } });
     expect(unknown.status).toBe(404);
     expect((await unknown.json()).error).toBe('not_found');
@@ -143,15 +190,27 @@ describe('http + websocket', () => {
 
   it('creates rooms and returns state', async () => {
     const { cookie } = await login();
-    const created = await fetch(`http://${base}/api/rooms`, { method: 'POST', headers: { cookie }, body: JSON.stringify({ name: 'R1' }) });
+    const created = await fetch(`http://${base}/api/rooms`, {
+      method: 'POST',
+      headers: { cookie },
+      body: JSON.stringify({ name: 'R1' }),
+    });
     expect(created.status).toBe(201);
     const room = await created.json();
     const list = await (await fetch(`http://${base}/api/rooms`, { headers: { cookie } })).json();
     expect(list).toHaveLength(1);
-    const state = await (await fetch(`http://${base}/api/rooms/${room.id}/state`, { headers: { cookie } })).json();
+    const state = await (
+      await fetch(`http://${base}/api/rooms/${room.id}/state`, { headers: { cookie } })
+    ).json();
     expect(state.room.name).toBe('R1');
-    expect((await fetch(`http://${base}/api/rooms/room_missing/state`, { headers: { cookie } })).status).toBe(404);
-    const huge = await fetch(`http://${base}/api/rooms`, { method: 'POST', headers: { cookie }, body: JSON.stringify({ name: 'x'.repeat(400_000) }) });
+    expect(
+      (await fetch(`http://${base}/api/rooms/room_missing/state`, { headers: { cookie } })).status,
+    ).toBe(404);
+    const huge = await fetch(`http://${base}/api/rooms`, {
+      method: 'POST',
+      headers: { cookie },
+      body: JSON.stringify({ name: 'x'.repeat(400_000) }),
+    });
     expect(huge.status).toBe(413);
   });
 
@@ -180,7 +239,13 @@ describe('http + websocket', () => {
 
   it('rejects unauthenticated sockets, then handles commands and errors', async () => {
     const { cookie, token } = await login();
-    const room = await (await fetch(`http://${base}/api/rooms`, { method: 'POST', headers: { cookie }, body: JSON.stringify({ name: 'R' }) })).json();
+    const room = await (
+      await fetch(`http://${base}/api/rooms`, {
+        method: 'POST',
+        headers: { cookie },
+        body: JSON.stringify({ name: 'R' }),
+      })
+    ).json();
     await expect(open(`ws://${base}/ws?roomId=${room.id}`)).rejects.toThrow(/401/);
     await expect(open(`ws://${base}/ws?roomId=${room.id}&token=bad`)).rejects.toThrow(/401/);
     await expect(open(`ws://${base}/ws?roomId=room_nope&token=${token}`)).rejects.toThrow(/404/);
@@ -188,11 +253,19 @@ describe('http + websocket', () => {
     const { sock, events } = await open(`ws://${base}/ws?roomId=${room.id}&token=${token}`);
     await until(() => events.some((e) => e.type === 'hello'));
     sock.send(JSON.stringify({ type: 'chat.send', cid: 'c1', body: 'hello room' }));
-    await until(() => events.some((e) => e.type === 'chat.message' && e.message.body === 'hello room'));
+    await until(() =>
+      events.some((e) => e.type === 'chat.message' && e.message.body === 'hello room'),
+    );
     sock.send(JSON.stringify({ type: 'chat.send', cid: 'c2', body: '' }));
-    await until(() => events.some((e) => e.type === 'error' && e.inReplyTo === 'c2' && e.code === 'bad_request'));
-    sock.send(JSON.stringify({ type: 'vote.cast', cid: 'c3', proposalId: 'prop_x', decision: 'approve' }));
-    await until(() => events.some((e) => e.type === 'error' && e.inReplyTo === 'c3' && e.code === 'not_found'));
+    await until(() =>
+      events.some((e) => e.type === 'error' && e.inReplyTo === 'c2' && e.code === 'bad_request'),
+    );
+    sock.send(
+      JSON.stringify({ type: 'vote.cast', cid: 'c3', proposalId: 'prop_x', decision: 'approve' }),
+    );
+    await until(() =>
+      events.some((e) => e.type === 'error' && e.inReplyTo === 'c3' && e.code === 'not_found'),
+    );
     sock.close();
     await until(() => storage.rooms.listPresence(room.id).every((p) => !p.connected));
   });

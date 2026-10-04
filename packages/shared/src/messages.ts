@@ -27,7 +27,14 @@ export type Card =
   | { type: 'review'; proposalId: ProposalId }
   | { type: 'quorum'; proposalId: ProposalId }
   | { type: 'exploration_started'; documentId: DocumentId; title: string; theses: string[] }
-  | { type: 'merge'; proposalId: ProposalId; optionId: OptionId; sha: Sha; reconciled: boolean; summary: string }
+  | {
+      type: 'merge';
+      proposalId: ProposalId;
+      optionId: OptionId;
+      sha: Sha;
+      reconciled: boolean;
+      summary: string;
+    }
   | { type: 'digest'; sinceMessageId: MessageId | null }
   | { type: 'agent_status'; status: 'thinking' | 'idle' | 'unavailable'; detail: string | null };
 

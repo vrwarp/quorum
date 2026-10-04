@@ -65,12 +65,19 @@ export interface Auth {
   clearCookie(secure: boolean): string;
 }
 
-export function createAuth(deps: { storage: Pick<Storage, 'users' | 'sessions'>; config: { password: string | null } }): Auth {
+export function createAuth(deps: {
+  storage: Pick<Storage, 'users' | 'sessions'>;
+  config: { password: string | null };
+}): Auth {
   const { storage, config } = deps;
   const attrs = (secure: boolean) => `Path=/; HttpOnly; SameSite=Lax${secure ? '; Secure' : ''}`;
   return {
     login(password, displayName) {
-      if (typeof displayName !== 'string' || !displayName.trim() || displayName.trim().length > 40) {
+      if (
+        typeof displayName !== 'string' ||
+        !displayName.trim() ||
+        displayName.trim().length > 40
+      ) {
         throw new AuthError(400, 'invalid_display_name', 'displayName must be 1-40 characters');
       }
       if (config.password !== null) {

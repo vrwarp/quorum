@@ -36,7 +36,15 @@ export const IntentBatchJsonSchema = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['type', 'confidence', 'documents', 'summary', 'messageIds', 'positions', 'needsResearch'],
+        required: [
+          'type',
+          'confidence',
+          'documents',
+          'summary',
+          'messageIds',
+          'positions',
+          'needsResearch',
+        ],
         properties: {
           type: { type: 'string', enum: ['edit_request', 'divergence', 'question', 'none'] },
           confidence: { type: 'number' },

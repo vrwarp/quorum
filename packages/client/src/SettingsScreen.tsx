@@ -21,7 +21,11 @@ export function SettingsLink() {
   );
 }
 
-type Phase = { step: 'idle' } | { step: 'starting' } | { step: 'code'; loginId: string; url: string } | { step: 'finishing' };
+type Phase =
+  | { step: 'idle' }
+  | { step: 'starting' }
+  | { step: 'code'; loginId: string; url: string }
+  | { step: 'finishing' };
 
 function describe(status: ClaudeStatus): string {
   const who = status.account?.email ?? status.account?.organization;
@@ -61,7 +65,8 @@ export function SettingsScreen() {
     try {
       const login = await api.claudeLoginStart();
       // Only ever render an https link, so a bad response cannot become a javascript: URL.
-      if (!/^https:\/\//i.test(login.url)) throw new Error('The server offered a sign-in link that is not safe to open.');
+      if (!/^https:\/\//i.test(login.url))
+        throw new Error('The server offered a sign-in link that is not safe to open.');
       setPhase({ step: 'code', loginId: login.loginId, url: login.url });
     } catch (e) {
       setPhase({ step: 'idle' });
@@ -125,12 +130,14 @@ export function SettingsScreen() {
       <section className="settings-card" aria-labelledby="claude-account-heading">
         <h2 id="claude-account-heading">Claude account</h2>
         <p className="muted small-text">
-          The agent runs on this server&apos;s Claude credential. This uses the owner&apos;s personal Claude login and must not be
-          offered to other people.
+          The agent runs on this server&apos;s Claude credential. This uses the owner&apos;s
+          personal Claude login and must not be offered to other people.
         </p>
 
         <div className="settings-status">
-          <span data-testid="claude-status">{status ? describe(status) : error ? 'Status unavailable' : 'Checking…'}</span>
+          <span data-testid="claude-status">
+            {status ? describe(status) : error ? 'Status unavailable' : 'Checking…'}
+          </span>
         </div>
 
         {error && (
@@ -142,17 +149,31 @@ export function SettingsScreen() {
         {status && !flowOpen && (
           <div className="settings-actions">
             {!status.signedIn && (
-              <button type="button" className="btn primary" data-testid="claude-signin" disabled={phase.step === 'starting'} onClick={() => void begin()}>
+              <button
+                type="button"
+                className="btn primary"
+                data-testid="claude-signin"
+                disabled={phase.step === 'starting'}
+                onClick={() => void begin()}
+              >
                 {phase.step === 'starting' ? 'Opening…' : 'Sign in with Claude'}
               </button>
             )}
             {status.method === 'oauth_login' && (
-              <button type="button" className="btn" data-testid="claude-signout" disabled={busy} onClick={() => void signOut()}>
+              <button
+                type="button"
+                className="btn"
+                data-testid="claude-signout"
+                disabled={busy}
+                onClick={() => void signOut()}
+              >
                 Sign out
               </button>
             )}
             {(status.method === 'oauth_token' || status.method === 'api_key') && (
-              <span className="muted small-text">This credential comes from the server&apos;s environment and is changed there.</span>
+              <span className="muted small-text">
+                This credential comes from the server&apos;s environment and is changed there.
+              </span>
             )}
           </div>
         )}
@@ -162,7 +183,12 @@ export function SettingsScreen() {
             <ol className="settings-steps">
               <li>
                 {phase.step === 'code' ? (
-                  <a href={phase.url} target="_blank" rel="noreferrer" data-testid="claude-signin-link">
+                  <a
+                    href={phase.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    data-testid="claude-signin-link"
+                  >
                     Open the Claude sign-in page
                   </a>
                 ) : (
@@ -170,7 +196,9 @@ export function SettingsScreen() {
                 )}{' '}
                 in a new tab and approve access.
               </li>
-              <li>Copy the code it shows you (or the whole address you are sent to) and paste it here.</li>
+              <li>
+                Copy the code it shows you (or the whole address you are sent to) and paste it here.
+              </li>
             </ol>
             <input
               data-testid="claude-code"
@@ -194,7 +222,13 @@ export function SettingsScreen() {
               >
                 {phase.step === 'finishing' ? 'Checking…' : 'Finish'}
               </button>
-              <button type="button" className="btn" data-testid="claude-cancel" disabled={phase.step === 'finishing'} onClick={cancel}>
+              <button
+                type="button"
+                className="btn"
+                data-testid="claude-cancel"
+                disabled={phase.step === 'finishing'}
+                onClick={cancel}
+              >
                 Cancel
               </button>
             </div>

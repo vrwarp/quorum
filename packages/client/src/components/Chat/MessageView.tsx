@@ -12,7 +12,13 @@ export function MessageView({ message: m }: { message: Message }) {
   const { you } = useRoom();
   const mine = m.author.kind === 'user' && m.author.userId === you.userId;
   const isPrivate = !!m.privateTo;
-  const cls = ['message', m.kind, mine ? 'mine' : '', m.author.kind === 'agent' ? 'agent' : '', isPrivate ? 'private' : '']
+  const cls = [
+    'message',
+    m.kind,
+    mine ? 'mine' : '',
+    m.author.kind === 'agent' ? 'agent' : '',
+    isPrivate ? 'private' : '',
+  ]
     .filter(Boolean)
     .join(' ');
   return (

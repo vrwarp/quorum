@@ -12,7 +12,14 @@ beforeEach(() => {
 });
 afterEach(() => s.close());
 
-const anchor: Anchor = { documentId: 'doc_1', baseSha: 'abc', startLine: 1, endLine: 2, textHash: 'h', text: 'hello' };
+const anchor: Anchor = {
+  documentId: 'doc_1',
+  baseSha: 'abc',
+  startLine: 1,
+  endLine: 2,
+  textHash: 'h',
+  text: 'hello',
+};
 
 function msg(id: string, roomId: string, over: Partial<Message> = {}): Message {
   return {
@@ -73,7 +80,9 @@ describe('rooms, participants, presence', () => {
     const r = s.rooms.create({ name: 'R', ownerId: u.id });
     s.rooms.addParticipant({ roomId: r.id, userId: u.id, displayName: 'Ann', role: 'owner' });
     s.rooms.addParticipant({ roomId: r.id, userId: u.id, displayName: 'Ann', role: 'owner' });
-    expect(s.rooms.listParticipants(r.id)).toEqual([{ roomId: r.id, userId: u.id, displayName: 'Ann', role: 'owner' }]);
+    expect(s.rooms.listParticipants(r.id)).toEqual([
+      { roomId: r.id, userId: u.id, displayName: 'Ann', role: 'owner' },
+    ]);
   });
 
   it('persists presence', () => {
@@ -85,7 +94,12 @@ describe('rooms, participants, presence', () => {
     s.rooms.upsertPresence(r.id, u.id, false, '2026-01-01T00:05:00.000Z');
     expect(s.rooms.getLastSeen(r.id, u.id)).toBe('2026-01-01T00:05:00.000Z');
     expect(s.rooms.listPresence(r.id)).toEqual([
-      { userId: u.id, displayName: 'Ann', connected: false, lastSeenAt: '2026-01-01T00:05:00.000Z' },
+      {
+        userId: u.id,
+        displayName: 'Ann',
+        connected: false,
+        lastSeenAt: '2026-01-01T00:05:00.000Z',
+      },
     ]);
   });
 
@@ -116,7 +130,11 @@ describe('messages', () => {
     });
     s.messages.insert(m);
     expect(s.messages.get('msg_1')).toEqual(m);
-    const updated: Message = { ...m, body: 'changed', card: { type: 'agent_status', status: 'idle', detail: null } };
+    const updated: Message = {
+      ...m,
+      body: 'changed',
+      card: { type: 'agent_status', status: 'idle', detail: null },
+    };
     s.messages.update(updated);
     expect(s.messages.get('msg_1')).toEqual(updated);
     expect(s.messages.get('nope')).toBeNull();
@@ -124,24 +142,52 @@ describe('messages', () => {
   });
 
   it('lists newest-last with before/after/limit and private filtering', () => {
-    for (let i = 1; i <= 6; i++) s.messages.insert(msg(`msg_${i}`, 'room_1', i === 3 ? { privateTo: 'user_2' } : {}));
+    for (let i = 1; i <= 6; i++)
+      s.messages.insert(msg(`msg_${i}`, 'room_1', i === 3 ? { privateTo: 'user_2' } : {}));
     s.messages.insert(msg('msg_other', 'room_2'));
     const ids = (ms: Message[]) => ms.map((m) => m.id);
     expect(ids(s.messages.list('room_1', { limit: 50, forUser: 'user_2' }))).toEqual([
-      'msg_1', 'msg_2', 'msg_3', 'msg_4', 'msg_5', 'msg_6',
+      'msg_1',
+      'msg_2',
+      'msg_3',
+      'msg_4',
+      'msg_5',
+      'msg_6',
     ]);
     expect(ids(s.messages.list('room_1', { limit: 50, forUser: 'user_1' }))).toEqual([
-      'msg_1', 'msg_2', 'msg_4', 'msg_5', 'msg_6',
+      'msg_1',
+      'msg_2',
+      'msg_4',
+      'msg_5',
+      'msg_6',
     ]);
-    expect(ids(s.messages.list('room_1', { limit: 50 }))).toEqual(['msg_1', 'msg_2', 'msg_4', 'msg_5', 'msg_6']);
-    expect(ids(s.messages.list('room_1', { limit: 2, forUser: 'user_2' }))).toEqual(['msg_5', 'msg_6']);
-    expect(ids(s.messages.list('room_1', { limit: 2, before: 'msg_5', forUser: 'user_2' }))).toEqual(['msg_3', 'msg_4']);
-    expect(ids(s.messages.list('room_1', { limit: 2, after: 'msg_2', forUser: 'user_2' }))).toEqual(['msg_3', 'msg_4']);
+    expect(ids(s.messages.list('room_1', { limit: 50 }))).toEqual([
+      'msg_1',
+      'msg_2',
+      'msg_4',
+      'msg_5',
+      'msg_6',
+    ]);
+    expect(ids(s.messages.list('room_1', { limit: 2, forUser: 'user_2' }))).toEqual([
+      'msg_5',
+      'msg_6',
+    ]);
+    expect(
+      ids(s.messages.list('room_1', { limit: 2, before: 'msg_5', forUser: 'user_2' })),
+    ).toEqual(['msg_3', 'msg_4']);
+    expect(ids(s.messages.list('room_1', { limit: 2, after: 'msg_2', forUser: 'user_2' }))).toEqual(
+      ['msg_3', 'msg_4'],
+    );
   });
 
   it('since and countSince', () => {
     for (let i = 1; i <= 4; i++) s.messages.insert(msg(`msg_${i}`, 'room_1'));
-    expect(s.messages.since('room_1', null, 10).map((m) => m.id)).toEqual(['msg_1', 'msg_2', 'msg_3', 'msg_4']);
+    expect(s.messages.since('room_1', null, 10).map((m) => m.id)).toEqual([
+      'msg_1',
+      'msg_2',
+      'msg_3',
+      'msg_4',
+    ]);
     expect(s.messages.since('room_1', 'msg_2', 10).map((m) => m.id)).toEqual(['msg_3', 'msg_4']);
     expect(s.messages.since('room_1', 'msg_2', 1).map((m) => m.id)).toEqual(['msg_3']);
     expect(s.messages.countSince('room_1', null)).toBe(4);
@@ -155,7 +201,12 @@ describe('documents', () => {
     const d = s.documents.create({ roomId: 'room_1', path: 'Arch.md', title: 'Arch' });
     expect(d.status).toBe('active');
     expect(d.id).toMatch(/^doc_/);
-    const fixed = s.documents.create({ id: 'doc_fixed', roomId: 'room_1', path: 'B.md', title: 'B' });
+    const fixed = s.documents.create({
+      id: 'doc_fixed',
+      roomId: 'room_1',
+      path: 'B.md',
+      title: 'B',
+    });
     expect(fixed.id).toBe('doc_fixed');
     expect(s.documents.getByPath('room_1', 'Arch.md')).toEqual(d);
     expect(() => s.documents.create({ roomId: 'room_1', path: 'Arch.md', title: 'dup' })).toThrow();
@@ -207,8 +258,20 @@ describe('proposals', () => {
     const p = proposal();
     s.proposals.create(p);
     expect(s.proposals.get('prop_1')).toEqual(p);
-    s.proposals.castVote({ proposalId: 'prop_1', userId: 'user_1', optionId: 'opt_A', decision: 'approve', castAt: 't1' });
-    s.proposals.castVote({ proposalId: 'prop_1', userId: 'user_2', optionId: null, decision: 'reject', castAt: 't2' });
+    s.proposals.castVote({
+      proposalId: 'prop_1',
+      userId: 'user_1',
+      optionId: 'opt_A',
+      decision: 'approve',
+      castAt: 't1',
+    });
+    s.proposals.castVote({
+      proposalId: 'prop_1',
+      userId: 'user_2',
+      optionId: null,
+      decision: 'reject',
+      castAt: 't2',
+    });
     const got = s.proposals.get('prop_1')!;
     expect(got.votes.map((v) => v.userId)).toEqual(['user_1', 'user_2']);
     expect(got.votes[1]).toMatchObject({ optionId: null, decision: 'reject' });
@@ -218,10 +281,28 @@ describe('proposals', () => {
 
   it('re-voting replaces, clearVote removes', () => {
     s.proposals.create(proposal());
-    s.proposals.castVote({ proposalId: 'prop_1', userId: 'user_1', optionId: 'opt_A', decision: 'approve', castAt: 't1' });
-    s.proposals.castVote({ proposalId: 'prop_1', userId: 'user_1', optionId: 'opt_B', decision: 'approve', castAt: 't2' });
+    s.proposals.castVote({
+      proposalId: 'prop_1',
+      userId: 'user_1',
+      optionId: 'opt_A',
+      decision: 'approve',
+      castAt: 't1',
+    });
+    s.proposals.castVote({
+      proposalId: 'prop_1',
+      userId: 'user_1',
+      optionId: 'opt_B',
+      decision: 'approve',
+      castAt: 't2',
+    });
     expect(s.proposals.listVotes('prop_1')).toEqual([
-      { proposalId: 'prop_1', userId: 'user_1', optionId: 'opt_B', decision: 'approve', castAt: 't2' },
+      {
+        proposalId: 'prop_1',
+        userId: 'user_1',
+        optionId: 'opt_B',
+        decision: 'approve',
+        castAt: 't2',
+      },
     ]);
     s.proposals.clearVote('prop_1', 'user_1');
     expect(s.proposals.listVotes('prop_1')).toEqual([]);
@@ -229,22 +310,61 @@ describe('proposals', () => {
 
   it('setState applies the patch and returns the updated proposal', () => {
     s.proposals.create(proposal());
-    const open = s.proposals.setState('prop_1', 'open', { openedAt: 'now', stale: true, title: 'New title', cardMessageId: 'msg_9' });
-    expect(open).toMatchObject({ state: 'open', openedAt: 'now', stale: true, title: 'New title', cardMessageId: 'msg_9' });
-    const merged = s.proposals.setState('prop_1', 'merged', { mergedOptionId: 'opt_B', mergeSha: 'sha', closedAt: 'later', reconciled: true, stale: false });
-    expect(merged).toMatchObject({ state: 'merged', mergedOptionId: 'opt_B', mergeSha: 'sha', reconciled: true, stale: false });
+    const open = s.proposals.setState('prop_1', 'open', {
+      openedAt: 'now',
+      stale: true,
+      title: 'New title',
+      cardMessageId: 'msg_9',
+    });
+    expect(open).toMatchObject({
+      state: 'open',
+      openedAt: 'now',
+      stale: true,
+      title: 'New title',
+      cardMessageId: 'msg_9',
+    });
+    const merged = s.proposals.setState('prop_1', 'merged', {
+      mergedOptionId: 'opt_B',
+      mergeSha: 'sha',
+      closedAt: 'later',
+      reconciled: true,
+      stale: false,
+    });
+    expect(merged).toMatchObject({
+      state: 'merged',
+      mergedOptionId: 'opt_B',
+      mergeSha: 'sha',
+      reconciled: true,
+      stale: false,
+    });
     expect(merged.options).toHaveLength(2);
     expect(() => s.proposals.setState('nope', 'open')).toThrow();
   });
 
   it('updateOption and list filters', () => {
     s.proposals.create(proposal());
-    s.proposals.create({ ...proposal(), id: 'prop_2', documentId: 'doc_2', state: 'open', createdAt: '2026-01-02T00:00:00.000Z', options: [] });
-    s.proposals.updateOption({ ...proposal().options[0]!, headSha: 'deadbeef', summary: 'changed' });
-    expect(s.proposals.get('prop_1')!.options[0]).toMatchObject({ headSha: 'deadbeef', summary: 'changed' });
+    s.proposals.create({
+      ...proposal(),
+      id: 'prop_2',
+      documentId: 'doc_2',
+      state: 'open',
+      createdAt: '2026-01-02T00:00:00.000Z',
+      options: [],
+    });
+    s.proposals.updateOption({
+      ...proposal().options[0]!,
+      headSha: 'deadbeef',
+      summary: 'changed',
+    });
+    expect(s.proposals.get('prop_1')!.options[0]).toMatchObject({
+      headSha: 'deadbeef',
+      summary: 'changed',
+    });
     expect(s.proposals.list('room_1').map((p) => p.id)).toEqual(['prop_1', 'prop_2']);
     expect(s.proposals.list('room_1', { states: ['open'] }).map((p) => p.id)).toEqual(['prop_2']);
-    expect(s.proposals.list('room_1', { documentId: 'doc_1' }).map((p) => p.id)).toEqual(['prop_1']);
+    expect(s.proposals.list('room_1', { documentId: 'doc_1' }).map((p) => p.id)).toEqual([
+      'prop_1',
+    ]);
     expect(s.proposals.list('room_1', { states: [] })).toEqual([]);
     expect(s.proposals.list('room_x')).toEqual([]);
   });
@@ -269,9 +389,15 @@ describe('changes', () => {
     s.changes.insert(change('c1', { createdAt: '2026-01-01T00:00:00.000Z' }));
     s.changes.insert(change('c2', { createdAt: '2026-01-02T00:00:00.000Z', documentId: 'doc_2' }));
     s.changes.insert(change('c3', { createdAt: '2026-01-03T00:00:00.000Z', proposalId: 'prop_1' }));
-    expect(s.changes.get('c3')).toMatchObject({ proposalId: 'prop_1', triggerMessageIds: ['msg_1'] });
+    expect(s.changes.get('c3')).toMatchObject({
+      proposalId: 'prop_1',
+      triggerMessageIds: ['msg_1'],
+    });
     expect(s.changes.list('room_1').map((c) => c.sha)).toEqual(['c3', 'c2', 'c1']);
-    expect(s.changes.list('room_1', { documentId: 'doc_1' }).map((c) => c.sha)).toEqual(['c3', 'c1']);
+    expect(s.changes.list('room_1', { documentId: 'doc_1' }).map((c) => c.sha)).toEqual([
+      'c3',
+      'c1',
+    ]);
     expect(s.changes.list('room_1', { limit: 1 }).map((c) => c.sha)).toEqual(['c3']);
     s.changes.markReverted('c1', 'c4');
     expect(s.changes.get('c1')!.revertedBySha).toBe('c4');
@@ -281,11 +407,24 @@ describe('changes', () => {
 
 describe('usage', () => {
   it('summarizes by role', () => {
-    const base = { roomId: 'room_1', sessionId: 's', model: 'm', cacheReadTokens: 0, at: 'now' } as const;
+    const base = {
+      roomId: 'room_1',
+      sessionId: 's',
+      model: 'm',
+      cacheReadTokens: 0,
+      at: 'now',
+    } as const;
     s.usage.insert({ ...base, role: 'listener', inputTokens: 10, outputTokens: 1, costUsd: 0.5 });
     s.usage.insert({ ...base, role: 'listener', inputTokens: 5, outputTokens: 2, costUsd: 0.25 });
     s.usage.insert({ ...base, role: 'worker', inputTokens: 100, outputTokens: 20, costUsd: 1 });
-    s.usage.insert({ ...base, roomId: 'room_2', role: 'worker', inputTokens: 1, outputTokens: 1, costUsd: 99 });
+    s.usage.insert({
+      ...base,
+      roomId: 'room_2',
+      role: 'worker',
+      inputTokens: 1,
+      outputTokens: 1,
+      costUsd: 99,
+    });
     expect(s.usage.summarize('room_1')).toEqual({
       totalCostUsd: 1.75,
       byRole: {

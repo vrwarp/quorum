@@ -61,7 +61,8 @@ export const logout = () => post<void>('/api/logout');
 export const me = () => request<Me>('/api/me');
 export const listRooms = () => request<Room[]>('/api/rooms');
 export const createRoom = (name: string) => post<Room>('/api/rooms', { name });
-export const getRoomState = (roomId: string) => request<RoomState>(`/api/rooms/${enc(roomId)}/state`);
+export const getRoomState = (roomId: string) =>
+  request<RoomState>(`/api/rooms/${enc(roomId)}/state`);
 export const getDocument = (roomId: string, documentId: string, ref?: string) =>
   request<DocumentContent>(
     `/api/rooms/${enc(roomId)}/documents/${enc(documentId)}${ref ? `?ref=${enc(ref)}` : ''}`,
@@ -76,7 +77,8 @@ export const getMessages = (roomId: string, before?: string, limit = 50) =>
   request<Message[]>(
     `/api/rooms/${enc(roomId)}/messages?limit=${limit}${before ? `&before=${enc(before)}` : ''}`,
   );
-export const getUsage = (roomId: string) => request<UsageResponse>(`/api/rooms/${enc(roomId)}/usage`);
+export const getUsage = (roomId: string) =>
+  request<UsageResponse>(`/api/rooms/${enc(roomId)}/usage`);
 
 export interface ClaudeStatus {
   signedIn: boolean;
@@ -94,7 +96,8 @@ export const claudeLoginStart = (mode: 'claudeai' | 'console' = 'claudeai') =>
   post<ClaudeLogin>('/api/claude/login/start', { mode });
 export const claudeLoginCode = (loginId: string, code: string) =>
   post<ClaudeStatus>('/api/claude/login/code', { loginId, code });
-export const claudeLoginCancel = (loginId: string) => post<{ ok: true }>('/api/claude/login/cancel', { loginId });
+export const claudeLoginCancel = (loginId: string) =>
+  post<{ ok: true }>('/api/claude/login/cancel', { loginId });
 export const claudeLogout = () => post<ClaudeStatus>('/api/claude/logout');
 
 /** What gets pasted back is either the bare code or the whole redirect URL; both work. */

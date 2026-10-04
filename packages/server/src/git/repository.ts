@@ -12,7 +12,12 @@ import {
   type RoomRepository,
 } from '../contracts/git.js';
 import { runGit, type GitResult } from './exec.js';
-import { preCommitHookScript, prettierFormatter, resolvePrettierBin, type MarkdownFormatter } from './format.js';
+import {
+  preCommitHookScript,
+  prettierFormatter,
+  resolvePrettierBin,
+  type MarkdownFormatter,
+} from './format.js';
 
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/@^~{}:+-]*$/;
 const SAFE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -49,7 +54,14 @@ function assertBranch(branch: string): string {
 /** Normalize a repo-relative path; rejects absolute paths and parent traversal. */
 function safePath(path: string): string {
   const n = posix.normalize(path);
-  if (!path || path.includes('\0') || posix.isAbsolute(n) || n === '..' || n.startsWith('../') || n === '.') {
+  if (
+    !path ||
+    path.includes('\0') ||
+    posix.isAbsolute(n) ||
+    n === '..' ||
+    n.startsWith('../') ||
+    n === '.'
+  ) {
     throw new Error(`invalid path: ${JSON.stringify(path)}`);
   }
   return n;
@@ -112,7 +124,8 @@ export class GitRoomRepository implements RoomRepository {
 
   private worktreePathFor(name: string): string {
     const dir = worktreeDirName(name);
-    if (!SAFE_NAME.test(dir) || dir.includes('..')) throw new Error(`invalid worktree name: ${JSON.stringify(name)}`);
+    if (!SAFE_NAME.test(dir) || dir.includes('..'))
+      throw new Error(`invalid worktree name: ${JSON.stringify(name)}`);
     return join(this.worktreesDir, dir);
   }
 
@@ -157,9 +170,21 @@ export class GitRoomRepository implements RoomRepository {
     for (const [k, v] of config) await this.git(['config', k, v]);
 
     if ((await this.headSha('main')) === null) {
-      const tree = (await runGit(['hash-object', '-t', 'tree', '-w', '--stdin'], { cwd: this.bareDir, input: '' })).stdout.trim();
+      const tree = (
+        await runGit(['hash-object', '-t', 'tree', '-w', '--stdin'], {
+          cwd: this.bareDir,
+          input: '',
+        })
+      ).stdout.trim();
       const commit = (
-        await this.out(['commit-tree', tree, '-m', 'Initialize room', '-m', `${TRAILERS.actor}: agent:system`])
+        await this.out([
+          'commit-tree',
+          tree,
+          '-m',
+          'Initialize room',
+          '-m',
+          `${TRAILERS.actor}: agent:system`,
+        ])
       ).trim();
       await this.git(['update-ref', 'refs/heads/main', commit]);
     }
@@ -175,7 +200,8 @@ export class GitRoomRepository implements RoomRepository {
 
   private trailerArgs(meta: CommitMeta, extra?: { reverts?: string }): string[] {
     const t: string[] = [`${TRAILERS.actor}: ${serializeActor(meta.actor)}`];
-    if (meta.triggerMessageIds.length > 0) t.push(`${TRAILERS.trigger}: ${meta.triggerMessageIds.map(oneLine).join(',')}`);
+    if (meta.triggerMessageIds.length > 0)
+      t.push(`${TRAILERS.trigger}: ${meta.triggerMessageIds.map(oneLine).join(',')}`);
     if (meta.proposalId) t.push(`${TRAILERS.proposal}: ${oneLine(meta.proposalId)}`);
     const reverts = meta.revertsSha ?? extra?.reverts;
     if (reverts) t.push(`${TRAILERS.reverts}: ${oneLine(reverts)}`);
@@ -187,8 +213,20 @@ export class GitRoomRepository implements RoomRepository {
   }
 
   /** Commit the index in `cwd` with trailers; returns the new HEAD sha. */
-  private async commit(cwd: string, subject: string, meta: CommitMeta, body?: string, extra?: { reverts?: string }): Promise<Sha> {
-    const args = ['-c', 'trailer.ifexists=addIfDifferent', 'commit', '-m', oneLine(subject) || 'Update'];
+  private async commit(
+    cwd: string,
+    subject: string,
+    meta: CommitMeta,
+    body?: string,
+    extra?: { reverts?: string },
+  ): Promise<Sha> {
+    const args = [
+      '-c',
+      'trailer.ifexists=addIfDifferent',
+      'commit',
+      '-m',
+      oneLine(subject) || 'Update',
+    ];
     if (body) args.push('-m', body);
     args.push(...this.trailerArgs(meta, extra));
     await this.git(args, cwd);
@@ -213,7 +251,11 @@ export class GitRoomRepository implements RoomRepository {
     await this.formatMarkdownFiles(cwd, [...new Set([...changed, ...untracked])]);
   }
 
-  async commitToMain(files: Record<string, string | null>, subject: string, meta: CommitMeta): Promise<Sha> {
+  async commitToMain(
+    files: Record<string, string | null>,
+    subject: string,
+    meta: CommitMeta,
+  ): Promise<Sha> {
     for (const [rawPath, content] of Object.entries(files)) {
       const path = safePath(rawPath);
       const abs = join(this.mainWorktree, path);
@@ -229,7 +271,11 @@ export class GitRoomRepository implements RoomRepository {
     return this.commit(this.mainWorktree, subject, meta);
   }
 
-  async commitWorktree(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha | null> {
+  async commitWorktree(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+  ): Promise<Sha | null> {
     const cwd = resolve(worktreePath);
     if (cwd !== this.mainWorktree) this.assertWorktree(cwd);
     await this.formatDirtyMarkdown(cwd);
@@ -259,8 +305,14 @@ export class GitRoomRepository implements RoomRepository {
       .split('\x1e')
       .slice(1)
       .map((rec) => {
-        const [sha, authorName, authoredAt, subject, rawBody, trailerText, rest] = rec.split('\x1f');
-        const trailers: CommitInfo['trailers'] = { actor: null, triggerMessageIds: [], proposalId: null, revertsSha: null };
+        const [sha, authorName, authoredAt, subject, rawBody, trailerText, rest] =
+          rec.split('\x1f');
+        const trailers: CommitInfo['trailers'] = {
+          actor: null,
+          triggerMessageIds: [],
+          proposalId: null,
+          revertsSha: null,
+        };
         let hasTrailers = false;
         for (const line of lines(trailerText ?? '')) {
           const m = /^([^:\s]+):\s*(.*)$/.exec(line);
@@ -270,7 +322,12 @@ export class GitRoomRepository implements RoomRepository {
           const value = m[2]!.trim();
           if (key === TRAILERS.actor.toLowerCase()) trailers.actor = value;
           else if (key === TRAILERS.trigger.toLowerCase())
-            trailers.triggerMessageIds.push(...value.split(',').map((s) => s.trim()).filter(Boolean));
+            trailers.triggerMessageIds.push(
+              ...value
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            );
           else if (key === TRAILERS.proposal.toLowerCase()) trailers.proposalId = value;
           else if (key === TRAILERS.reverts.toLowerCase()) trailers.revertsSha = value;
         }
@@ -301,18 +358,36 @@ export class GitRoomRepository implements RoomRepository {
 
   async show(sha: Sha): Promise<CommitInfo> {
     const out = await this.out([
-      'log', '-n', '1', `--format=${COMMIT_FORMAT}`, '--name-only', '--diff-merges=first-parent', assertRef(sha), '--',
+      'log',
+      '-n',
+      '1',
+      `--format=${COMMIT_FORMAT}`,
+      '--name-only',
+      '--diff-merges=first-parent',
+      assertRef(sha),
+      '--',
     ]);
     const [c] = this.parseCommits(out);
     if (!c) throw new Error(`commit not found: ${sha}`);
     return c;
   }
 
-  async logLines(path: string, startLine: number, endLine: number, ref = 'main'): Promise<CommitInfo[]> {
+  async logLines(
+    path: string,
+    startLine: number,
+    endLine: number,
+    ref = 'main',
+  ): Promise<CommitInfo[]> {
     const p = safePath(path);
     const start = Math.max(1, Math.floor(startLine));
     const end = Math.max(start, Math.floor(endLine));
-    const out = await this.out(['log', '-s', `--format=${COMMIT_FORMAT}`, `-L${start},${end}:${p}`, assertRef(ref)]);
+    const out = await this.out([
+      'log',
+      '-s',
+      `--format=${COMMIT_FORMAT}`,
+      `-L${start},${end}:${p}`,
+      assertRef(ref),
+    ]);
     return this.parseCommits(out, [p]);
   }
 
@@ -336,19 +411,40 @@ export class GitRoomRepository implements RoomRepository {
   }
 
   async diff(path: string, fromRef: string, toRef: string): Promise<string> {
-    return this.out(['diff', '--no-color', '--no-ext-diff', assertRef(fromRef), assertRef(toRef), '--', safePath(path)]);
+    return this.out([
+      'diff',
+      '--no-color',
+      '--no-ext-diff',
+      assertRef(fromRef),
+      assertRef(toRef),
+      '--',
+      safePath(path),
+    ]);
   }
 
   async changedFiles(fromRef: string, toRef: string): Promise<string[]> {
-    return nulList(await this.out(['diff', '--name-only', '-z', assertRef(fromRef), assertRef(toRef), '--']));
+    return nulList(
+      await this.out(['diff', '--name-only', '-z', assertRef(fromRef), assertRef(toRef), '--']),
+    );
   }
 
   async mergeBase(refA: string, refB: string): Promise<Sha> {
     return (await this.out(['merge-base', assertRef(refA), assertRef(refB)])).trim();
   }
 
-  async rewrittenLineCount(path: string, fromRef: string, toRef: string): Promise<{ removed: number; added: number }> {
-    const out = await this.out(['diff', '--numstat', assertRef(fromRef), assertRef(toRef), '--', safePath(path)]);
+  async rewrittenLineCount(
+    path: string,
+    fromRef: string,
+    toRef: string,
+  ): Promise<{ removed: number; added: number }> {
+    const out = await this.out([
+      'diff',
+      '--numstat',
+      assertRef(fromRef),
+      assertRef(toRef),
+      '--',
+      safePath(path),
+    ]);
     let added = 0;
     let removed = 0;
     for (const line of lines(out)) {
@@ -361,7 +457,10 @@ export class GitRoomRepository implements RoomRepository {
 
   // ---- branches and worktrees ----
 
-  async createBranch(branch: string, fromRef = 'main'): Promise<{ worktreePath: string; baseSha: Sha }> {
+  async createBranch(
+    branch: string,
+    fromRef = 'main',
+  ): Promise<{ worktreePath: string; baseSha: Sha }> {
     assertBranch(branch);
     const baseSha = await this.revParse(fromRef);
     const worktreePath = this.worktreePathFor(branch);
@@ -410,15 +509,26 @@ export class GitRoomRepository implements RoomRepository {
     assertBranch(branch);
     const branchSha = await this.revParse(`refs/heads/${branch}`);
     const mainSha = await this.revParse('refs/heads/main');
-    const isAncestor = async (a: string, b: string) => (await this.gitTry(['merge-base', '--is-ancestor', a, b])).code === 0;
+    const isAncestor = async (a: string, b: string) =>
+      (await this.gitTry(['merge-base', '--is-ancestor', a, b])).code === 0;
 
     if (await isAncestor(mainSha, branchSha)) {
       if (branchSha !== mainSha) await this.fastForwardMain(branchSha, mainSha);
-      return { status: 'fast-forward', newMainSha: branchSha, worktreePath: null, conflictedFiles: [] };
+      return {
+        status: 'fast-forward',
+        newMainSha: branchSha,
+        worktreePath: null,
+        conflictedFiles: [],
+      };
     }
     if (await isAncestor(branchSha, mainSha)) {
       // everything on the branch is already in main
-      return { status: 'fast-forward', newMainSha: mainSha, worktreePath: null, conflictedFiles: [] };
+      return {
+        status: 'fast-forward',
+        newMainSha: mainSha,
+        worktreePath: null,
+        conflictedFiles: [],
+      };
     }
 
     const name = `merge-${worktreeDirName(branch)}-${randomBytes(3).toString('hex')}`;
@@ -445,7 +555,9 @@ export class GitRoomRepository implements RoomRepository {
     const cwd = this.assertWorktree(worktreePath);
     // files the merge left unmerged may have been resolved in the working tree without `git add`
     const unmerged = await this.conflictedFiles(cwd);
-    const mdFiles = nulList(await this.out(['ls-files', '-z', '-c', '-o', '--exclude-standard', '--', '*.md'], cwd));
+    const mdFiles = nulList(
+      await this.out(['ls-files', '-z', '-c', '-o', '--exclude-standard', '--', '*.md'], cwd),
+    );
     for (const f of new Set([...mdFiles, ...unmerged])) {
       if (!existsSync(join(cwd, f))) continue;
       const text = await fsReadFile(join(cwd, f), 'utf8');
@@ -455,7 +567,8 @@ export class GitRoomRepository implements RoomRepository {
     const oldMain = (await this.out(['rev-parse', 'HEAD'], cwd)).trim();
     await this.formatDirtyMarkdown(cwd);
     await this.git(['add', '-A'], cwd);
-    if ((await this.conflictedFiles(cwd)).length > 0) throw new Error('merge still has unresolved conflicts');
+    if ((await this.conflictedFiles(cwd)).length > 0)
+      throw new Error('merge still has unresolved conflicts');
     const sha = await this.commit(cwd, subject, meta);
     try {
       await this.fastForwardMain(sha, oldMain);
@@ -476,7 +589,8 @@ export class GitRoomRepository implements RoomRepository {
 
   async revert(sha: Sha, meta: CommitMeta): Promise<Sha> {
     const target = await this.revParse(sha);
-    const parents = (await this.out(['rev-list', '--parents', '-n', '1', target])).trim().split(/\s+/).length - 1;
+    const parents =
+      (await this.out(['rev-list', '--parents', '-n', '1', target])).trim().split(/\s+/).length - 1;
     const args = ['revert', '--no-commit'];
     if (parents > 1) args.push('-m', '1');
     args.push(target);

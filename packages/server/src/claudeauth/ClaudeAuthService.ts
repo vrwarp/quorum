@@ -49,7 +49,11 @@ export interface LoginChild {
   kill(signal?: NodeJS.Signals): unknown;
 }
 
-export type SpawnFn = (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => LoginChild;
+export type SpawnFn = (
+  command: string,
+  args: string[],
+  options: { env: NodeJS.ProcessEnv },
+) => LoginChild;
 export type ExecFileFn = (
   file: string,
   args: string[],
@@ -57,7 +61,10 @@ export type ExecFileFn = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 export interface ClaudeAuthDeps {
-  config: Pick<ServerConfig, 'claudeConfigDir' | 'claudeBinary' | 'claudeOauthToken' | 'anthropicApiKey'>;
+  config: Pick<
+    ServerConfig,
+    'claudeConfigDir' | 'claudeBinary' | 'claudeOauthToken' | 'anthropicApiKey'
+  >;
   logger?: Logger;
   /** Injected in tests; defaults to `child_process.spawn` with piped stdio. */
   spawn?: SpawnFn;
@@ -108,7 +115,11 @@ interface Pending {
 
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 
-function defaultExecFile(file: string, args: string[], options: { timeout: number; env: NodeJS.ProcessEnv }) {
+function defaultExecFile(
+  file: string,
+  args: string[],
+  options: { timeout: number; env: NodeJS.ProcessEnv },
+) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     nodeExecFile(file, args, options, (err, stdout, stderr) => {
       if (err) reject(err);
@@ -118,7 +129,10 @@ function defaultExecFile(file: string, args: string[], options: { timeout: numbe
 }
 
 const defaultSpawn: SpawnFn = (command, args, options) =>
-  nodeSpawn(command, args, { env: options.env, stdio: ['pipe', 'pipe', 'pipe'] }) as unknown as LoginChild;
+  nodeSpawn(command, args, {
+    env: options.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }) as unknown as LoginChild;
 
 async function exists(file: string): Promise<boolean> {
   return stat(file).then(
@@ -150,7 +164,8 @@ function parseAccount(stdout: string): { loggedIn: boolean | null; account: Clau
 export class ClaudeAuthService {
   private readonly pending = new Map<string, Pending>();
   private readonly listeners = new Set<() => void>();
-  private cache: { at: number; value: Promise<Omit<ClaudeAuthStatus, 'pendingLogins'>> } | null = null;
+  private cache: { at: number; value: Promise<Omit<ClaudeAuthStatus, 'pendingLogins'>> } | null =
+    null;
   private changes = 0;
   private readonly configDir: string;
   private readonly stagingRoot: string;
@@ -160,7 +175,10 @@ export class ClaudeAuthService {
   constructor(private readonly deps: ClaudeAuthDeps) {
     this.configDir = deps.config.claudeConfigDir;
     // A sibling of the config dir, so a staged attempt never sits inside the directory the SDK reads.
-    this.stagingRoot = path.join(path.dirname(this.configDir), `${path.basename(this.configDir)}-login`);
+    this.stagingRoot = path.join(
+      path.dirname(this.configDir),
+      `${path.basename(this.configDir)}-login`,
+    );
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...deps.timeouts };
     this.log = deps.logger ?? (() => undefined);
   }
@@ -185,7 +203,8 @@ export class ClaudeAuthService {
   /** Environment additions the Agent SDK should receive. */
   env(): Record<string, string> {
     const out: Record<string, string> = { CLAUDE_CONFIG_DIR: this.configDir };
-    if (this.deps.config.claudeOauthToken) out.CLAUDE_CODE_OAUTH_TOKEN = this.deps.config.claudeOauthToken;
+    if (this.deps.config.claudeOauthToken)
+      out.CLAUDE_CODE_OAUTH_TOKEN = this.deps.config.claudeOauthToken;
     return out;
   }
 
@@ -221,17 +240,24 @@ export class ClaudeAuthService {
     if (config.anthropicApiKey) return { signedIn: true, method: 'api_key', account: null };
     if (config.claudeOauthToken) return { signedIn: true, method: 'oauth_token', account: null };
 
-    const env: NodeJS.ProcessEnv = { ...(this.deps.env ?? process.env), CLAUDE_CONFIG_DIR: this.configDir };
+    const env: NodeJS.ProcessEnv = {
+      ...(this.deps.env ?? process.env),
+      CLAUDE_CONFIG_DIR: this.configDir,
+    };
     // Judge the config dir alone; ambient credentials are reported through the config fields above.
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
     delete env.CLAUDE_CODE_OAUTH_TOKEN;
 
     try {
-      const { stdout } = await (this.deps.execFile ?? defaultExecFile)(config.claudeBinary, ['auth', 'status'], {
-        timeout: this.timeouts.probeMs,
-        env,
-      });
+      const { stdout } = await (this.deps.execFile ?? defaultExecFile)(
+        config.claudeBinary,
+        ['auth', 'status'],
+        {
+          timeout: this.timeouts.probeMs,
+          env,
+        },
+      );
       const { loggedIn, account } = parseAccount(stdout);
       if (loggedIn === false) return { signedIn: false, method: 'none', account: null };
       return { signedIn: true, method: 'oauth_login', account };
@@ -240,9 +266,13 @@ export class ClaudeAuthService {
       // A numeric code is an exit status: the CLI ran and said no. Anything else (ENOENT, a timeout) means it did
       // not answer, so fall back to the credentials file rather than reporting a guess as a verdict.
       if (typeof code === 'number') return { signedIn: false, method: 'none', account: null };
-      this.log('warn', 'claude auth status did not answer; checking for credentials file', { code: String(code) });
+      this.log('warn', 'claude auth status did not answer; checking for credentials file', {
+        code: String(code),
+      });
       const has = await exists(this.credentialsPath);
-      return has ? { signedIn: true, method: 'oauth_login', account: null } : { signedIn: false, method: 'none', account: null };
+      return has
+        ? { signedIn: true, method: 'oauth_login', account: null }
+        : { signedIn: false, method: 'none', account: null };
     }
   }
 
@@ -295,13 +325,21 @@ export class ClaudeAuthService {
     child.once('exit', ((code: number | null) => {
       const failure = /Login failed:?\s*(.*)/i.exec(entry.stderr);
       entry.settle(
-        code === 0 ? { ok: true } : { ok: false, error: failure?.[1]?.trim() || entry.stderr.trim() || 'The code was not accepted.' },
+        code === 0
+          ? { ok: true }
+          : {
+              ok: false,
+              error: failure?.[1]?.trim() || entry.stderr.trim() || 'The code was not accepted.',
+            },
       );
     }) as (...args: never[]) => void);
 
     const url = await new Promise<string>((resolve, reject) => {
       let out = '';
-      const deadline = setTimeout(() => reject(new Error('Claude Code did not offer a sign-in link.')), this.timeouts.urlMs);
+      const deadline = setTimeout(
+        () => reject(new Error('Claude Code did not offer a sign-in link.')),
+        this.timeouts.urlMs,
+      );
       const fail = (e: Error) => {
         clearTimeout(deadline);
         reject(e);
@@ -325,9 +363,12 @@ export class ClaudeAuthService {
       });
       child.on('error', ((e: Error) => fail(e)) as (...args: never[]) => void);
       child.on('exit', ((code: number | null) =>
-        fail(new Error(entry.stderr.trim() || `Claude Code exited (${code ?? 'signal'}) before offering a sign-in link.`))) as (
-        ...args: never[]
-      ) => void);
+        fail(
+          new Error(
+            entry.stderr.trim() ||
+              `Claude Code exited (${code ?? 'signal'}) before offering a sign-in link.`,
+          ),
+        )) as (...args: never[]) => void);
     }).catch((err: unknown) => {
       this.end(id, 'start failed');
       throw err instanceof Error ? err : new Error(String(err));
@@ -360,7 +401,10 @@ export class ClaudeAuthService {
     const outcome = await Promise.race([
       entry.done,
       new Promise<LoginResult>((resolve) => {
-        timer = setTimeout(() => resolve({ ok: false, error: 'Claude did not answer in time.' }), this.timeouts.codeMs);
+        timer = setTimeout(
+          () => resolve({ ok: false, error: 'Claude did not answer in time.' }),
+          this.timeouts.codeMs,
+        );
       }),
     ]);
     clearTimeout(timer);
@@ -378,8 +422,13 @@ export class ClaudeAuthService {
       await this.promote(entry.stagingDir);
     } catch (err) {
       this.end(id, 'promote failed');
-      this.log('error', 'claude sign-in succeeded but credentials could not be saved', { err: String(err) });
-      return { ok: false, error: 'Claude accepted the code but no credentials were saved. Try again.' };
+      this.log('error', 'claude sign-in succeeded but credentials could not be saved', {
+        err: String(err),
+      });
+      return {
+        ok: false,
+        error: 'Claude accepted the code but no credentials were saved. Try again.',
+      };
     }
     this.end(id, 'signed in');
     this.log('info', 'claude sign-in completed', { loginId: id });

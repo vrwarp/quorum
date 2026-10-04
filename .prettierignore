@@ -1,0 +1,4 @@
+# Generated output that .gitignore does not cover (packages/client/.gitignore is not read by prettier).
+dist-types/
+e2e/test-results/
+playwright-report/

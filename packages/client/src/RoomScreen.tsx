@@ -12,7 +12,10 @@ import { UsageFooter } from './components/UsageFooter';
 import { SettingsLink } from './SettingsScreen';
 import { navigate } from './router';
 
-export function RoomScreen(props: { roomId: string; you: { userId: string; displayName: string } }) {
+export function RoomScreen(props: {
+  roomId: string;
+  you: { userId: string; displayName: string };
+}) {
   return (
     <RoomProvider roomId={props.roomId} you={props.you}>
       <RoomInner />
@@ -34,7 +37,14 @@ function RoomInner() {
     const p = state.proposals.find((x) => x.id === view.proposalId);
     const o = p?.options.find((x) => x.id === view.optionId);
     if (!p || !o) return null;
-    return { proposalId: p.id, optionId: o.id, documentId: p.documentId, branch: o.branch, label: o.label, headSha: o.headSha };
+    return {
+      proposalId: p.id,
+      optionId: o.id,
+      documentId: p.documentId,
+      branch: o.branch,
+      label: o.label,
+      headSha: o.headSha,
+    };
   }, [view, state.proposals]);
 
   useEffect(() => {
@@ -59,7 +69,9 @@ function RoomInner() {
               <select
                 data-testid="rule-select"
                 value={room.votingRule}
-                onChange={(e) => send({ type: 'room.setRule', votingRule: e.target.value as VotingRule })}
+                onChange={(e) =>
+                  send({ type: 'room.setRule', votingRule: e.target.value as VotingRule })
+                }
               >
                 <option value="unanimous">Unanimous</option>
                 <option value="majority">Majority</option>
@@ -102,7 +114,12 @@ function RoomInner() {
         {state.error && (
           <div className="banner error" role="alert">
             <span>{state.error}</span>
-            <button type="button" className="btn small" aria-label="Dismiss error" onClick={dismissError}>
+            <button
+              type="button"
+              className="btn small"
+              aria-label="Dismiss error"
+              onClick={dismissError}
+            >
               ×
             </button>
           </div>

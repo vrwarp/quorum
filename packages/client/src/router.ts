@@ -23,7 +23,12 @@ export function usePath(): string {
   return path;
 }
 
-export type Route = { name: 'home' } | { name: 'rooms' } | { name: 'settings' } | { name: 'room'; roomId: string } | { name: 'unknown' };
+export type Route =
+  | { name: 'home' }
+  | { name: 'rooms' }
+  | { name: 'settings' }
+  | { name: 'room'; roomId: string }
+  | { name: 'unknown' };
 
 export function parseRoute(path: string): Route {
   const p = path.replace(/\/+$/, '') || '/';

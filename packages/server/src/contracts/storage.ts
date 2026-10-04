@@ -77,7 +77,10 @@ export interface MessageRepo {
   get(messageId: MessageId): Message | null;
   getMany(ids: MessageId[]): Message[];
   /** newest last; `before` is exclusive. privateTo filter: include private messages only for that user */
-  list(roomId: RoomId, opts: { before?: MessageId; after?: MessageId; limit: number; forUser?: UserId }): Message[];
+  list(
+    roomId: RoomId,
+    opts: { before?: MessageId; after?: MessageId; limit: number; forUser?: UserId },
+  ): Message[];
   /** messages created after the given message id (or all when null), in order */
   since(roomId: RoomId, sinceMessageId: MessageId | null, limit: number): Message[];
   countSince(roomId: RoomId, sinceMessageId: MessageId | null): number;
@@ -96,7 +99,24 @@ export interface ProposalRepo {
   create(p: Proposal): void;
   get(proposalId: ProposalId): Proposal | null;
   list(roomId: RoomId, opts?: { states?: ProposalState[]; documentId?: DocumentId }): Proposal[];
-  setState(proposalId: ProposalId, state: ProposalState, patch?: Partial<Pick<Proposal, 'openedAt' | 'closedAt' | 'mergedOptionId' | 'mergeSha' | 'windowClosesAt' | 'cardMessageId' | 'stale' | 'reconciled' | 'title'>>): Proposal;
+  setState(
+    proposalId: ProposalId,
+    state: ProposalState,
+    patch?: Partial<
+      Pick<
+        Proposal,
+        | 'openedAt'
+        | 'closedAt'
+        | 'mergedOptionId'
+        | 'mergeSha'
+        | 'windowClosesAt'
+        | 'cardMessageId'
+        | 'stale'
+        | 'reconciled'
+        | 'title'
+      >
+    >,
+  ): Proposal;
   updateOption(option: ProposalOption): void;
   castVote(vote: Vote): void;
   clearVote(proposalId: ProposalId, userId: UserId): void;
@@ -112,5 +132,8 @@ export interface ChangeRepo {
 
 export interface UsageRepo {
   insert(record: UsageRecord): void;
-  summarize(roomId: RoomId): { totalCostUsd: number; byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }> };
+  summarize(roomId: RoomId): {
+    totalCostUsd: number;
+    byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }>;
+  };
 }

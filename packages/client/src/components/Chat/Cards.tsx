@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { diffWords } from 'diff';
 import type { Card, Change, Message, Proposal, ProposalOption } from '@quorum/shared';
 import { getChangeDiff, getProposalDiff } from '../../api';
@@ -41,18 +41,48 @@ export function CardView({ message, card }: { message: Message; card: Card }) {
   }
 }
 
-function DiffButton({ label = 'View diff', title, load, testid }: { label?: string; title: string; load: Parameters<ReturnType<typeof useUi>['openDiff']>[0]['load']; testid?: string }) {
+function DiffButton({
+  label = 'View diff',
+  title,
+  load,
+  testid,
+}: {
+  label?: string;
+  title: string;
+  load: Parameters<ReturnType<typeof useUi>['openDiff']>[0]['load'];
+  testid?: string;
+}) {
   const { openDiff } = useUi();
   return (
-    <button type="button" className="btn small" data-testid={testid} onClick={() => openDiff({ title, load })}>
+    <button
+      type="button"
+      className="btn small"
+      data-testid={testid}
+      onClick={() => openDiff({ title, load })}
+    >
       {label}
     </button>
   );
 }
 
-function ChangeCard({ change }: { change: Change }) {
-  const { roomId, send } = useRoom();
+/** Sends revert.request once per click; re-enabled when the server answered with an error. */
+function useRevert(sha: string) {
+  const { send, state } = useRoom();
   const [requested, setRequested] = useState(false);
+  useEffect(() => {
+    if (state.error) setRequested(false);
+  }, [state.error]);
+  return {
+    requested,
+    revert: () => {
+      if (send({ type: 'revert.request', sha })) setRequested(true);
+    },
+  };
+}
+
+function ChangeCard({ change }: { change: Change }) {
+  const { roomId } = useRoom();
+  const { requested, revert } = useRevert(change.sha);
   const reverted = !!change.revertedBySha;
   const isRevert = !!change.revertsSha;
   return (
@@ -65,15 +95,16 @@ function ChangeCard({ change }: { change: Change }) {
       <p>{change.summary}</p>
       <div className="muted small-text">by {actorName(change.actor)}</div>
       <div className="card-actions">
-        <DiffButton title={`Change ${shortSha(change.sha)}`} load={() => getChangeDiff(roomId, change.sha)} />
+        <DiffButton
+          title={`Change ${shortSha(change.sha)}`}
+          load={() => getChangeDiff(roomId, change.sha)}
+        />
         <button
           type="button"
           className="btn small danger"
           data-testid={`revert-${change.sha}`}
           disabled={reverted || isRevert || requested}
-          onClick={() => {
-            if (send({ type: 'revert.request', sha: change.sha })) setRequested(true);
-          }}
+          onClick={revert}
         >
           {reverted ? 'Reverted' : 'Revert'}
         </button>
@@ -107,7 +138,9 @@ function SuggestionCard({ card }: { card: Extract<Card, { type: 'suggestion' }> 
       {card.replacement === '' && <div className="muted small-text">Deletes this paragraph.</div>}
       <div className="muted small-text">line {card.anchor.startLine}</div>
       {card.note && <p className="muted small-text">{card.note}</p>}
-      {card.resolutionSha && <div className="muted small-text">Applied in {shortSha(card.resolutionSha)}</div>}
+      {card.resolutionSha && (
+        <div className="muted small-text">Applied in {shortSha(card.resolutionSha)}</div>
+      )}
     </div>
   );
 }
@@ -125,7 +158,9 @@ function AskCard({ card }: { card: Extract<Card, { type: 'ask' }> }) {
 function ExplorationCard({ card }: { card: Extract<Card, { type: 'exploration_started' }> }) {
   return (
     <div className="card exploration" data-testid="card-exploration">
-      <div className="card-title">Exploring: {card.title}</div>
+      <div className="card-title">
+        {/^exploring\b/i.test(card.title) ? card.title : `Exploring: ${card.title}`}
+      </div>
       <ul>
         {card.theses.map((t, i) => (
           <li key={i}>{t}</li>
@@ -137,18 +172,33 @@ function ExplorationCard({ card }: { card: Extract<Card, { type: 'exploration_st
 
 function MergeCard({ card }: { card: Extract<Card, { type: 'merge' }> }) {
   const { roomId, state } = useRoom();
+  const { requested, revert } = useRevert(card.sha);
   const p = state.proposals.find((x) => x.id === card.proposalId);
   const opt = p?.options.find((o) => o.id === card.optionId);
+  const reverted = p?.state === 'reverted' && p.mergeSha === card.sha;
   return (
-    <div className="card merge" data-testid="card-merge">
+    <div className={`card merge${reverted ? ' reverted' : ''}`} data-testid="card-merge">
       <div className="card-title">
         Merged{p ? `: ${p.title}` : ''} <code>{shortSha(card.sha)}</code>
         {card.reconciled && <span className="pill">reconciled</span>}
+        {reverted && <span className="pill warn">reverted</span>}
       </div>
       {opt && <div className="muted small-text">Option {opt.label}</div>}
       <p>{card.summary}</p>
       <div className="card-actions">
-        <DiffButton title={`Merge ${shortSha(card.sha)}`} load={() => getChangeDiff(roomId, card.sha)} />
+        <DiffButton
+          title={`Merge ${shortSha(card.sha)}`}
+          load={() => getChangeDiff(roomId, card.sha)}
+        />
+        <button
+          type="button"
+          className="btn small danger"
+          data-testid={`revert-${card.sha}`}
+          disabled={reverted || requested}
+          onClick={revert}
+        >
+          {reverted ? 'Reverted' : 'Revert'}
+        </button>
       </div>
     </div>
   );
@@ -160,7 +210,12 @@ function ReviewCard({ proposalId }: { proposalId: string }) {
   const closes = p?.windowClosesAt ? Date.parse(p.windowClosesAt) : null;
   const open = p?.state === 'open';
   const now = useNow(1000, open && closes !== null);
-  if (!p) return <div className="card review" data-testid="card-review">Loading proposal…</div>;
+  if (!p)
+    return (
+      <div className="card review" data-testid="card-review">
+        Loading proposal…
+      </div>
+    );
   const opt = p.options[0];
   const mine = p.votes.find((v) => v.userId === you.userId);
   const approvals = p.votes.filter((v) => v.decision === 'approve').length;
@@ -173,7 +228,13 @@ function ReviewCard({ proposalId }: { proposalId: string }) {
       {opt && <OptionBody option={opt} proposal={p} />}
       <div className="muted small-text">
         {approvals} approve, {rejections} reject
-        {open && closes !== null && <> · window closes in <span data-testid="review-countdown">{formatCountdown(closes - now)}</span></>}
+        {open && closes !== null && (
+          <>
+            {' '}
+            · window closes in{' '}
+            <span data-testid="review-countdown">{formatCountdown(closes - now)}</span>
+          </>
+        )}
       </div>
       <div className="card-actions">
         {opt && <ProposalDiffButton proposal={p} option={opt} />}
@@ -183,7 +244,9 @@ function ReviewCard({ proposalId }: { proposalId: string }) {
           data-testid="review-approve"
           aria-pressed={mine?.decision === 'approve'}
           disabled={!open}
-          onClick={() => send({ type: 'vote.cast', proposalId: p.id, decision: 'approve', optionId: opt?.id })}
+          onClick={() =>
+            send({ type: 'vote.cast', proposalId: p.id, decision: 'approve', optionId: opt?.id })
+          }
         >
           Approve
         </button>
@@ -217,7 +280,15 @@ function OptionBody({ option, proposal }: { option: ProposalOption; proposal: Pr
   );
 }
 
-export function ProposalDiffButton({ proposal, option, label = 'View diff' }: { proposal: Proposal; option: ProposalOption; label?: string }) {
+export function ProposalDiffButton({
+  proposal,
+  option,
+  label = 'View diff',
+}: {
+  proposal: Proposal;
+  option: ProposalOption;
+  label?: string;
+}) {
   const { roomId } = useRoom();
   return (
     <DiffButton
@@ -232,7 +303,12 @@ export function ProposalDiffButton({ proposal, option, label = 'View diff' }: { 
 function QuorumCard({ proposalId }: { proposalId: string }) {
   const { state, send, you } = useRoom();
   const p = state.proposals.find((x) => x.id === proposalId);
-  if (!p) return <div className="card quorum" data-testid="card-quorum">Loading proposal…</div>;
+  if (!p)
+    return (
+      <div className="card quorum" data-testid="card-quorum">
+        Loading proposal…
+      </div>
+    );
   const open = p.state === 'open';
   const mine = p.votes.find((v) => v.userId === you.userId);
   const eligible = state.presence.filter((x) => x.connected).length;
@@ -246,11 +322,17 @@ function QuorumCard({ proposalId }: { proposalId: string }) {
       </div>
       <ol className="options">
         {p.options.map((o) => {
-          const tally = p.votes.filter((v) => v.decision === 'approve' && v.optionId === o.id).length;
+          const tally = p.votes.filter(
+            (v) => v.decision === 'approve' && v.optionId === o.id,
+          ).length;
           const chosen = mine?.decision === 'approve' && mine.optionId === o.id;
           const merged = p.mergedOptionId === o.id;
           return (
-            <li key={o.id} className={`option${chosen ? ' chosen' : ''}${merged ? ' merged' : ''}`} data-testid={`option-${o.id}`}>
+            <li
+              key={o.id}
+              className={`option${chosen ? ' chosen' : ''}${merged ? ' merged' : ''}`}
+              data-testid={`option-${o.id}`}
+            >
               <div className="option-head">
                 <strong>Option {o.label}</strong>
                 <span className="pill" data-testid={`tally-${o.id}`}>
@@ -267,7 +349,14 @@ function QuorumCard({ proposalId }: { proposalId: string }) {
                   data-testid={`vote-${o.id}`}
                   aria-pressed={chosen}
                   disabled={!open}
-                  onClick={() => send({ type: 'vote.cast', proposalId: p.id, decision: 'approve', optionId: o.id })}
+                  onClick={() =>
+                    send({
+                      type: 'vote.cast',
+                      proposalId: p.id,
+                      decision: 'approve',
+                      optionId: o.id,
+                    })
+                  }
                 >
                   {chosen ? 'Your vote' : `Vote ${o.label}`}
                 </button>

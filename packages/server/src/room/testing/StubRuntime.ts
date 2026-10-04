@@ -15,7 +15,12 @@ export class StubRuntime implements AgentRuntime {
   mergeDriverCalls: Array<{ proposal: Proposal; optionId: OptionId; worktreePath: string }> = [];
   /** set to make the runtime misbehave */
   throwEverywhere = false;
-  mergeDriver: (input: { worktreePath: string }) => Promise<{ reconciled: boolean; summary: string }> = async () => ({ reconciled: true, summary: 'reconciled by stub' });
+  mergeDriver: (input: {
+    worktreePath: string;
+  }) => Promise<{ reconciled: boolean; summary: string }> = async () => ({
+    reconciled: true,
+    summary: 'reconciled by stub',
+  });
   semanticRevert: (input: { change: Change; byUserId: UserId }) => Promise<Sha> = async () => {
     throw new Error('semantic revert not configured');
   };
@@ -50,7 +55,10 @@ export class StubRuntime implements AgentRuntime {
     this.maybeThrow();
     this.reverted.push({ change, revertSha, byUserId });
   }
-  async runMergeDriver(_r: string, input: { proposal: Proposal; optionId: OptionId; worktreePath: string }) {
+  async runMergeDriver(
+    _r: string,
+    input: { proposal: Proposal; optionId: OptionId; worktreePath: string },
+  ) {
     this.mergeDriverCalls.push(input);
     return this.mergeDriver(input);
   }

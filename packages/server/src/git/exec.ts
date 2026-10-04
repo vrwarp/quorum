@@ -27,7 +27,14 @@ export class GitError extends Error {
 function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   // inherited repository selection (e.g. when started from inside a git hook) must never leak in
-  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_COMMON_DIR', 'GIT_PREFIX']) {
+  for (const k of [
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_COMMON_DIR',
+    'GIT_PREFIX',
+  ]) {
     delete env[k];
   }
   return {
@@ -51,8 +58,10 @@ export function runGit(args: string[], opts: GitOptions): Promise<GitResult> {
       { cwd: opts.cwd, env: gitEnv(), maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, code: 0 });
-        const code = typeof (err as { code?: unknown }).code === 'number' ? ((err as { code: number }).code) : 1;
-        if (opts.allowFail && typeof (err as { code?: unknown }).code === 'number') return resolve({ stdout, stderr, code });
+        const code =
+          typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1;
+        if (opts.allowFail && typeof (err as { code?: unknown }).code === 'number')
+          return resolve({ stdout, stderr, code });
         reject(new GitError(args, code, stderr ?? String(err), stdout ?? ''));
       },
     );

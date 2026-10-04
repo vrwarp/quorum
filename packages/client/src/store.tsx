@@ -1,4 +1,12 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+} from 'react';
 import type { ReactNode } from 'react';
 import type {
   ClientCommand,
@@ -47,6 +55,9 @@ export const initialState: RoomStoreState = {
   error: null,
 };
 
+/** Shown when a command is dropped because the socket is down; cleared again once the socket is back. */
+export const OFFLINE_MESSAGE = 'Not connected; try again in a moment.';
+
 export type Action =
   | { type: 'event'; ev: ServerEvent }
   | { type: 'connected'; connected: boolean }
@@ -61,10 +72,28 @@ function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
   return next;
 }
 
+/**
+ * Merge a hello snapshot into what the store already holds. The snapshot wins for every message it contains; anything
+ * else is kept: earlier pages the person loaded, and events that raced ahead of the snapshot (a private digest, or a
+ * message newer than the snapshot). Order is by creation time, ties keeping their arrival order.
+ */
+export function mergeSnapshotMessages(existing: Message[], snapshot: Message[]): Message[] {
+  const inSnapshot = new Set(snapshot.map((m) => m.id));
+  const kept = existing.filter((m) => !inSnapshot.has(m.id));
+  if (kept.length === 0) return snapshot;
+  return [...kept, ...snapshot].sort((a, b) =>
+    a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
+  );
+}
+
 export function reducer(state: RoomStoreState, action: Action): RoomStoreState {
   switch (action.type) {
     case 'connected':
-      return { ...state, connected: action.connected };
+      return {
+        ...state,
+        connected: action.connected,
+        error: action.connected && state.error === OFFLINE_MESSAGE ? null : state.error,
+      };
     case 'dismissError':
       return { ...state, error: null };
     case 'prepend': {
@@ -81,12 +110,6 @@ export function applyEvent(state: RoomStoreState, ev: ServerEvent): RoomStoreSta
   switch (ev.type) {
     case 'hello': {
       const s = ev.state;
-      const ids = new Set(s.recentMessages.map((m) => m.id));
-      // keep private messages (digests) that arrived before this snapshot
-      const keptPrivate = state.messages.filter((m) => m.privateTo && !ids.has(m.id));
-      const messages = [...s.recentMessages, ...keptPrivate].sort((a, b) =>
-        a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
-      );
       return {
         ...state,
         loaded: true,
@@ -96,27 +119,41 @@ export function applyEvent(state: RoomStoreState, ev: ServerEvent): RoomStoreSta
         presence: s.presence,
         documents: s.documents,
         proposals: s.proposals,
-        messages,
+        messages: mergeSnapshotMessages(state.messages, s.recentMessages),
         agentStatus: s.agentStatus,
         agentDetail: null,
       };
     }
     case 'chat.message':
-    case 'chat.updated':
       return { ...state, messages: upsertById(state.messages, ev.message) };
+    case 'chat.updated': {
+      // a card changed in place (suggestion applied, change reverted): only messages already on screen matter, and
+      // appending an older one here would put it at the end of the transcript
+      const i = state.messages.findIndex((m) => m.id === ev.message.id);
+      if (i < 0) return state;
+      const messages = state.messages.slice();
+      messages[i] = ev.message;
+      return { ...state, messages };
+    }
     case 'presence.update':
       return { ...state, presence: ev.presence };
+    case 'room.updated':
+      return { ...state, room: ev.room };
     case 'document.updated':
       return {
         ...state,
-        documents: state.documents.map((d) => (d.id === ev.documentId ? { ...d, headSha: ev.headSha } : d)),
+        documents: state.documents.map((d) =>
+          d.id === ev.documentId ? { ...d, headSha: ev.headSha } : d,
+        ),
       };
     case 'document.created':
       return { ...state, documents: upsertById(state.documents, ev.document) };
     case 'document.archived':
       return {
         ...state,
-        documents: state.documents.map((d) => (d.id === ev.documentId ? { ...d, status: 'archived' } : d)),
+        documents: state.documents.map((d) =>
+          d.id === ev.documentId ? { ...d, status: 'archived' } : d,
+        ),
       };
     case 'proposal.updated':
       return { ...state, proposals: upsertById(state.proposals, ev.proposal) };
@@ -165,7 +202,8 @@ export function RoomProvider(props: {
 
   const send = useCallback((cmd: ClientCommand) => {
     const ok = socketRef.current?.send(cmd) ?? false;
-    if (!ok) dispatch({ type: 'event', ev: { type: 'error', code: 'offline', message: 'Not connected; try again in a moment.' } });
+    if (!ok)
+      dispatch({ type: 'event', ev: { type: 'error', code: 'offline', message: OFFLINE_MESSAGE } });
     return ok;
   }, []);
 

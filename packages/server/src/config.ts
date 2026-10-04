@@ -30,14 +30,18 @@ export function tunableEnvName(key: string): string {
 
 function parseNumber(name: string, raw: string): number {
   const n = Number(raw);
-  if (raw.trim() === '' || !Number.isFinite(n)) throw new Error(`${name} must be a number, got "${raw}"`);
+  if (raw.trim() === '' || !Number.isFinite(n))
+    throw new Error(`${name} must be a number, got "${raw}"`);
   return n;
 }
 
 /** Platform packages that could hold a runnable Claude Code binary on this machine, best first. */
 export function claudePlatformCandidates(
   proc: { platform: string; arch: string } = process,
-  glibc: boolean = Boolean((process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined)?.header?.glibcVersionRuntime),
+  glibc: boolean = Boolean(
+    (process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } | undefined)
+      ?.header?.glibcVersionRuntime,
+  ),
 ): string[] {
   const arch = proc.arch === 'arm64' ? 'arm64' : 'x64';
   if (proc.platform === 'darwin') return [`darwin-${arch}`];
@@ -53,7 +57,10 @@ export function findClaudeBinary(candidates: string[] = claudePlatformCandidates
   for (const platform of candidates) {
     try {
       const manifest = require.resolve(`@anthropic-ai/claude-agent-sdk-${platform}/package.json`);
-      return path.join(path.dirname(manifest), platform.startsWith('win32') ? 'claude.exe' : 'claude');
+      return path.join(
+        path.dirname(manifest),
+        platform.startsWith('win32') ? 'claude.exe' : 'claude',
+      );
     } catch {
       continue;
     }
@@ -68,20 +75,36 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const allowNoPassword = env.QUORUM_ALLOW_NO_PASSWORD === '1';
   let password: string | null = env.QUORUM_PASSWORD ? env.QUORUM_PASSWORD : null;
   if (password === null && !allowNoPassword) {
-    throw new Error('QUORUM_PASSWORD is required (set QUORUM_ALLOW_NO_PASSWORD=1 to run without one)');
+    throw new Error(
+      'QUORUM_PASSWORD is required (set QUORUM_ALLOW_NO_PASSWORD=1 to run without one)',
+    );
   }
 
   const anthropicApiKey = env.ANTHROPIC_API_KEY ? env.ANTHROPIC_API_KEY : null;
   const rawRuntime = env.QUORUM_RUNTIME;
-  if (rawRuntime !== undefined && rawRuntime !== '' && rawRuntime !== 'claude' && rawRuntime !== 'fake') {
+  if (
+    rawRuntime !== undefined &&
+    rawRuntime !== '' &&
+    rawRuntime !== 'claude' &&
+    rawRuntime !== 'fake'
+  ) {
     throw new Error(`QUORUM_RUNTIME must be "claude" or "fake", got "${rawRuntime}"`);
   }
   // Credentials may arrive later through the web sign-in (see docs/CLAUDE-SIGNIN.md), so the real runtime is the
   // default even with none configured; the fake runtime is for tests and an explicit QUORUM_RUNTIME=fake.
   const runtime: 'claude' | 'fake' = rawRuntime ? (rawRuntime as 'claude' | 'fake') : 'claude';
   const claudeOauthToken = env.CLAUDE_CODE_OAUTH_TOKEN ? env.CLAUDE_CODE_OAUTH_TOKEN : null;
-  const claudeConfigDir = env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : path.join(dataDir, 'claude');
-  const claudeBinary = findClaudeBinary();
+  const claudeConfigDir = env.CLAUDE_CONFIG_DIR
+    ? path.resolve(env.CLAUDE_CONFIG_DIR)
+    : path.join(dataDir, 'claude');
+  // QUORUM_CLAUDE_BINARY points at another Claude Code executable (a system install, or a stub in tests); a bare
+  // command name such as "claude" is looked up on PATH.
+  const claudeOverride = env.QUORUM_CLAUDE_BINARY;
+  const claudeBinary = claudeOverride
+    ? /[\\/]/.test(claudeOverride)
+      ? path.resolve(claudeOverride)
+      : claudeOverride
+    : findClaudeBinary();
 
   const maxBudgetUsdPerRoom = env.QUORUM_MAX_BUDGET_USD_PER_ROOM
     ? parseNumber('QUORUM_MAX_BUDGET_USD_PER_ROOM', env.QUORUM_MAX_BUDGET_USD_PER_ROOM)

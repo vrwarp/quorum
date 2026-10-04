@@ -17,7 +17,11 @@ export interface WsOptions {
 
 export interface WsHandle {
   wss: WebSocketServer;
-  close(): void;
+  /**
+   * Closes every socket and resolves once their disconnect handlers ran (so presence and last-seen are recorded
+   * while storage is still open). Sockets that ignore the closing handshake are terminated after `graceMs`.
+   */
+  close(graceMs?: number): Promise<void>;
 }
 
 function reject(socket: Duplex, status: number, text: string): void {
@@ -79,17 +83,31 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
     // commands are processed in order per socket
     let queue: Promise<void> = ready;
     ws.on('message', (data, isBinary) => {
-      if (isBinary) return sendEvent(ws, { type: 'error', code: 'bad_request', message: 'binary frames are not supported' });
+      if (isBinary)
+        return sendEvent(ws, {
+          type: 'error',
+          code: 'bad_request',
+          message: 'binary frames are not supported',
+        });
       const parsed = parseClientCommand(data.toString());
       if (!parsed.ok) {
-        return sendEvent(ws, { type: 'error', code: 'bad_request', message: parsed.message, ...(parsed.cid ? { inReplyTo: parsed.cid } : {}) });
+        return sendEvent(ws, {
+          type: 'error',
+          code: 'bad_request',
+          message: parsed.message,
+          ...(parsed.cid ? { inReplyTo: parsed.cid } : {}),
+        });
       }
       queue = queue.then(async () => {
         if (closed) return;
         try {
           await service.handle(roomId, userId, parsed.cmd);
         } catch (err) {
-          if (!(err instanceof RoomError)) log('error', 'command failed', { type: parsed.cmd.type, err: String((err as Error)?.stack ?? err) });
+          if (!(err instanceof RoomError))
+            log('error', 'command failed', {
+              type: parsed.cmd.type,
+              err: String((err as Error)?.stack ?? err),
+            });
           sendEvent(ws, errorEvent(err, parsed.cid));
         }
       });
@@ -126,10 +144,20 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
 
   return {
     wss,
-    close() {
+    async close(graceMs = 500) {
       clearInterval(interval);
-      for (const ws of wss.clients) ws.close(1001, 'server shutting down');
-      wss.close();
+      const sockets = [...wss.clients];
+      const closed = sockets.map(
+        (ws) =>
+          new Promise<void>((resolve) =>
+            ws.readyState === ws.CLOSED ? resolve() : ws.once('close', () => resolve()),
+          ),
+      );
+      for (const ws of sockets) ws.close(1001, 'server shutting down');
+      const force = setTimeout(() => sockets.forEach((ws) => ws.terminate()), graceMs);
+      await Promise.all(closed);
+      clearTimeout(force);
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
     },
   };
 }

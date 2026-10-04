@@ -32,7 +32,12 @@ export class FakeRepository implements RoomRepository {
 
   constructor(readonly roomId: string) {}
 
-  private newCommit(parent: string | null, files: Record<string, string>, subject: string, meta: CommitMeta | null): string {
+  private newCommit(
+    parent: string | null,
+    files: Record<string, string>,
+    subject: string,
+    meta: CommitMeta | null,
+  ): string {
     const sha = `c${String(++this.seq).padStart(6, '0')}`;
     this.commits.set(sha, { sha, parent, files, subject, meta });
     return sha;
@@ -198,11 +203,17 @@ export class FakeRepository implements RoomRepository {
       return { status: 'fast-forward', worktreePath: null, conflictedFiles: [], newMainSha: head };
     }
     this.pendingMerge = { branch, worktree: `/fake/merge/${branch}` };
-    return { status: 'clean', worktreePath: this.pendingMerge.worktree, conflictedFiles: [], newMainSha: null };
+    return {
+      status: 'clean',
+      worktreePath: this.pendingMerge.worktree,
+      conflictedFiles: [],
+      newMainSha: null,
+    };
   }
   async finishMerge(worktreePath: string, subject: string, meta: CommitMeta) {
     this.assertLocked();
-    if (!this.pendingMerge || this.pendingMerge.worktree !== worktreePath) throw new Error('no merge in progress');
+    if (!this.pendingMerge || this.pendingMerge.worktree !== worktreePath)
+      throw new Error('no merge in progress');
     const main = this.refs.get('main')!;
     const base = await this.mergeBase('main', this.pendingMerge.branch);
     const baseFiles = this.commits.get(base)!.files;
@@ -229,7 +240,9 @@ export class FakeRepository implements RoomRepository {
     const parentFiles = target.parent ? this.commits.get(target.parent)!.files : {};
     const head = this.refs.get('main')!;
     const cur = { ...this.commits.get(head)!.files };
-    const touched = [...new Set([...Object.keys(parentFiles), ...Object.keys(target.files)])].filter((k) => parentFiles[k] !== target.files[k]);
+    const touched = [
+      ...new Set([...Object.keys(parentFiles), ...Object.keys(target.files)]),
+    ].filter((k) => parentFiles[k] !== target.files[k]);
     const conflicts = touched.filter((k) => cur[k] !== target.files[k]);
     if (conflicts.length) throw new RevertConflictError(sha, conflicts);
     for (const k of touched) {

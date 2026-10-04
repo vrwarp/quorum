@@ -42,10 +42,23 @@ export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose
         <div className="drawer-head">
           <h3>{request.title}</h3>
           <span className="spacer" />
-          <button type="button" className="btn small" data-testid="diff-raw-toggle" aria-pressed={raw} onClick={() => setRaw((v) => !v)}>
+          <button
+            type="button"
+            className="btn small"
+            data-testid="diff-raw-toggle"
+            aria-pressed={raw}
+            onClick={() => setRaw((v) => !v)}
+          >
             {raw ? 'Word diff' : 'Raw diff'}
           </button>
-          <button ref={closeRef} type="button" className="btn small" aria-label="Close diff" data-testid="diff-close" onClick={onClose}>
+          <button
+            ref={closeRef}
+            type="button"
+            className="btn small"
+            aria-label="Close diff"
+            data-testid="diff-close"
+            onClick={onClose}
+          >
             ×
           </button>
         </div>
@@ -60,7 +73,11 @@ export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose
             <p className="muted small-text">
               {diff.path} · {shortSha(diff.baseSha)} → {shortSha(diff.headSha)}
             </p>
-            {raw ? <pre className="unified">{diff.unified || '(empty)'}</pre> : <WordDiff before={diff.before} after={diff.after} />}
+            {raw ? (
+              <pre className="unified">{diff.unified || '(empty)'}</pre>
+            ) : (
+              <WordDiff before={diff.before} after={diff.after} />
+            )}
           </>
         )}
       </aside>

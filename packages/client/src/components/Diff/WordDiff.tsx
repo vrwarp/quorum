@@ -4,7 +4,8 @@ const LONG_DOC = 20_000;
 
 /** Word-level diff with insert/delete styling; falls back to a line diff for long text. */
 export function WordDiff({ before, after }: { before: string; after: string }) {
-  const parts = before.length + after.length > LONG_DOC ? diffLines(before, after) : diffWords(before, after);
+  const parts =
+    before.length + after.length > LONG_DOC ? diffLines(before, after) : diffWords(before, after);
   if (before === after) return <div className="diff-text muted">No changes.</div>;
   return (
     <div className="diff-text" data-testid="word-diff">

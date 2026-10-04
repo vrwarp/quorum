@@ -1,7 +1,10 @@
+import './quietSqlite.js'; // must stay the first import: it silences node:sqlite's experimental warning
 import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname } from 'node:path';
-import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
+import type * as NodeSqlite from 'node:sqlite';
+import type { SQLInputValue, StatementSync } from 'node:sqlite';
 import {
   newId,
   type ActorRef,
@@ -51,6 +54,9 @@ const json = (v: unknown) => JSON.stringify(v);
  */
 export function openStorage(filePath: string): Storage {
   if (filePath !== ':memory:') mkdirSync(dirname(filePath), { recursive: true });
+  // Loaded here, not with a static import: Node emits the experimental warning while it links a static `node:sqlite`
+  // import, which is before quietSqlite.js has run. A require at call time comes after it.
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof NodeSqlite;
   const db = new DatabaseSync(filePath);
   db.exec('PRAGMA busy_timeout = 5000;');
   if (filePath !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
@@ -65,7 +71,8 @@ export function openStorage(filePath: string): Storage {
     }
     return s;
   };
-  const get = (sql: string, ...params: SQLInputValue[]): Row | null => (prep(sql).get(...params) as Row | undefined) ?? null;
+  const get = (sql: string, ...params: SQLInputValue[]): Row | null =>
+    (prep(sql).get(...params) as Row | undefined) ?? null;
   const all = (sql: string, ...params: SQLInputValue[]): Row[] => prep(sql).all(...params) as Row[];
   const run = (sql: string, ...params: SQLInputValue[]): void => {
     prep(sql).run(...params);
@@ -103,11 +110,20 @@ export function openStorage(filePath: string): Storage {
   }
 
   // ---- users ----
-  const toUser = (r: Row): User => ({ id: r.id, displayName: r.displayName, createdAt: r.createdAt });
+  const toUser = (r: Row): User => ({
+    id: r.id,
+    displayName: r.displayName,
+    createdAt: r.createdAt,
+  });
   const users: UserRepo = {
     create(displayName) {
       const user: User = { id: newId('user'), displayName, createdAt: nowIso() };
-      run('INSERT INTO users (id, displayName, createdAt) VALUES (?, ?, ?)', user.id, user.displayName, user.createdAt);
+      run(
+        'INSERT INTO users (id, displayName, createdAt) VALUES (?, ?, ?)',
+        user.id,
+        user.displayName,
+        user.createdAt,
+      );
       return user;
     },
     get(userId) {
@@ -124,7 +140,12 @@ export function openStorage(filePath: string): Storage {
   const sessions: SessionRepo = {
     create(userId) {
       const token = randomBytes(32).toString('hex');
-      run('INSERT INTO sessions (token, userId, createdAt) VALUES (?, ?, ?)', token, userId, nowIso());
+      run(
+        'INSERT INTO sessions (token, userId, createdAt) VALUES (?, ?, ?)',
+        token,
+        userId,
+        nowIso(),
+      );
       return { token, userId };
     },
     resolve(token) {
@@ -224,7 +245,11 @@ export function openStorage(filePath: string): Storage {
       }));
     },
     getLastSeen(roomId, userId) {
-      const r = get('SELECT lastSeenAt FROM presence WHERE roomId = ? AND userId = ?', roomId, userId);
+      const r = get(
+        'SELECT lastSeenAt FROM presence WHERE roomId = ? AND userId = ?',
+        roomId,
+        userId,
+      );
       return r ? (r.lastSeenAt as string) : null;
     },
   };
@@ -315,7 +340,12 @@ export function openStorage(filePath: string): Storage {
               viewer,
               limit,
             )
-          : all(`SELECT * FROM messages WHERE roomId = ? AND ${VISIBLE} ORDER BY seq DESC LIMIT ?`, roomId, viewer, limit);
+          : all(
+              `SELECT * FROM messages WHERE roomId = ? AND ${VISIBLE} ORDER BY seq DESC LIMIT ?`,
+              roomId,
+              viewer,
+              limit,
+            );
       return rows.reverse().map(toMessage);
     },
     since(roomId, sinceMessageId, limit) {
@@ -385,7 +415,10 @@ export function openStorage(filePath: string): Storage {
     list(roomId, includeArchived = false) {
       const rows = includeArchived
         ? all('SELECT * FROM documents WHERE roomId = ? ORDER BY createdAt, rowid', roomId)
-        : all("SELECT * FROM documents WHERE roomId = ? AND status = 'active' ORDER BY createdAt, rowid", roomId);
+        : all(
+            "SELECT * FROM documents WHERE roomId = ? AND status = 'active' ORDER BY createdAt, rowid",
+            roomId,
+          );
       return rows.map(toDocument);
     },
     rename(id, title, path) {
@@ -518,7 +551,10 @@ export function openStorage(filePath: string): Storage {
         where.push('documentId = ?');
         params.push(opts.documentId);
       }
-      return all(`SELECT * FROM proposals WHERE ${where.join(' AND ')} ORDER BY createdAt, rowid`, ...params).map(toProposal);
+      return all(
+        `SELECT * FROM proposals WHERE ${where.join(' AND ')} ORDER BY createdAt, rowid`,
+        ...params,
+      ).map(toProposal);
     },
     setState(proposalId: ProposalId, state: ProposalState, patch) {
       const sets = ['state = ?'];
@@ -627,14 +663,19 @@ export function openStorage(filePath: string): Storage {
       );
     },
     summarize(roomId: RoomId) {
-      const byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }> = {};
+      const byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }> =
+        {};
       let totalCostUsd = 0;
       for (const r of all(
         `SELECT role, SUM(costUsd) AS costUsd, SUM(inputTokens) AS inputTokens, SUM(outputTokens) AS outputTokens
            FROM usage WHERE roomId = ? GROUP BY role ORDER BY role`,
         roomId,
       )) {
-        byRole[r.role] = { costUsd: r.costUsd, inputTokens: r.inputTokens, outputTokens: r.outputTokens };
+        byRole[r.role] = {
+          costUsd: r.costUsd,
+          inputTokens: r.inputTokens,
+          outputTokens: r.outputTokens,
+        };
         totalCostUsd += r.costUsd as number;
       }
       return { totalCostUsd, byRole };

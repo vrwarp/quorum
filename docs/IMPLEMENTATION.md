@@ -9,7 +9,7 @@ build in parallel against the same contracts. Read the PRD first; this file does
 packages/shared/        types + WS/HTTP protocol + listener intent schema + tunables   (frozen; ask before changing)
 packages/server/src/
   contracts/            interfaces between server modules (frozen; ask before changing)
-  config.ts             env parsing: QUORUM_DATA_DIR, QUORUM_PASSWORD, PORT, ANTHROPIC_API_KEY, QUORUM_RUNTIME=claude|fake
+  config.ts             env parsing: QUORUM_DATA_DIR, QUORUM_PASSWORD, PORT, ANTHROPIC_API_KEY, QUORUM_RUNTIME=claude|fake (see "Running it")
   db/                   M1a  node:sqlite implementation of contracts/storage.ts
   git/                  M1a  implementation of contracts/git.ts (bare repo + worktrees, trailers, write lock, formatter hook)
   room/                 M1b  RoomService: all domain logic, implements contracts/agents.ts RoomActions, emits events
@@ -104,10 +104,22 @@ Canvas renders markdown by paragraph (one source line = one block) so click-to-s
 can compute `Anchor`s (`textHash` from shared). Diff view uses the `diff` package for word-level diffs of
 `DiffResponse.before/after`. Keep state in a small store (React context + reducer); no state libraries.
 
-### e2e (M2)
-Playwright starts the built server with `QUORUM_RUNTIME=fake` and a temp data dir, logs in two browser
-contexts, and walks PRD §2: direct request -> Change card; divergence -> exploration -> Quorum card ->
-votes -> merge; suggestion -> applied; ask -> answer; revert; rejoin digest (presence absence tunable set low).
+### integration and e2e (M2)
+`packages/server/src/api/integration.test.ts` boots `startServer()` for real (SQLite, git, HTTP + WebSocket, fake
+runtime) and drives it with `fetch` and `ws`: the PRD §2 scenario, restarts, merges through the merge driver,
+presence-completed votes, rename/archive and the error paths. It runs under `npm test`.
+
+`e2e/` runs the same server as a separate process (`QUORUM_RUNTIME=fake`, temp data dir) and walks PRD §2 through
+the real client in Chromium with two browser contexts: direct request -> Change card; divergence -> exploration ->
+Quorum card -> votes -> merge; suggestion -> applied; ask -> answer; revert; rejoin digest (absence tunable set low);
+Review proposals (reject, and merge when the window closes); documents and the voting rule; a dropped and restored
+socket; Settings.
+
+Found and fixed while wiring it up: the protocol gained one additive event, `room.updated` (a voting-rule change had no
+way to reach clients); a revert now flags the original Change card through `chat.updated` (the card embeds its
+`Change`); the Merge card has a Revert button; `startServer()` returns `close()`, and `attachWebSocket(...).close()` is
+async so shutdown records last-seen times before the database closes; `node:sqlite` is loaded lazily so its
+experimental warning can be filtered (a static import warns while the module graph links).
 
 ## Milestones
 
@@ -115,6 +127,83 @@ votes -> merge; suggestion -> applied; ask -> answer; revert; rejoin digest (pre
 |---|---|---|
 | M0 | scaffold, shared, contracts, this doc | `npm run typecheck` passes for shared |
 | M1a–d | the four module groups above, in parallel | each module typechecks and its unit tests pass |
-| M2 | main.ts, e2e | `npm run build && npm run test && npm run test:e2e` green with the fake runtime |
+| M2 | main.ts, integration and e2e tests | `npm run validate && npm run test:e2e` green with the fake runtime |
 | M3 | Opus review, fixes | findings addressed |
 | M4 | final verification | manual walkthrough, screenshots, push |
+
+## Running it
+
+Needs Node >= 22.13 and `git` on the PATH. Install once with `npm install` (npm workspaces: `packages/*` and `e2e`).
+
+### Development (two terminals)
+
+```bash
+# terminal 1: the server, restarted on change (http://localhost:8787). The fake agent needs no Claude login.
+QUORUM_PASSWORD=dev QUORUM_RUNTIME=fake npm run dev:server
+
+# terminal 2: the Vite client with hot reload (http://localhost:5173); it proxies /api and /ws to :8787
+npm run dev:client
+```
+
+Open http://localhost:5173 and log in with any display name and the password. The data directory defaults to
+`./data` relative to where the server runs (`packages/server/data` under `npm run dev:server`; git-ignored). Drop
+`QUORUM_RUNTIME=fake` to use the real agents: they need a Claude login (the Settings page, `ANTHROPIC_API_KEY`, or
+`CLAUDE_CODE_OAUTH_TOKEN`; see `docs/CLAUDE-SIGNIN.md`).
+
+### Production (one process)
+
+```bash
+npm run build
+QUORUM_PASSWORD=change-me QUORUM_DATA_DIR=/var/lib/quorum npm start     # http://localhost:8787
+```
+
+`npm start` runs `node packages/server/dist/main.js`, which serves the API, `/ws` and the built client
+(`packages/client/dist`, with SPA fallback). SIGINT/SIGTERM shut it down cleanly: agents stop, sockets close and
+last-seen times are recorded, then the database closes.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QUORUM_PASSWORD` | required | Shared password (`QUORUM_ALLOW_NO_PASSWORD=1` runs without one: tests and local use only). |
+| `PORT` | `8787` | HTTP and WebSocket port. |
+| `QUORUM_DATA_DIR` | `./data` | SQLite database, per-room git repositories, the Claude login (`claude/`). |
+| `QUORUM_RUNTIME` | `claude` | `claude` (real agents) or `fake` (scripted, no network). |
+| `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | unset | Credentials for the real agents; otherwise sign in from Settings. |
+| `CLAUDE_CONFIG_DIR` | `<data>/claude` | Where the web sign-in stores the Claude login. |
+| `QUORUM_CLAUDE_BINARY` | the Agent SDK's bundled binary | Another Claude Code executable (a path, or a name looked up on the PATH). |
+| `QUORUM_MAX_BUDGET_USD_PER_ROOM` | `20` | Spend cap per room. |
+| `QUORUM_CLIENT_DIST` | `packages/client/dist` | Built client to serve. |
+| `QUORUM_<NAME>_MS` ... | `packages/shared/src/config.ts` | Any `DEFAULTS` key, upper-snake-cased: `QUORUM_DIGEST_ABSENCE_MS`, `QUORUM_REVIEW_WINDOW_MS`, `QUORUM_LISTENER_DEBOUNCE_MS`, ... |
+| `QUORUM_FAKE_EXPLORE_MS` | `500` | Fake runtime only: how long an exploration takes. |
+| `QUORUM_DEBUG` | unset | `1` enables debug logging. |
+
+### Tests
+
+```bash
+npm test             # vitest: unit tests plus the server integration test (real git and SQLite, fake runtime; ~15 s)
+npm run typecheck    # tsc -b over shared, server, client and e2e
+npm run format       # prettier --write; `npm run format:check` verifies
+npm run validate     # typecheck + format:check + test + build: run before pushing
+```
+
+### End-to-end tests
+
+```bash
+npm run build && npm run test:e2e
+```
+
+Playwright starts `node packages/server/dist/main.js` on port 8799 (`QUORUM_E2E_PORT` changes it) with a temporary data directory,
+`QUORUM_RUNTIME=fake`, short tunables (digest absence 1.5 s, review window 4 s, listener debounce 200 ms) and a stub
+`claude` CLI (`e2e/fake-claude.mjs`, so Settings reliably reads "Not signed in"). It then drives the built client in
+Chromium with two or three browser contexts per spec. The fake runtime's phrases are listed at the top of
+`e2e/quorum.spec.ts`.
+
+Chromium: `npx playwright install chromium`, or, where a different revision is already installed under
+`PLAYWRIGHT_BROWSERS_PATH` and downloads are not possible, the config falls back to it; `QUORUM_E2E_CHROMIUM` pins an
+executable. `QUORUM_E2E_VERBOSE=1` shows the server log. Failures leave traces and screenshots in `e2e/test-results/`
+and an HTML report in `playwright-report/` (`npx playwright show-report`).
+
+### Docker
+
+`docker compose up -d --build`; see `docs/DEPLOY.md`.

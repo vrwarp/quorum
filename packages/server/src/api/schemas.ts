@@ -22,7 +22,12 @@ export const ClientCommandSchema = z.discriminatedUnion('type', [
     replacement: z.string().max(100_000),
     note: z.string().max(2_000).optional(),
   }),
-  z.object({ type: z.literal('ask.create'), cid, anchor: AnchorSchema, question: z.string().min(1).max(5_000) }),
+  z.object({
+    type: z.literal('ask.create'),
+    cid,
+    anchor: AnchorSchema,
+    question: z.string().min(1).max(5_000),
+  }),
   z.object({
     type: z.literal('vote.cast'),
     cid,
@@ -32,7 +37,12 @@ export const ClientCommandSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('revert.request'), cid, sha: z.string().min(4).max(100) }),
   z.object({ type: z.literal('document.create'), cid, title: z.string().min(1).max(120) }),
-  z.object({ type: z.literal('document.rename'), cid, documentId: id, title: z.string().min(1).max(120) }),
+  z.object({
+    type: z.literal('document.rename'),
+    cid,
+    documentId: id,
+    title: z.string().min(1).max(120),
+  }),
   z.object({ type: z.literal('document.archive'), cid, documentId: id }),
   z.object({ type: z.literal('room.setRule'), cid, votingRule: z.enum(['unanimous', 'majority']) }),
 ]);
@@ -42,7 +52,8 @@ type Parsed = z.infer<typeof ClientCommandSchema>;
 const _assignable = (c: Parsed): ClientCommand => c;
 void _assignable;
 
-export type ParseResult = { ok: true; cmd: ClientCommand; cid?: string } | { ok: false; message: string; cid?: string };
+export type ParseResult =
+  { ok: true; cmd: ClientCommand; cid?: string } | { ok: false; message: string; cid?: string };
 
 /** Parse a raw WebSocket frame (string) or an already-decoded value. */
 export function parseClientCommand(raw: unknown): ParseResult {
@@ -54,7 +65,10 @@ export function parseClientCommand(raw: unknown): ParseResult {
       return { ok: false, message: 'invalid JSON' };
     }
   }
-  const cid = typeof (data as { cid?: unknown } | null)?.cid === 'string' ? (data as { cid: string }).cid : undefined;
+  const cid =
+    typeof (data as { cid?: unknown } | null)?.cid === 'string'
+      ? (data as { cid: string }).cid
+      : undefined;
   const r = ClientCommandSchema.safeParse(data);
   if (!r.success) {
     const issue = r.error.issues[0];

@@ -9,14 +9,29 @@ import { FakeGit, MemoryStorage, StubRuntime } from '../room/testing/index.js';
 import { LoginLimitError, type ClaudeAuthStatus } from '../claudeauth/index.js';
 import { createHttpServer, type HttpOptions } from './index.js';
 
-const signedOut: ClaudeAuthStatus = { signedIn: false, method: 'none', account: null, pendingLogins: 0 };
-const signedIn: ClaudeAuthStatus = { signedIn: true, method: 'oauth_login', account: { email: 'me@example.com' }, pendingLogins: 0 };
+const signedOut: ClaudeAuthStatus = {
+  signedIn: false,
+  method: 'none',
+  account: null,
+  pendingLogins: 0,
+};
+const signedIn: ClaudeAuthStatus = {
+  signedIn: true,
+  method: 'oauth_login',
+  account: { email: 'me@example.com' },
+  pendingLogins: 0,
+};
 
 function fakeClaude() {
   return {
     status: vi.fn(async () => signedOut),
-    startLogin: vi.fn(async () => ({ loginId: 'L1', url: 'https://claude.com/cai/oauth/authorize?x=1' })),
-    submitCode: vi.fn(async (_id: string, code: string) => (code === 'good' ? { ok: true } : { ok: false, error: 'bad code' })),
+    startLogin: vi.fn(async () => ({
+      loginId: 'L1',
+      url: 'https://claude.com/cai/oauth/authorize?x=1',
+    })),
+    submitCode: vi.fn(async (_id: string, code: string) =>
+      code === 'good' ? { ok: true } : { ok: false, error: 'bad code' },
+    ),
     cancel: vi.fn(() => true),
     logout: vi.fn(async () => undefined),
   };
@@ -33,7 +48,12 @@ describe('/api/claude', () => {
     const storage = new MemoryStorage();
     service = new RoomService({ storage, git: new FakeGit() });
     service.setRuntime(new StubRuntime());
-    server = createHttpServer({ service, storage, config: { password: 'pw', clientDistDir: dist }, claudeAuth });
+    server = createHttpServer({
+      service,
+      storage,
+      config: { password: 'pw', clientDistDir: dist },
+      claudeAuth,
+    });
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   }
@@ -50,7 +70,10 @@ describe('/api/claude', () => {
   const call = (cookie: string | null, method: string, p: string, body?: unknown) =>
     fetch(`${base}/api/claude/${p}`, {
       method,
-      headers: { ...(cookie ? { cookie } : {}), ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      headers: {
+        ...(cookie ? { cookie } : {}),
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
 
@@ -95,7 +118,10 @@ describe('/api/claude', () => {
     it('starts a login and returns the link', async () => {
       const cookie = await login();
       const res = await call(cookie, 'POST', 'login/start', { mode: 'console' });
-      expect(await res.json()).toEqual({ loginId: 'L1', url: 'https://claude.com/cai/oauth/authorize?x=1' });
+      expect(await res.json()).toEqual({
+        loginId: 'L1',
+        url: 'https://claude.com/cai/oauth/authorize?x=1',
+      });
       expect(claude.startLogin).toHaveBeenCalledWith('console');
       await call(cookie, 'POST', 'login/start', {});
       expect(claude.startLogin).toHaveBeenLastCalledWith('claudeai');
@@ -106,7 +132,9 @@ describe('/api/claude', () => {
       const cookie = await login();
       claude.startLogin.mockRejectedValueOnce(new LoginLimitError());
       expect((await call(cookie, 'POST', 'login/start', {})).status).toBe(429);
-      claude.startLogin.mockRejectedValueOnce(new Error('Claude Code did not offer a sign-in link.'));
+      claude.startLogin.mockRejectedValueOnce(
+        new Error('Claude Code did not offer a sign-in link.'),
+      );
       const res = await call(cookie, 'POST', 'login/start', {});
       expect(res.status).toBe(502);
       expect((await res.json()).message).toMatch(/did not offer/);
@@ -115,7 +143,8 @@ describe('/api/claude', () => {
     it('throttles login starts per address', async () => {
       const cookie = await login();
       const statuses: number[] = [];
-      for (let i = 0; i < 7; i++) statuses.push((await call(cookie, 'POST', 'login/start', {})).status);
+      for (let i = 0; i < 7; i++)
+        statuses.push((await call(cookie, 'POST', 'login/start', {})).status);
       expect(statuses).toEqual([200, 200, 200, 200, 200, 429, 429]);
     });
 

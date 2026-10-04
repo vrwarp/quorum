@@ -23,14 +23,27 @@ import type { RoomRepository } from './git.js';
  * the agent runtime. Every mutation here goes through the normal room pipeline (persist, broadcast).
  */
 export interface RoomActions {
-  postChat(roomId: RoomId, input: { body: string; card?: Card | null; anchor?: Anchor | null; inReplyTo?: MessageId[] }): Promise<Message>;
+  postChat(
+    roomId: RoomId,
+    input: { body: string; card?: Card | null; anchor?: Anchor | null; inReplyTo?: MessageId[] },
+  ): Promise<Message>;
   updateCard(roomId: RoomId, messageId: MessageId, card: Card): Promise<Message>;
-  sendPrivate(roomId: RoomId, userId: UserId, input: { body: string; card?: Card | null }): Promise<Message>;
-  readTranscript(roomId: RoomId, opts: { ids?: MessageId[]; sinceMessageId?: MessageId | null; limit?: number }): Promise<Message[]>;
+  sendPrivate(
+    roomId: RoomId,
+    userId: UserId,
+    input: { body: string; card?: Card | null },
+  ): Promise<Message>;
+  readTranscript(
+    roomId: RoomId,
+    opts: { ids?: MessageId[]; sinceMessageId?: MessageId | null; limit?: number },
+  ): Promise<Message[]>;
   getRoomState(roomId: RoomId): Promise<RoomState>;
   getDocument(roomId: RoomId, documentId: DocumentId): Promise<Document | null>;
   /** Record a commit the agent made to main and broadcast document.updated + a Change card. */
-  recordChange(roomId: RoomId, change: Omit<Change, 'roomId' | 'createdAt' | 'revertedBySha'>): Promise<Change>;
+  recordChange(
+    roomId: RoomId,
+    change: Omit<Change, 'roomId' | 'createdAt' | 'revertedBySha'>,
+  ): Promise<Change>;
   /** Create a proposal (state drafting -> open with card). Validates single-document scope. */
   openProposal(
     roomId: RoomId,
@@ -44,10 +57,19 @@ export interface RoomActions {
       stale?: boolean;
     },
   ): Promise<Proposal>;
-  closeProposal(roomId: RoomId, proposalId: ProposalId, reason: 'expired' | 'rejected' | 'abandoned', note?: string): Promise<Proposal>;
+  closeProposal(
+    roomId: RoomId,
+    proposalId: ProposalId,
+    reason: 'expired' | 'rejected' | 'abandoned',
+    note?: string,
+  ): Promise<Proposal>;
   /** Ask the room to merge a passed proposal (RoomService runs the merge pipeline). */
   requestMerge(roomId: RoomId, proposalId: ProposalId, optionId: OptionId): Promise<void>;
-  setAgentStatus(roomId: RoomId, status: 'idle' | 'thinking' | 'unavailable', detail?: string | null): Promise<void>;
+  setAgentStatus(
+    roomId: RoomId,
+    status: 'idle' | 'thinking' | 'unavailable',
+    detail?: string | null,
+  ): Promise<void>;
   recordUsage(record: UsageRecord): Promise<void>;
   /** git access for a room (the orchestrator's main worktree, branches, blame) */
   repo(roomId: RoomId): Promise<RoomRepository>;
@@ -81,21 +103,40 @@ export interface AgentRuntime {
    * The runtime must leave the worktree with a clean, marker-free result (or throw).
    * Returns a summary of any semantic reconciliation performed.
    */
-  runMergeDriver(roomId: RoomId, input: { proposal: Proposal; optionId: OptionId; worktreePath: string; conflictedFiles: string[]; documentPath: string }): Promise<{ reconciled: boolean; summary: string }>;
+  runMergeDriver(
+    roomId: RoomId,
+    input: {
+      proposal: Proposal;
+      optionId: OptionId;
+      worktreePath: string;
+      conflictedFiles: string[];
+      documentPath: string;
+    },
+  ): Promise<{ reconciled: boolean; summary: string }>;
 
   /** Semantic revert when `git revert` conflicts. Must leave main reverted (committed) or throw. */
   runSemanticRevert(roomId: RoomId, input: { change: Change; byUserId: UserId }): Promise<Sha>;
 
   /** Digest for a returning participant. */
-  writeDigest(roomId: RoomId, input: { userId: UserId; sinceMessageId: MessageId | null; events: string[] }): Promise<string>;
+  writeDigest(
+    roomId: RoomId,
+    input: { userId: UserId; sinceMessageId: MessageId | null; events: string[] },
+  ): Promise<string>;
 }
 
 /** Factory signature both runtimes export. */
-export type AgentRuntimeFactory = (actions: RoomActions, options: AgentRuntimeOptions) => AgentRuntime;
+export type AgentRuntimeFactory = (
+  actions: RoomActions,
+  options: AgentRuntimeOptions,
+) => AgentRuntime;
 
 export interface AgentRuntimeOptions {
   dataDir: string;
   /** overrides of @quorum/shared DEFAULTS */
   tunables?: Partial<typeof import('@quorum/shared').DEFAULTS>;
-  logger?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string, meta?: Record<string, unknown>) => void;
+  logger?: (
+    level: 'debug' | 'info' | 'warn' | 'error',
+    msg: string,
+    meta?: Record<string, unknown>,
+  ) => void;
 }

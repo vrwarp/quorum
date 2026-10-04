@@ -19,9 +19,19 @@ export function Block(props: {
 }) {
   const { line, text, raw, readOnly, pending, active, startWithAsk } = props;
   return (
-    <div className={`block${pending ? ' has-pending' : ''}${active ? ' editing' : ''}`} data-testid={`block-${line}`} data-line={line}>
+    <div
+      className={`block${pending ? ' has-pending' : ''}${active ? ' editing' : ''}`}
+      data-testid={`block-${line}`}
+      data-line={line}
+    >
       {active && !readOnly ? (
-        <Editor text={text} startWithAsk={startWithAsk} onClose={props.onClose} onSuggest={props.onSuggest} onAsk={props.onAsk} />
+        <Editor
+          text={text}
+          startWithAsk={startWithAsk}
+          onClose={props.onClose}
+          onSuggest={props.onSuggest}
+          onAsk={props.onAsk}
+        />
       ) : (
         <div
           className={`block-view${readOnly ? '' : ' clickable'}`}
@@ -100,7 +110,12 @@ function Editor(props: {
           Cancel
         </button>
         {!asking && (
-          <button type="button" className="btn small" data-testid="ask-button" onClick={() => setAsking(true)}>
+          <button
+            type="button"
+            className="btn small"
+            data-testid="ask-button"
+            onClick={() => setAsking(true)}
+          >
             Ask
           </button>
         )}
@@ -122,7 +137,12 @@ function Editor(props: {
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => e.key === 'Escape' && props.onClose()}
           />
-          <button type="submit" className="btn small primary" data-testid="ask-submit" disabled={!question.trim()}>
+          <button
+            type="submit"
+            className="btn small primary"
+            data-testid="ask-submit"
+            disabled={!question.trim()}
+          >
             Ask
           </button>
         </form>

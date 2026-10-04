@@ -11,10 +11,12 @@ export function Chat() {
 
   const connected = state.presence.filter((p) => p.connected);
 
+  // A proposal card is posted before its proposal.updated arrives and grows when it does, so follow proposals too:
+  // otherwise the vote buttons of a new Quorum card end up below the fold.
   useLayoutEffect(() => {
     const el = listRef.current;
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
-  }, [state.messages]);
+  }, [state.messages, state.proposals]);
 
   useEffect(() => {
     const el = listRef.current;
@@ -59,7 +61,11 @@ export function Chat() {
           stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
-        <button type="button" className="btn small link" onClick={() => void loadEarlier().catch(() => {})}>
+        <button
+          type="button"
+          className="btn small link"
+          onClick={() => void loadEarlier().catch(() => {})}
+        >
           Load earlier messages
         </button>
         {state.messages.map((m) => (
@@ -76,7 +82,13 @@ export function Chat() {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKey}
         />
-        <button type="button" className="btn primary" data-testid="chat-send" onClick={submit} disabled={!text.trim()}>
+        <button
+          type="button"
+          className="btn primary"
+          data-testid="chat-send"
+          onClick={submit}
+          disabled={!text.trim()}
+        >
           Send
         </button>
       </div>

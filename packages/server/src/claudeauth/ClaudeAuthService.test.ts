@@ -4,9 +4,16 @@ import { existsSync } from 'node:fs';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ClaudeAuthService, MAX_PENDING_LOGINS, type ClaudeAuthDeps, type ExecFileFn, type LoginChild } from './index.js';
+import {
+  ClaudeAuthService,
+  MAX_PENDING_LOGINS,
+  type ClaudeAuthDeps,
+  type ExecFileFn,
+  type LoginChild,
+} from './index.js';
 
-const URL_LINE = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=abc123\n";
+const URL_LINE =
+  "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=abc123\n";
 
 class FakeChild extends EventEmitter implements LoginChild {
   stdout = new EventEmitter();
@@ -44,7 +51,9 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 /** A CLI that prints the link, then accepts exactly `accept` by writing credentials and exiting 0. */
-function cliBehavior(opts: { accept?: string; noUrl?: boolean; exitEarly?: boolean; writeCreds?: boolean } = {}) {
+function cliBehavior(
+  opts: { accept?: string; noUrl?: boolean; exitEarly?: boolean; writeCreds?: boolean } = {},
+) {
   const accept = opts.accept ?? 'good-code';
   return (_cmd: string, args: string[], o: { env: NodeJS.ProcessEnv }): LoginChild => {
     const child = new FakeChild();
@@ -56,12 +65,18 @@ function cliBehavior(opts: { accept?: string; noUrl?: boolean; exitEarly?: boole
         if (opts.writeCreds !== false) {
           const dir = o.env.CLAUDE_CONFIG_DIR!;
           mkdirSync(dir, { recursive: true });
-          writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'staged' } }));
+          writeFileSync(
+            path.join(dir, '.credentials.json'),
+            JSON.stringify({ claudeAiOauth: { accessToken: 'staged' } }),
+          );
         }
         child.say('\nLogin successful\n');
         child.emit('exit', 0, null);
       } else {
-        child.stderr.emit('data', Buffer.from('Login failed: Request failed with status code 400\n'));
+        child.stderr.emit(
+          'data',
+          Buffer.from('Login failed: Request failed with status code 400\n'),
+        );
         child.emit('exit', 1, null);
       }
     };
@@ -78,10 +93,17 @@ function cliBehavior(opts: { accept?: string; noUrl?: boolean; exitEarly?: boole
   };
 }
 
-function make(overrides: Partial<ClaudeAuthDeps> & { cli?: Parameters<typeof cliBehavior>[0] } = {}) {
+function make(
+  overrides: Partial<ClaudeAuthDeps> & { cli?: Parameters<typeof cliBehavior>[0] } = {},
+) {
   const { cli, ...rest } = overrides;
   const service = new ClaudeAuthService({
-    config: { claudeConfigDir: configDir, claudeBinary: 'claude', claudeOauthToken: null, anthropicApiKey: null },
+    config: {
+      claudeConfigDir: configDir,
+      claudeBinary: 'claude',
+      claudeOauthToken: null,
+      anthropicApiKey: null,
+    },
     spawn: cliBehavior(cli),
     execFile: async () => {
       throw Object.assign(new Error('not logged in'), { code: 1 });
@@ -144,7 +166,10 @@ describe('startLogin', () => {
   });
 
   it('fails when no link appears in time', async () => {
-    const service = make({ cli: { noUrl: true }, timeouts: { urlMs: 30, codeMs: 200, loginMs: 5_000 } });
+    const service = make({
+      cli: { noUrl: true },
+      timeouts: { urlMs: 30, codeMs: 200, loginMs: 5_000 },
+    });
     await expect(service.startLogin()).rejects.toThrow(/did not offer/);
     expect(service.pendingCount).toBe(0);
     expect(children[0]!.killed).toBe(true);
@@ -266,16 +291,37 @@ describe('cancel and timeouts', () => {
 describe('status', () => {
   it('reports api key and oauth token from config without probing', async () => {
     const execFile = vi.fn();
-    const key = make({ config: { claudeConfigDir: configDir, claudeBinary: 'claude', claudeOauthToken: 'tok', anthropicApiKey: 'sk' }, execFile });
+    const key = make({
+      config: {
+        claudeConfigDir: configDir,
+        claudeBinary: 'claude',
+        claudeOauthToken: 'tok',
+        anthropicApiKey: 'sk',
+      },
+      execFile,
+    });
     expect(await key.status()).toMatchObject({ signedIn: true, method: 'api_key', account: null });
-    const token = make({ config: { claudeConfigDir: configDir, claudeBinary: 'claude', claudeOauthToken: 'tok', anthropicApiKey: null }, execFile });
+    const token = make({
+      config: {
+        claudeConfigDir: configDir,
+        claudeBinary: 'claude',
+        claudeOauthToken: 'tok',
+        anthropicApiKey: null,
+      },
+      execFile,
+    });
     expect(await token.status()).toMatchObject({ signedIn: true, method: 'oauth_token' });
     expect(execFile).not.toHaveBeenCalled();
   });
 
   it('uses `claude auth status` with the config dir and reads the account', async () => {
     const execFile = vi.fn<ExecFileFn>(async () => ({
-      stdout: JSON.stringify({ loggedIn: true, email: 'me@example.com', orgName: 'Me Inc', subscriptionType: 'max' }),
+      stdout: JSON.stringify({
+        loggedIn: true,
+        email: 'me@example.com',
+        orgName: 'Me Inc',
+        subscriptionType: 'max',
+      }),
       stderr: '',
     }));
     const service = make({ execFile });
@@ -393,7 +439,17 @@ describe('logout and env', () => {
 
   it('env() gives the SDK the config dir and the token when configured', () => {
     expect(make().env()).toEqual({ CLAUDE_CONFIG_DIR: configDir });
-    const withToken = make({ config: { claudeConfigDir: configDir, claudeBinary: 'claude', claudeOauthToken: 'tok', anthropicApiKey: null } });
-    expect(withToken.env()).toEqual({ CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_OAUTH_TOKEN: 'tok' });
+    const withToken = make({
+      config: {
+        claudeConfigDir: configDir,
+        claudeBinary: 'claude',
+        claudeOauthToken: 'tok',
+        anthropicApiKey: null,
+      },
+    });
+    expect(withToken.env()).toEqual({
+      CLAUDE_CONFIG_DIR: configDir,
+      CLAUDE_CODE_OAUTH_TOKEN: 'tok',
+    });
   });
 });

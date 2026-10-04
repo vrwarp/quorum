@@ -43,7 +43,12 @@ async function setup(tunables: ConstructorParameters<typeof RoomService>[0]['tun
       kind,
       title: 'Pick storage',
       branchBase: repo.refs.get('main')!,
-      options: branches.map((b, i) => ({ label: String.fromCharCode(65 + i), branch: b, summary: `s${i}`, tradeoffs: `t${i}` })),
+      options: branches.map((b, i) => ({
+        label: String.fromCharCode(65 + i),
+        branch: b,
+        summary: `s${i}`,
+        tradeoffs: `t${i}`,
+      })),
       triggerMessageIds: [],
     });
   const vote = (user: { id: string }, p: Proposal, i: number | 'reject') =>
@@ -55,7 +60,26 @@ async function setup(tunables: ConstructorParameters<typeof RoomService>[0]['tun
         : { type: 'vote.cast', proposalId: p.id, decision: 'approve', optionId: p.options[i]!.id },
     );
   const proposal = (id: string) => storage.proposals.get(id)!;
-  return { storage, git, runtime, clock, service, alice, bob, carol, room, repo, doc, connect, mkBranch, open, vote, proposal, logs, clients };
+  return {
+    storage,
+    git,
+    runtime,
+    clock,
+    service,
+    alice,
+    bob,
+    carol,
+    room,
+    repo,
+    doc,
+    connect,
+    mkBranch,
+    open,
+    vote,
+    proposal,
+    logs,
+    clients,
+  };
 }
 
 afterEach(() => {
@@ -74,29 +98,57 @@ describe('rooms and documents', () => {
     expect(head.meta?.actor).toMatchObject({ kind: 'user', userId: h.alice.id });
 
     const created = await h.service.createDocument(h.room.id, h.alice.id, 'Notes');
-    expect(events.some((e) => e.type === 'document.created' && e.document.id === created.id)).toBe(true);
+    expect(events.some((e) => e.type === 'document.created' && e.document.id === created.id)).toBe(
+      true,
+    );
     const state = await h.service.getState(h.room.id, h.alice.id);
     expect(state.documents.map((d) => d.path)).toEqual(['Plan.md', 'Notes.md']);
-    expect(state.recentMessages.some((m) => m.kind === 'system' && m.body.includes('Notes.md'))).toBe(true);
-    await expect(h.service.createDocument(h.room.id, h.alice.id, 'Notes')).rejects.toMatchObject({ code: 'conflict' });
+    expect(
+      state.recentMessages.some((m) => m.kind === 'system' && m.body.includes('Notes.md')),
+    ).toBe(true);
+    await expect(h.service.createDocument(h.room.id, h.alice.id, 'Notes')).rejects.toMatchObject({
+      code: 'conflict',
+    });
   });
 
   it('renames and archives documents through main', async () => {
     const h = await setup();
-    await h.service.handle(h.room.id, h.alice.id, { type: 'document.rename', documentId: h.doc.id, title: 'Roadmap' });
+    await h.service.handle(h.room.id, h.alice.id, {
+      type: 'document.rename',
+      documentId: h.doc.id,
+      title: 'Roadmap',
+    });
     expect(await h.repo.readFile('Roadmap.md')).toBe('# Plan\n');
     expect(await h.repo.readFile('Plan.md')).toBeNull();
-    await h.service.handle(h.room.id, h.alice.id, { type: 'document.archive', documentId: h.doc.id });
+    await h.service.handle(h.room.id, h.alice.id, {
+      type: 'document.archive',
+      documentId: h.doc.id,
+    });
     expect(await h.repo.readFile('Roadmap.md')).toBeNull();
     expect(h.storage.documents.get(h.doc.id)!.status).toBe('archived');
   });
 
-  it('only the owner can change the voting rule', async () => {
+  it('only the owner can change the voting rule, and everyone connected hears about it', async () => {
     const h = await setup();
-    await h.connect(h.bob);
-    await expect(h.service.handle(h.room.id, h.bob.id, { type: 'room.setRule', votingRule: 'majority' })).rejects.toMatchObject({ code: 'forbidden' });
+    const a = await h.connect(h.alice);
+    const b = await h.connect(h.bob);
+    await expect(
+      h.service.handle(h.room.id, h.bob.id, { type: 'room.setRule', votingRule: 'majority' }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    const updates = (events: ServerEvent[]) => events.filter((e) => e.type === 'room.updated');
+    expect(updates(b.events)).toHaveLength(0);
     await h.service.handle(h.room.id, h.alice.id, { type: 'room.setRule', votingRule: 'majority' });
     expect(h.storage.rooms.get(h.room.id)!.votingRule).toBe('majority');
+    for (const events of [a.events, b.events])
+      expect(updates(events)).toEqual([
+        {
+          type: 'room.updated',
+          room: expect.objectContaining({ id: h.room.id, votingRule: 'majority' }),
+        },
+      ]);
+    // setting the rule it already has is not an event
+    await h.service.handle(h.room.id, h.alice.id, { type: 'room.setRule', votingRule: 'majority' });
+    expect(updates(b.events)).toHaveLength(1);
   });
 });
 
@@ -104,19 +156,42 @@ describe('messages', () => {
   it('routes human chat to the runtime and persists it', async () => {
     const h = await setup();
     const a = await h.connect(h.alice);
-    await h.service.handle(h.room.id, h.alice.id, { type: 'chat.send', body: 'please add a section' });
+    await h.service.handle(h.room.id, h.alice.id, {
+      type: 'chat.send',
+      body: 'please add a section',
+    });
     expect(h.runtime.chat).toHaveLength(1);
     expect(h.runtime.chat[0]!.author).toMatchObject({ kind: 'user', displayName: 'Alice' });
-    expect(a.events.some((e) => e.type === 'chat.message' && e.message.body === 'please add a section')).toBe(true);
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'chat.send', body: '  ' })).rejects.toBeInstanceOf(RoomError);
+    expect(
+      a.events.some((e) => e.type === 'chat.message' && e.message.body === 'please add a section'),
+    ).toBe(true);
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, { type: 'chat.send', body: '  ' }),
+    ).rejects.toBeInstanceOf(RoomError);
   });
 
   it('creates suggestion and ask cards and notifies the runtime', async () => {
     const h = await setup();
-    const anchor: Anchor = { documentId: h.doc.id, baseSha: 'x', startLine: 1, endLine: 1, textHash: textHash('# Plan'), text: '# Plan' };
-    await h.service.handle(h.room.id, h.alice.id, { type: 'suggestion.create', anchor, replacement: '# Plan v2', note: 'rename' });
+    const anchor: Anchor = {
+      documentId: h.doc.id,
+      baseSha: 'x',
+      startLine: 1,
+      endLine: 1,
+      textHash: textHash('# Plan'),
+      text: '# Plan',
+    };
+    await h.service.handle(h.room.id, h.alice.id, {
+      type: 'suggestion.create',
+      anchor,
+      replacement: '# Plan v2',
+      note: 'rename',
+    });
     await h.service.handle(h.room.id, h.alice.id, { type: 'ask.create', anchor, question: 'why?' });
-    expect(h.runtime.suggestions[0]!.card).toMatchObject({ type: 'suggestion', status: 'pending', replacement: '# Plan v2' });
+    expect(h.runtime.suggestions[0]!.card).toMatchObject({
+      type: 'suggestion',
+      status: 'pending',
+      replacement: '# Plan v2',
+    });
     expect(h.runtime.asks[0]!.card).toMatchObject({ type: 'ask', question: 'why?' });
     expect(h.runtime.chat).toHaveLength(0);
   });
@@ -126,8 +201,12 @@ describe('messages', () => {
     const a = await h.connect(h.alice);
     const b = await h.connect(h.bob);
     await h.service.sendPrivate(h.room.id, h.bob.id, { body: 'secret digest' });
-    expect(b.events.some((e) => e.type === 'chat.message' && e.message.body === 'secret digest')).toBe(true);
-    expect(a.events.some((e) => e.type === 'chat.message' && e.message.body === 'secret digest')).toBe(false);
+    expect(
+      b.events.some((e) => e.type === 'chat.message' && e.message.body === 'secret digest'),
+    ).toBe(true);
+    expect(
+      a.events.some((e) => e.type === 'chat.message' && e.message.body === 'secret digest'),
+    ).toBe(false);
     const forAlice = await h.service.getState(h.room.id, h.alice.id);
     expect(forAlice.recentMessages.some((m: Message) => m.body === 'secret digest')).toBe(false);
     const forBob = await h.service.getState(h.room.id, h.bob.id);
@@ -138,7 +217,9 @@ describe('messages', () => {
     const h = await setup();
     h.runtime.throwEverywhere = true;
     await h.connect(h.alice);
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'chat.send', body: 'hi' })).resolves.toBeUndefined();
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, { type: 'chat.send', body: 'hi' }),
+    ).resolves.toBeUndefined();
     expect(h.logs.some((l) => l.includes('onChatMessage'))).toBe(true);
   });
 });
@@ -152,7 +233,9 @@ describe('proposals', () => {
     await expect(h.open('review', ['plan/nothing'])).rejects.toMatchObject({ code: 'invalid' });
     h.mkBranch('plan/ok', 'ok');
     h.repo.commitOnBranch('plan/bad2', { 'Other.md': 'z' });
-    await expect(h.open('quorum', ['plan/ok', 'plan/bad2'])).rejects.toMatchObject({ code: 'invalid' });
+    await expect(h.open('quorum', ['plan/ok', 'plan/bad2'])).rejects.toMatchObject({
+      code: 'invalid',
+    });
     expect(h.storage.proposals.list(h.room.id)).toHaveLength(0);
   });
 
@@ -165,8 +248,13 @@ describe('proposals', () => {
     expect(p.windowClosesAt).toBe(new Date(T0 + 120_000).toISOString());
     const stored = h.proposal(p.id);
     expect(stored.cardMessageId).toBeTruthy();
-    expect(h.storage.messages.get(stored.cardMessageId!)!.card).toEqual({ type: 'review', proposalId: p.id });
-    expect(a.events.some((e) => e.type === 'proposal.updated' && e.proposal.id === p.id)).toBe(true);
+    expect(h.storage.messages.get(stored.cardMessageId!)!.card).toEqual({
+      type: 'review',
+      proposalId: p.id,
+    });
+    expect(a.events.some((e) => e.type === 'proposal.updated' && e.proposal.id === p.id)).toBe(
+      true,
+    );
     await h.service.close();
   });
 
@@ -193,7 +281,10 @@ describe('proposals', () => {
     expect(await h.repo.readFile('Plan.md')).toBe('A');
     expect(h.repo.tags.has('milestone/1')).toBe(true);
     expect(h.runtime.proposalEvents.at(-1)).toMatchObject({ type: 'merged', reconciled: false });
-    expect(h.storage.changes.get(merged.mergeSha!)).toMatchObject({ proposalId: p.id, actor: { kind: 'agent', role: 'merge' } });
+    expect(h.storage.changes.get(merged.mergeSha!)).toMatchObject({
+      proposalId: p.id,
+      actor: { kind: 'agent', role: 'merge' },
+    });
     await expect(h.vote(h.alice, p, 1)).rejects.toMatchObject({ code: 'conflict' });
   });
 
@@ -220,9 +311,28 @@ describe('proposals', () => {
     h.mkBranch('plan/a', 'A');
     h.mkBranch('plan/b', 'B');
     const q = await h.open('quorum', ['plan/a', 'plan/b']);
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'vote.cast', proposalId: q.id, decision: 'approve' })).rejects.toMatchObject({ code: 'invalid' });
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'vote.cast', proposalId: q.id, decision: 'approve', optionId: 'opt_nope' })).rejects.toMatchObject({ code: 'invalid' });
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'vote.cast', proposalId: 'prop_nope', decision: 'approve' })).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, {
+        type: 'vote.cast',
+        proposalId: q.id,
+        decision: 'approve',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid' });
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, {
+        type: 'vote.cast',
+        proposalId: q.id,
+        decision: 'approve',
+        optionId: 'opt_nope',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid' });
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, {
+        type: 'vote.cast',
+        proposalId: 'prop_nope',
+        decision: 'approve',
+      }),
+    ).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('review: a rejection archives the proposal', async () => {
@@ -268,7 +378,12 @@ describe('proposals', () => {
     h.mkBranch('plan/a', 'A');
     const p = await h.open('review', ['plan/a']);
     // main moves after the branch point
-    await h.repo.withMainLock(() => h.repo.commitToMain({ 'Side.md': 'side' }, 'side', { actor: { kind: 'agent', role: 'orchestrator' }, triggerMessageIds: [] }));
+    await h.repo.withMainLock(() =>
+      h.repo.commitToMain({ 'Side.md': 'side' }, 'side', {
+        actor: { kind: 'agent', role: 'orchestrator' },
+        triggerMessageIds: [],
+      }),
+    );
     await h.vote(h.alice, p, 0);
     await h.service.idle();
     expect(h.runtime.mergeDriverCalls).toHaveLength(1);
@@ -286,7 +401,12 @@ describe('proposals', () => {
     const a = await h.connect(h.alice);
     h.mkBranch('plan/a', 'A');
     const p = await h.open('review', ['plan/a']);
-    await h.repo.withMainLock(() => h.repo.commitToMain({ 'Side.md': 'side' }, 'side', { actor: { kind: 'agent', role: 'orchestrator' }, triggerMessageIds: [] }));
+    await h.repo.withMainLock(() =>
+      h.repo.commitToMain({ 'Side.md': 'side' }, 'side', {
+        actor: { kind: 'agent', role: 'orchestrator' },
+        triggerMessageIds: [],
+      }),
+    );
     h.runtime.mergeDriver = async () => {
       throw new Error('cannot reconcile');
     };
@@ -294,8 +414,18 @@ describe('proposals', () => {
     await h.service.idle();
     expect(h.proposal(p.id).state).toBe('open');
     expect(h.repo.aborted).toHaveLength(1);
-    expect(h.runtime.proposalEvents.at(-1)).toMatchObject({ type: 'merge_failed', reason: 'cannot reconcile' });
-    expect(a.events.some((e) => e.type === 'chat.message' && e.message.kind === 'system' && e.message.body.includes('failed'))).toBe(true);
+    expect(h.runtime.proposalEvents.at(-1)).toMatchObject({
+      type: 'merge_failed',
+      reason: 'cannot reconcile',
+    });
+    expect(
+      a.events.some(
+        (e) =>
+          e.type === 'chat.message' &&
+          e.message.kind === 'system' &&
+          e.message.body.includes('failed'),
+      ),
+    ).toBe(true);
     await h.service.close();
   });
 
@@ -326,7 +456,10 @@ describe('changes and revert', () => {
     const h = await setup();
     const a = await h.connect(h.alice);
     const sha = await h.repo.withMainLock(() =>
-      h.repo.commitToMain({ 'Plan.md': '# Plan\nmore\n' }, 'add more', { actor: { kind: 'agent', role: 'orchestrator' }, triggerMessageIds: [] }),
+      h.repo.commitToMain({ 'Plan.md': '# Plan\nmore\n' }, 'add more', {
+        actor: { kind: 'agent', role: 'orchestrator' },
+        triggerMessageIds: [],
+      }),
     );
     const change = await h.service.recordChange(h.room.id, {
       sha,
@@ -343,30 +476,73 @@ describe('changes and revert', () => {
   it('recordChange persists, posts a Change card and broadcasts document.updated', async () => {
     const { h, a, sha } = await withChange();
     expect(a.events.some((e) => e.type === 'document.updated' && e.headSha === sha)).toBe(true);
-    expect(a.events.some((e) => e.type === 'chat.message' && e.message.card?.type === 'change')).toBe(true);
+    expect(
+      a.events.some((e) => e.type === 'chat.message' && e.message.card?.type === 'change'),
+    ).toBe(true);
     expect(h.storage.changes.get(sha)).toBeTruthy();
   });
 
   it('reverts mechanically through the lock', async () => {
     const { h, a, sha } = await withChange();
-    await h.service.handle(h.room.id, h.bob.id, { type: 'revert.request', sha }).catch((e) => expect(e.code).toBe('forbidden'));
+    await h.service
+      .handle(h.room.id, h.bob.id, { type: 'revert.request', sha })
+      .catch((e) => expect(e.code).toBe('forbidden'));
     await h.service.handle(h.room.id, h.alice.id, { type: 'revert.request', sha });
     expect(await h.repo.readFile('Plan.md')).toBe('# Plan\n');
     const orig = h.storage.changes.get(sha)!;
     expect(orig.revertedBySha).toBeTruthy();
     expect(h.storage.changes.get(orig.revertedBySha!)).toMatchObject({ revertsSha: sha });
     expect(h.runtime.reverted).toHaveLength(1);
-    expect(a.events.some((e) => e.type === 'document.updated' && e.headSha === orig.revertedBySha)).toBe(true);
-    await expect(h.service.handle(h.room.id, h.alice.id, { type: 'revert.request', sha })).rejects.toMatchObject({ code: 'conflict' });
+    expect(
+      a.events.some((e) => e.type === 'document.updated' && e.headSha === orig.revertedBySha),
+    ).toBe(true);
+    await expect(
+      h.service.handle(h.room.id, h.alice.id, { type: 'revert.request', sha }),
+    ).rejects.toMatchObject({ code: 'conflict' });
+  });
+
+  it('flags the Change card as reverted, live and in storage', async () => {
+    const { h, a, sha } = await withChange();
+    const cardOf = (m: Message) => (m.card?.type === 'change' ? m.card.change : null);
+    expect(
+      h.storage.messages
+        .list(h.room.id, { limit: 50 })
+        .map(cardOf)
+        .find((c) => c?.sha === sha)?.revertedBySha,
+    ).toBeNull();
+    await h.service.handle(h.room.id, h.alice.id, { type: 'revert.request', sha });
+    const revertSha = h.storage.changes.get(sha)!.revertedBySha;
+    expect(revertSha).toBeTruthy();
+    const updates = a.events.filter(
+      (e): e is Extract<ServerEvent, { type: 'chat.updated' }> => e.type === 'chat.updated',
+    );
+    expect(updates.map((e) => cardOf(e.message))).toEqual([
+      expect.objectContaining({ sha, revertedBySha: revertSha }),
+    ]);
+    const stored = h.storage.messages.list(h.room.id, { limit: 50 }).map(cardOf);
+    expect(stored.find((c) => c?.sha === sha)?.revertedBySha).toBe(revertSha);
+    // the revert itself shows as a new, separate Change card
+    expect(stored.find((c) => c?.sha === revertSha)).toMatchObject({
+      revertsSha: sha,
+      revertedBySha: null,
+    });
   });
 
   it('falls back to the semantic revert when git revert conflicts', async () => {
     const { h, sha } = await withChange();
     await h.repo.withMainLock(() =>
-      h.repo.commitToMain({ 'Plan.md': '# Plan\nmore\nlater\n' }, 'later', { actor: { kind: 'agent', role: 'orchestrator' }, triggerMessageIds: [] }),
+      h.repo.commitToMain({ 'Plan.md': '# Plan\nmore\nlater\n' }, 'later', {
+        actor: { kind: 'agent', role: 'orchestrator' },
+        triggerMessageIds: [],
+      }),
     );
     h.runtime.semanticRevert = async () =>
-      h.repo.withMainLock(() => h.repo.commitToMain({ 'Plan.md': '# Plan\nlater\n' }, 'semantic revert', { actor: { kind: 'agent', role: 'merge' }, triggerMessageIds: [] }));
+      h.repo.withMainLock(() =>
+        h.repo.commitToMain({ 'Plan.md': '# Plan\nlater\n' }, 'semantic revert', {
+          actor: { kind: 'agent', role: 'merge' },
+          triggerMessageIds: [],
+        }),
+      );
     await h.service.handle(h.room.id, h.alice.id, { type: 'revert.request', sha });
     expect(await h.repo.readFile('Plan.md')).toBe('# Plan\nlater\n');
     expect(h.storage.changes.get(sha)!.revertedBySha).toBeTruthy();
@@ -379,10 +555,17 @@ describe('presence and digest', () => {
     const h = await setup({ digestAbsenceMs: 120_000 });
     const a = await h.connect(h.alice);
     const b = await h.connect(h.bob);
-    expect(a.events.some((e) => e.type === 'presence.update' && e.presence.find((p) => p.userId === h.bob.id)?.connected)).toBe(true);
+    expect(
+      a.events.some(
+        (e) =>
+          e.type === 'presence.update' && e.presence.find((p) => p.userId === h.bob.id)?.connected,
+      ),
+    ).toBe(true);
     b.disconnect();
     expect(a.events.filter((e) => e.type === 'presence.update').at(-1)).toMatchObject({
-      presence: expect.arrayContaining([expect.objectContaining({ userId: h.bob.id, connected: false })]),
+      presence: expect.arrayContaining([
+        expect.objectContaining({ userId: h.bob.id, connected: false }),
+      ]),
     });
 
     // short absence, with an event: no digest
@@ -409,7 +592,16 @@ describe('presence and digest', () => {
     await h.service.idle();
     expect(h.runtime.digests).toHaveLength(1);
     expect(h.runtime.digests[0]!.events.join('\n')).toContain('Notes');
-    expect(b4.events.some((e) => e.type === 'chat.message' && e.message.card?.type === 'digest' && e.message.privateTo === h.bob.id)).toBe(true);
-    expect(a.events.some((e) => e.type === 'chat.message' && e.message.card?.type === 'digest')).toBe(false);
+    expect(
+      b4.events.some(
+        (e) =>
+          e.type === 'chat.message' &&
+          e.message.card?.type === 'digest' &&
+          e.message.privateTo === h.bob.id,
+      ),
+    ).toBe(true);
+    expect(
+      a.events.some((e) => e.type === 'chat.message' && e.message.card?.type === 'digest'),
+    ).toBe(false);
   });
 });

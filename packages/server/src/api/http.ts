@@ -15,11 +15,17 @@ export interface HttpOptions {
     RoomService,
     'createRoom' | 'listRooms' | 'getState' | 'getRoom' | 'repo' | 'listMessages'
   >;
-  storage: Pick<Storage, 'users' | 'sessions' | 'rooms' | 'documents' | 'proposals' | 'changes' | 'usage' | 'messages'>;
+  storage: Pick<
+    Storage,
+    'users' | 'sessions' | 'rooms' | 'documents' | 'proposals' | 'changes' | 'usage' | 'messages'
+  >;
   config: Pick<ServerConfig, 'password' | 'clientDistDir'>;
   logger?: Logger;
   /** The server's Claude credential (web sign-in). When absent, `/api/claude/*` answers 503. */
-  claudeAuth?: Pick<ClaudeAuthService, 'status' | 'startLogin' | 'submitCode' | 'cancel' | 'logout'>;
+  claudeAuth?: Pick<
+    ClaudeAuthService,
+    'status' | 'startLogin' | 'submitCode' | 'cancel' | 'logout'
+  >;
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -34,7 +40,13 @@ class HttpError extends Error {
   }
 }
 
-const ROOM_STATUS: Record<RoomErrorCode, number> = { not_found: 404, forbidden: 403, invalid: 400, conflict: 409, internal: 500 };
+const ROOM_STATUS: Record<RoomErrorCode, number> = {
+  not_found: 404,
+  forbidden: 403,
+  invalid: 400,
+  conflict: 409,
+  internal: 500,
+};
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -55,9 +67,19 @@ const MIME: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string | string[]> = {}): void {
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Record<string, string | string[]> = {},
+): void {
   const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text), 'cache-control': 'no-store', ...headers });
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'cache-control': 'no-store',
+    ...headers,
+  });
   res.end(text);
 }
 
@@ -66,7 +88,8 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'payload_too_large', 'request body too large');
+    if (size > MAX_BODY_BYTES)
+      throw new HttpError(413, 'payload_too_large', 'request body too large');
     chunks.push(chunk as Buffer);
   }
   if (size === 0) return {};
@@ -98,7 +121,8 @@ class Throttle {
 
 /** git ref/sha as accepted from the query string: no leading dash, no odd characters. */
 function safeRef(ref: string): string {
-  if (!/^[A-Za-z0-9._/~^-]+$/.test(ref) || ref.startsWith('-') || ref.includes('..')) throw new HttpError(400, 'bad_ref', 'invalid ref');
+  if (!/^[A-Za-z0-9._/~^-]+$/.test(ref) || ref.startsWith('-') || ref.includes('..'))
+    throw new HttpError(400, 'bad_ref', 'invalid ref');
   return ref;
 }
 
@@ -123,7 +147,12 @@ export function createHttpServer(opts: HttpOptions): Server {
       const body = await readJson(req);
       try {
         const { token, user } = auth.login(body.password, body.displayName);
-        sendJson(res, 200, { userId: user.id, displayName: user.displayName }, { 'set-cookie': auth.sessionCookie(token, secure) });
+        sendJson(
+          res,
+          200,
+          { userId: user.id, displayName: user.displayName },
+          { 'set-cookie': auth.sessionCookie(token, secure) },
+        );
       } catch (err) {
         if (err instanceof AuthError) throw new HttpError(err.status, err.code, err.message);
         throw err;
@@ -157,7 +186,8 @@ export function createHttpServer(opts: HttpOptions): Server {
     if (method === 'POST' && p === '/api/rooms') {
       const u = requireUser();
       const body = await readJson(req);
-      if (typeof body.name !== 'string') throw new HttpError(400, 'bad_request', 'name is required');
+      if (typeof body.name !== 'string')
+        throw new HttpError(400, 'bad_request', 'name is required');
       sendJson(res, 201, await service.createRoom(u.id, body.name));
       return true;
     }
@@ -165,7 +195,12 @@ export function createHttpServer(opts: HttpOptions): Server {
     if (p.startsWith('/api/claude/')) {
       requireUser();
       const claude = opts.claudeAuth;
-      if (!claude) throw new HttpError(503, 'claude_auth_unavailable', 'Claude sign-in is not available on this server');
+      if (!claude)
+        throw new HttpError(
+          503,
+          'claude_auth_unavailable',
+          'Claude sign-in is not available on this server',
+        );
       const ip = req.socket.remoteAddress ?? 'unknown';
 
       if (method === 'GET' && p === '/api/claude/status') {
@@ -175,32 +210,55 @@ export function createHttpServer(opts: HttpOptions): Server {
       if (method === 'POST' && p === '/api/claude/login/start') {
         const body = await readJson(req);
         const mode = body.mode ?? 'claudeai';
-        if (mode !== 'claudeai' && mode !== 'console') throw new HttpError(400, 'bad_request', 'mode must be "claudeai" or "console"');
-        if (!loginStartThrottle.allow(ip)) throw new HttpError(429, 'rate_limited', 'Too many sign-in attempts. Wait a few minutes.');
+        if (mode !== 'claudeai' && mode !== 'console')
+          throw new HttpError(400, 'bad_request', 'mode must be "claudeai" or "console"');
+        if (!loginStartThrottle.allow(ip))
+          throw new HttpError(
+            429,
+            'rate_limited',
+            'Too many sign-in attempts. Wait a few minutes.',
+          );
         try {
           const login = await claude.startLogin(mode);
           sendJson(res, 200, { loginId: login.loginId, url: login.url });
         } catch (err) {
-          if (err instanceof LoginLimitError) throw new HttpError(429, 'too_many_logins', err.message);
+          if (err instanceof LoginLimitError)
+            throw new HttpError(429, 'too_many_logins', err.message);
           log('warn', 'could not start a claude sign-in', { err: String(err) });
-          throw new HttpError(502, 'claude_login_failed', err instanceof Error ? err.message : 'Could not start the sign-in.');
+          throw new HttpError(
+            502,
+            'claude_login_failed',
+            err instanceof Error ? err.message : 'Could not start the sign-in.',
+          );
         }
         return true;
       }
       if (method === 'POST' && p === '/api/claude/login/code') {
         const body = await readJson(req);
-        if (typeof body.loginId !== 'string' || !body.loginId || typeof body.code !== 'string' || !body.code.trim()) {
+        if (
+          typeof body.loginId !== 'string' ||
+          !body.loginId ||
+          typeof body.code !== 'string' ||
+          !body.code.trim()
+        ) {
           throw new HttpError(400, 'bad_request', 'loginId and code are required');
         }
-        if (!loginCodeThrottle.allow(ip)) throw new HttpError(429, 'rate_limited', 'Too many attempts. Wait a few minutes.');
+        if (!loginCodeThrottle.allow(ip))
+          throw new HttpError(429, 'rate_limited', 'Too many attempts. Wait a few minutes.');
         const result = await claude.submitCode(body.loginId, body.code);
-        if (!result.ok) throw new HttpError(400, 'claude_login_failed', result.error ?? 'The code was not accepted.');
+        if (!result.ok)
+          throw new HttpError(
+            400,
+            'claude_login_failed',
+            result.error ?? 'The code was not accepted.',
+          );
         sendJson(res, 200, await claude.status());
         return true;
       }
       if (method === 'POST' && p === '/api/claude/login/cancel') {
         const body = await readJson(req);
-        if (typeof body.loginId !== 'string' || !body.loginId) throw new HttpError(400, 'bad_request', 'loginId is required');
+        if (typeof body.loginId !== 'string' || !body.loginId)
+          throw new HttpError(400, 'bad_request', 'loginId is required');
         claude.cancel(body.loginId);
         sendJson(res, 200, { ok: true });
         return true;
@@ -225,7 +283,10 @@ export function createHttpServer(opts: HttpOptions): Server {
         return true;
       }
       if (rest.length === 1 && rest[0] === 'messages') {
-        const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 1), 200);
+        const limit = Math.min(
+          Math.max(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 1),
+          200,
+        );
         const before = url.searchParams.get('before') ?? undefined;
         sendJson(res, 200, service.listMessages(roomId, u.id, { before, limit }));
         return true;
@@ -236,19 +297,24 @@ export function createHttpServer(opts: HttpOptions): Server {
       }
       if (rest.length === 2 && rest[0] === 'documents') {
         const doc = storage.documents.get(rest[1]!);
-        if (!doc || doc.roomId !== roomId) throw new HttpError(404, 'not_found', 'document not found');
+        if (!doc || doc.roomId !== roomId)
+          throw new HttpError(404, 'not_found', 'document not found');
         const ref = safeRef(url.searchParams.get('ref') ?? 'main');
         const repo = await service.repo(roomId);
         const [content, sha] = await Promise.all([repo.readFile(doc.path, ref), repo.headSha(ref)]);
-        if (content === null || sha === null) throw new HttpError(404, 'not_found', 'document not found at ref');
+        if (content === null || sha === null)
+          throw new HttpError(404, 'not_found', 'document not found at ref');
         sendJson(res, 200, { path: doc.path, ref, sha, content });
         return true;
       }
       if (rest.length === 3 && rest[0] === 'proposals' && rest[2] === 'diff') {
         const proposal: Proposal | null = storage.proposals.get(rest[1]!);
-        if (!proposal || proposal.roomId !== roomId) throw new HttpError(404, 'not_found', 'proposal not found');
+        if (!proposal || proposal.roomId !== roomId)
+          throw new HttpError(404, 'not_found', 'proposal not found');
         const optionId = url.searchParams.get('optionId');
-        const option = optionId ? proposal.options.find((o) => o.id === optionId) : proposal.options[0];
+        const option = optionId
+          ? proposal.options.find((o) => o.id === optionId)
+          : proposal.options[0];
         if (!option) throw new HttpError(404, 'not_found', 'option not found');
         const doc = storage.documents.get(proposal.documentId);
         if (!doc) throw new HttpError(404, 'not_found', 'document not found');
@@ -274,7 +340,8 @@ export function createHttpServer(opts: HttpOptions): Server {
       if (rest.length === 3 && rest[0] === 'changes' && rest[2] === 'diff') {
         const sha = safeRef(rest[1]!);
         const change = storage.changes.get(sha);
-        if (!change || change.roomId !== roomId) throw new HttpError(404, 'not_found', 'change not found');
+        if (!change || change.roomId !== roomId)
+          throw new HttpError(404, 'not_found', 'change not found');
         const doc = storage.documents.get(change.documentId);
         if (!doc) throw new HttpError(404, 'not_found', 'document not found');
         const repo = await service.repo(roomId);
@@ -284,7 +351,15 @@ export function createHttpServer(opts: HttpOptions): Server {
           repo.readFile(doc.path, sha),
           repo.diff(doc.path, parent, sha),
         ]);
-        const out: DiffResponse = { documentId: doc.id, path: doc.path, baseSha: parent, headSha: sha, before: before ?? '', after: after ?? '', unified };
+        const out: DiffResponse = {
+          documentId: doc.id,
+          path: doc.path,
+          baseSha: parent,
+          headSha: sha,
+          before: before ?? '',
+          after: after ?? '',
+          unified,
+        };
         sendJson(res, 200, out);
         return true;
       }
@@ -292,8 +367,13 @@ export function createHttpServer(opts: HttpOptions): Server {
     return false;
   }
 
-  async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
-    if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed', 'method not allowed');
+  async function serveStatic(
+    req: IncomingMessage,
+    res: ServerResponse,
+    pathname: string,
+  ): Promise<void> {
+    if (req.method !== 'GET' && req.method !== 'HEAD')
+      throw new HttpError(405, 'method_not_allowed', 'method not allowed');
     let rel: string;
     try {
       rel = decodeURIComponent(pathname);
@@ -336,15 +416,30 @@ export function createHttpServer(opts: HttpOptions): Server {
           if (await route(req, res, url)) return;
           throw new HttpError(404, 'not_found', 'unknown API route');
         }
-        if (url.pathname === '/ws' || url.pathname.startsWith('/ws/')) throw new HttpError(404, 'not_found', 'not found');
+        if (url.pathname === '/ws' || url.pathname.startsWith('/ws/'))
+          throw new HttpError(404, 'not_found', 'not found');
         await serveStatic(req, res, url.pathname);
       } catch (err) {
         let status = 500;
         let code = 'internal';
         let message = 'internal error';
-        if (err instanceof HttpError) ({ status, code, message } = { status: err.status, code: err.code, message: err.message });
-        else if (err instanceof RoomError) ({ status, code, message } = { status: ROOM_STATUS[err.code], code: err.code, message: err.message });
-        else log('error', 'request failed', { url: req.url, err: String((err as Error)?.stack ?? err) });
+        if (err instanceof HttpError)
+          ({ status, code, message } = {
+            status: err.status,
+            code: err.code,
+            message: err.message,
+          });
+        else if (err instanceof RoomError)
+          ({ status, code, message } = {
+            status: ROOM_STATUS[err.code],
+            code: err.code,
+            message: err.message,
+          });
+        else
+          log('error', 'request failed', {
+            url: req.url,
+            err: String((err as Error)?.stack ?? err),
+          });
         if (res.headersSent) return void res.destroy();
         sendJson(res, status, { error: code, message });
       }

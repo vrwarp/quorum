@@ -59,7 +59,11 @@ export interface RoomRepository {
 
   /** Write files in the main worktree and commit (call inside withMainLock). Returns the new sha.
    *  Runs the formatter before committing. Throws if nothing changed. */
-  commitToMain(files: Record<string, string | null>, subject: string, meta: CommitMeta): Promise<Sha>;
+  commitToMain(
+    files: Record<string, string | null>,
+    subject: string,
+    meta: CommitMeta,
+  ): Promise<Sha>;
 
   /** Commit whatever is currently modified in a worktree (used after an agent edited files directly). */
   commitWorktree(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha | null>; // null if clean
@@ -86,7 +90,11 @@ export interface RoomRepository {
   /** merge-base of main and a branch */
   mergeBase(refA: string, refB: string): Promise<Sha>;
   /** number of existing lines deleted/modified in `path` between refs (for the size rule) */
-  rewrittenLineCount(path: string, fromRef: string, toRef: string): Promise<{ removed: number; added: number }>;
+  rewrittenLineCount(
+    path: string,
+    fromRef: string,
+    toRef: string,
+  ): Promise<{ removed: number; added: number }>;
 
   /**
    * Begin merging `branch` into main (call inside withMainLock). Fast-forwards when possible and
@@ -107,7 +115,10 @@ export interface RoomRepository {
 }
 
 export class RevertConflictError extends Error {
-  constructor(public readonly sha: Sha, public readonly conflictedFiles: string[]) {
+  constructor(
+    public readonly sha: Sha,
+    public readonly conflictedFiles: string[],
+  ) {
     super(`revert of ${sha} conflicts`);
   }
 }

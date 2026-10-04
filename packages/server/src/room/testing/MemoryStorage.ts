@@ -35,7 +35,8 @@ export class MemoryStorage implements Storage {
       return u;
     },
     get: (id: string) => this._users.get(id) ?? null,
-    findByDisplayName: (name: string) => [...this._users.values()].find((u) => u.displayName === name) ?? null,
+    findByDisplayName: (name: string) =>
+      [...this._users.values()].find((u) => u.displayName === name) ?? null,
   };
 
   sessions = {
@@ -49,7 +50,11 @@ export class MemoryStorage implements Storage {
   };
 
   rooms = {
-    create: (input: { name: string; ownerId: string; votingRule?: 'unanimous' | 'majority' }): Room => {
+    create: (input: {
+      name: string;
+      ownerId: string;
+      votingRule?: 'unanimous' | 'majority';
+    }): Room => {
       const room: Room = {
         id: newId('room'),
         name: input.name,
@@ -72,15 +77,23 @@ export class MemoryStorage implements Storage {
       if (r) r.archivedAt = this.clock().toISOString();
     },
     addParticipant: (p: Participant) => {
-      if (!this._participants.some((x) => x.roomId === p.roomId && x.userId === p.userId)) this._participants.push(p);
+      if (!this._participants.some((x) => x.roomId === p.roomId && x.userId === p.userId))
+        this._participants.push(p);
     },
     listParticipants: (roomId: string) => this._participants.filter((p) => p.roomId === roomId),
     upsertPresence: (roomId: string, userId: string, connected: boolean, at: string) => {
       const u = this._users.get(userId);
-      this._presence.set(`${roomId}:${userId}`, { userId, displayName: u?.displayName ?? userId, connected, lastSeenAt: at });
+      this._presence.set(`${roomId}:${userId}`, {
+        userId,
+        displayName: u?.displayName ?? userId,
+        connected,
+        lastSeenAt: at,
+      });
     },
-    listPresence: (roomId: string) => [...this._presence.entries()].filter(([k]) => k.startsWith(`${roomId}:`)).map(([, v]) => v),
-    getLastSeen: (roomId: string, userId: string) => this._presence.get(`${roomId}:${userId}`)?.lastSeenAt ?? null,
+    listPresence: (roomId: string) =>
+      [...this._presence.entries()].filter(([k]) => k.startsWith(`${roomId}:`)).map(([, v]) => v),
+    getLastSeen: (roomId: string, userId: string) =>
+      this._presence.get(`${roomId}:${userId}`)?.lastSeenAt ?? null,
   };
 
   messages = {
@@ -91,8 +104,13 @@ export class MemoryStorage implements Storage {
     },
     get: (id: string) => this._messages.find((m) => m.id === id) ?? null,
     getMany: (ids: string[]) => this._messages.filter((m) => ids.includes(m.id)),
-    list: (roomId: string, opts: { before?: string; after?: string; limit: number; forUser?: string }) => {
-      let ms = this._messages.filter((m) => m.roomId === roomId && (m.privateTo === null || m.privateTo === opts.forUser));
+    list: (
+      roomId: string,
+      opts: { before?: string; after?: string; limit: number; forUser?: string },
+    ) => {
+      let ms = this._messages.filter(
+        (m) => m.roomId === roomId && (m.privateTo === null || m.privateTo === opts.forUser),
+      );
       if (opts.before) {
         const i = ms.findIndex((m) => m.id === opts.before);
         if (i >= 0) ms = ms.slice(0, i);
@@ -108,7 +126,8 @@ export class MemoryStorage implements Storage {
       const i = sinceId ? ms.findIndex((m) => m.id === sinceId) : -1;
       return ms.slice(i + 1, i + 1 + limit);
     },
-    countSince: (roomId: string, sinceId: string | null) => this.messages.since(roomId, sinceId, Infinity).length,
+    countSince: (roomId: string, sinceId: string | null) =>
+      this.messages.since(roomId, sinceId, Infinity).length,
   };
 
   documents = {
@@ -125,9 +144,12 @@ export class MemoryStorage implements Storage {
       return d;
     },
     get: (id: string) => this._docs.get(id) ?? null,
-    getByPath: (roomId: string, path: string) => [...this._docs.values()].find((d) => d.roomId === roomId && d.path === path) ?? null,
+    getByPath: (roomId: string, path: string) =>
+      [...this._docs.values()].find((d) => d.roomId === roomId && d.path === path) ?? null,
     list: (roomId: string, includeArchived = false) =>
-      [...this._docs.values()].filter((d) => d.roomId === roomId && (includeArchived || d.status === 'active')),
+      [...this._docs.values()].filter(
+        (d) => d.roomId === roomId && (includeArchived || d.status === 'active'),
+      ),
     rename: (id: string, title: string, path: string) => {
       const d = this._docs.get(id);
       if (d) Object.assign(d, { title, path });
@@ -180,7 +202,9 @@ export class MemoryStorage implements Storage {
     },
     list: (roomId: string, opts?: { documentId?: string; limit?: number }) =>
       this._changes
-        .filter((c) => c.roomId === roomId && (!opts?.documentId || c.documentId === opts.documentId))
+        .filter(
+          (c) => c.roomId === roomId && (!opts?.documentId || c.documentId === opts.documentId),
+        )
         .slice(-(opts?.limit ?? 1000))
         .reverse()
         .map((c) => structuredClone(c)),
@@ -193,7 +217,8 @@ export class MemoryStorage implements Storage {
   usage = {
     insert: (r: UsageRecord) => void this._usage.push(r),
     summarize: (roomId: string) => {
-      const byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }> = {};
+      const byRole: Record<string, { costUsd: number; inputTokens: number; outputTokens: number }> =
+        {};
       let total = 0;
       for (const r of this._usage.filter((u) => u.roomId === roomId)) {
         const b = (byRole[r.role] ??= { costUsd: 0, inputTokens: 0, outputTokens: 0 });
