@@ -1,10 +1,11 @@
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { RoomState } from '@quorum/shared';
 import { createStubActions, type StubActions } from '../testing/stubActions.js';
 import { MemoryRepo } from '../testing/memoryRepo.js';
 import { makeProposal } from '../testing/fixtures.js';
+import { ScratchWorktree } from './scratch.js';
 import {
   evaluateVote,
   mcpToolNames,
@@ -19,15 +20,17 @@ const AGENT = { kind: 'agent', role: 'worker' } as const;
 interface Rig {
   repo: MemoryRepo;
   stub: StubActions;
+  /** the orchestrator's working copy: commit_main takes the edit from here */
+  scratch: ScratchWorktree;
   run(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean }>;
   explorations: ExplorationRequest[];
   statusCalls: Array<[string, string | null]>;
   logs: string[];
 }
 
-function rig(
+async function rig(
   opts: { withExploration?: boolean; withStatusHook?: boolean; limit?: number } = {},
-): Rig {
+): Promise<Rig> {
   const repo = new MemoryRepo('room_test', {
     'Architecture.md': DOC,
     'PRD.md': '# PRD\n\nGoals.\n',
@@ -43,6 +46,7 @@ function rig(
       { userId: 'user_bob', displayName: 'Bob' },
     ],
   });
+  const scratch = await ScratchWorktree.create(repo);
   const explorations: ExplorationRequest[] = [];
   const statusCalls: Rig['statusCalls'] = [];
   const logs: string[] = [];
@@ -50,12 +54,13 @@ function rig(
     roomId: stub.roomId,
     actions: stub.actions,
     repo,
+    scratch,
     logger: (_l, msg) => logs.push(msg),
     immediateRewriteLimit: opts.limit,
     startExploration: opts.withExploration
       ? async (req) => {
           explorations.push(req);
-          return { branchBase: 'abc', workers: [] };
+          return { explorationId: 'expl_1', branches: ['architecture/storage/a'], baseSha: 'abc' };
         }
       : undefined,
     setStatus: opts.withStatusHook ? (s, d) => statusCalls.push([s, d]) : undefined,
@@ -64,6 +69,7 @@ function rig(
   return {
     repo,
     stub,
+    scratch,
     explorations,
     statusCalls,
     logs,
@@ -79,8 +85,19 @@ function rig(
   };
 }
 
-function editMain(repo: MemoryRepo, file: string, content: string): void {
-  writeFileSync(join(repo.mainWorktree, file), content);
+/** What the model does with Edit/Write: change a file in its own working directory. */
+function edit(r: Rig, file: string, content: string): void {
+  writeFileSync(join(r.scratch.dir, file), content);
+}
+
+/** Another writer commits to main meanwhile (a participant creating or changing a document, a merge). */
+async function otherWriter(r: Rig, files: Record<string, string>, subject = 'Other change') {
+  return r.repo.withMainLock(() =>
+    r.repo.commitToMain(files, subject, {
+      actor: { kind: 'user', userId: 'user_bob', displayName: 'Bob' },
+      triggerMessageIds: [],
+    }),
+  );
 }
 
 async function branchWith(
@@ -95,8 +112,8 @@ async function branchWith(
 }
 
 describe('tool set', () => {
-  it('exposes the PRD tools under mcp__quorum__ names', () => {
-    const r = rig();
+  it('exposes the PRD tools under mcp__quorum__ names', async () => {
+    const r = await rig();
     const names = orchestratorTools({
       roomId: 'r',
       actions: r.stub.actions,
@@ -127,7 +144,7 @@ describe('tool set', () => {
   });
 
   it('returns failures as tool errors instead of throwing into the SDK', async () => {
-    const r = rig();
+    const r = await rig();
     const out = await r.run('close_proposal', { proposalId: 'prop_missing', reason: 'expired' });
     expect(out.isError).toBe(true);
     expect(out.text).toMatch(/close_proposal failed: no proposal prop_missing/);
@@ -137,8 +154,8 @@ describe('tool set', () => {
 
 describe('commit_main', () => {
   let r: Rig;
-  beforeEach(() => {
-    r = rig();
+  beforeEach(async () => {
+    r = await rig();
   });
 
   const args = (over: Record<string, unknown> = {}) => ({
@@ -148,9 +165,11 @@ describe('commit_main', () => {
     triggerMessageIds: ['msg_1'],
     ...over,
   });
+  const mainText = () => r.repo.readFile('Architecture.md');
+  const scratchText = (file = 'Architecture.md') => readFileSync(join(r.scratch.dir, file), 'utf8');
 
   it('commits the edit through the write queue with trailers and records a Change', async () => {
-    editMain(r.repo, 'Architecture.md', `${DOC}\n## Latency\n\np99 under 200 ms.\n`);
+    edit(r, 'Architecture.md', `${DOC}\n## Latency\n\np99 under 200 ms.\n`);
     const out = await r.run('commit_main', args());
     expect(out.isError).toBe(false);
     const sha = /committed ([0-9a-f]{40})/.exec(out.text)![1]!;
@@ -174,8 +193,20 @@ describe('commit_main', () => {
     });
   });
 
+  it("works on the orchestrator's own working copy, never on the main worktree", async () => {
+    edit(r, 'Architecture.md', `${DOC}\n## Latency\n\np99 under 200 ms.\n`);
+    // the edit is not visible to main in any way until commit_main takes it there
+    expect(readFileSync(join(r.repo.mainWorktree, 'Architecture.md'), 'utf8')).toBe(DOC);
+    expect(await mainText()).toBe(DOC);
+    expect(r.scratch.dir).not.toBe(r.repo.mainWorktree);
+    await r.run('commit_main', args());
+    // afterwards the working copy mirrors main again
+    expect(scratchText()).toBe(await mainText());
+    expect(r.scratch.base).toBe(await r.repo.headSha('main'));
+  });
+
   it('authors the commit as the participant when applying their suggestion', async () => {
-    editMain(r.repo, 'Architecture.md', DOC.replace('Para 2.', 'Para two, fixed.'));
+    edit(r, 'Architecture.md', DOC.replace('Para 2.', 'Para two, fixed.'));
     const out = await r.run(
       'commit_main',
       args({ subject: 'Apply suggestion', asUserId: 'user_bob' }),
@@ -191,7 +222,7 @@ describe('commit_main', () => {
   });
 
   it('rejects unknown participants, unknown documents and archived documents', async () => {
-    editMain(r.repo, 'Architecture.md', `${DOC}\nMore.\n`);
+    edit(r, 'Architecture.md', `${DOC}\nMore.\n`);
     expect((await r.run('commit_main', args({ asUserId: 'user_nobody' }))).text).toMatch(
       /unknown participant/,
     );
@@ -204,21 +235,22 @@ describe('commit_main', () => {
   });
 
   it('discards edits to other files: a change touches exactly one document', async () => {
-    editMain(r.repo, 'Architecture.md', `${DOC}\nAdded.\n`);
-    editMain(r.repo, 'PRD.md', '# PRD\n\nSneaky edit.\n');
-    editMain(r.repo, 'Notes.md', 'a new file');
+    edit(r, 'Architecture.md', `${DOC}\nAdded.\n`);
+    edit(r, 'PRD.md', '# PRD\n\nSneaky edit.\n');
+    edit(r, 'Notes.md', 'a new file');
     const out = await r.run('commit_main', args());
     expect(out.isError).toBe(false);
     expect(out.text).toMatch(/Changes to Notes\.md, PRD\.md were discarded/);
     const sha = /committed ([0-9a-f]{40})/.exec(out.text)![1]!;
     expect((await r.repo.show(sha)).files).toEqual(['Architecture.md']);
     expect(await r.repo.readFile('PRD.md')).toBe('# PRD\n\nGoals.\n');
-    expect(readFileSync(join(r.repo.mainWorktree, 'PRD.md'), 'utf8')).toBe('# PRD\n\nGoals.\n');
+    expect(scratchText('PRD.md')).toBe('# PRD\n\nGoals.\n');
+    expect(existsSync(join(r.scratch.dir, 'Notes.md'))).toBe(false);
     expect(await r.repo.listFiles()).toEqual(['Architecture.md', 'PRD.md']);
   });
 
   it('says so when only other files were touched, and commits nothing', async () => {
-    editMain(r.repo, 'PRD.md', 'changed');
+    edit(r, 'PRD.md', 'changed');
     const out = await r.run('commit_main', args());
     expect(out.isError).toBe(true);
     expect(out.text).toMatch(/Nothing to commit/);
@@ -228,39 +260,36 @@ describe('commit_main', () => {
 
   it('refuses a change that rewrites more paragraphs than the size rule allows, and discards the edit', async () => {
     const before = await r.repo.headSha('main');
-    editMain(r.repo, 'Architecture.md', '# Architecture\n\nPara 5.\n'); // removes paragraphs 1-4
+    edit(r, 'Architecture.md', '# Architecture\n\nPara 5.\n'); // removes paragraphs 1-4
     const out = await r.run('commit_main', args());
     expect(out.isError).toBe(true);
     expect(out.text).toMatch(/deletes or rewrites 4 existing paragraphs/);
     expect(out.text).toMatch(/at most 3/);
     expect(out.text).toMatch(/start_exploration/);
+    expect(out.text).toMatch(/exploration_finished/);
     expect(out.text).toMatch(/kind "review"/);
     expect(await r.repo.headSha('main')).toBe(before);
-    expect(readFileSync(join(r.repo.mainWorktree, 'Architecture.md'), 'utf8')).toBe(DOC);
+    expect(scratchText()).toBe(DOC); // the working copy is clean again
     expect(r.stub.changes).toHaveLength(0);
   });
 
   it('allows exactly the limit, and any amount of added text', async () => {
-    editMain(
-      r.repo,
+    edit(
+      r,
       'Architecture.md',
       DOC.replace('Para 1.', 'One.').replace('Para 2.', 'Two.').replace('Para 3.', 'Three.'),
     );
     expect((await r.run('commit_main', args())).isError).toBe(false); // 3 rewritten paragraphs
 
     const many = Array.from({ length: 30 }, (_, i) => `Added paragraph ${i}.`).join('\n\n');
-    editMain(r.repo, 'Architecture.md', `${await r.repo.readFile('Architecture.md')}\n${many}\n`);
+    edit(r, 'Architecture.md', `${await r.repo.readFile('Architecture.md')}\n${many}\n`);
     expect((await r.run('commit_main', args({ subject: 'Add lots' }))).isError).toBe(false);
     expect(r.stub.changes).toHaveLength(2);
   });
 
   it('applies the room tunable for the size rule', async () => {
-    const strict = rig({ limit: 1 });
-    editMain(
-      strict.repo,
-      'Architecture.md',
-      DOC.replace('Para 1.', 'One.').replace('Para 2.', 'Two.'),
-    );
+    const strict = await rig({ limit: 1 });
+    edit(strict, 'Architecture.md', DOC.replace('Para 1.', 'One.').replace('Para 2.', 'Two.'));
     expect((await strict.run('commit_main', args())).text).toMatch(/at most 1/);
   });
 
@@ -268,11 +297,159 @@ describe('commit_main', () => {
     expect((await r.run('commit_main', args())).text).toMatch(
       /Nothing to commit: Architecture\.md is unchanged/,
     );
-    rmSync(join(r.repo.mainWorktree, 'Architecture.md'));
+    rmSync(join(r.scratch.dir, 'Architecture.md'));
     const out = await r.run('commit_main', args());
     expect(out.isError).toBe(true);
     expect(out.text).toMatch(/archived from the UI, never deleted/);
-    expect(readFileSync(join(r.repo.mainWorktree, 'Architecture.md'), 'utf8')).toBe(DOC);
+    expect(scratchText()).toBe(DOC);
+  });
+
+  it('refuses to commit without a working copy', async () => {
+    const tools = orchestratorTools({
+      roomId: r.stub.roomId,
+      actions: r.stub.actions,
+      repo: r.repo,
+      logger: () => undefined,
+    });
+    const commit = tools.find((t) => t.name === 'commit_main')!;
+    const out = (await commit.handler(args() as never, {})) as { content: Array<{ text: string }> };
+    expect(out.content[0]!.text).toMatch(/no working directory to commit from/);
+  });
+
+  describe('when main moved since the turn began (another writer committed meanwhile)', () => {
+    const para = (n: number, text: string) => DOC.replace(`Para ${n}.`, text);
+
+    it('commits the edit on top of an unrelated change to another document, and says nothing about a merge', async () => {
+      edit(r, 'Architecture.md', para(2, 'Para two, edited.'));
+      await otherWriter(r, { 'PRD.md': '# PRD\n\nGoals.\n\nMore goals.\n' }, 'Edit PRD');
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(false);
+      expect(out.text).not.toMatch(/merged/);
+      expect(await mainText()).toBe(para(2, 'Para two, edited.'));
+      expect(await r.repo.readFile('PRD.md')).toContain('More goals.');
+    });
+
+    it('merges an edit with a concurrent change to other paragraphs of the same document: neither is lost', async () => {
+      edit(r, 'Architecture.md', para(2, 'Para two, edited by the orchestrator.'));
+      const other = para(4, 'Para four, edited by Bob.');
+      await otherWriter(r, { 'Architecture.md': other });
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(false);
+      expect(out.text).toMatch(/merged with the newer text/);
+      const text = (await mainText())!;
+      expect(text).toContain('Para two, edited by the orchestrator.');
+      expect(text).toContain('Para four, edited by Bob.');
+      // the Change card reports the orchestrator's own commit
+      expect(r.stub.changes).toHaveLength(1);
+    });
+
+    it("refuses when the same lines changed, discards the edit, and leaves the other writer's text alone", async () => {
+      edit(r, 'Architecture.md', para(2, "Para two, the orchestrator's version."));
+      await otherWriter(r, { 'Architecture.md': para(2, "Para two, Bob's version.") });
+      const before = await r.repo.headSha('main');
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(true);
+      expect(out.text).toMatch(/Refused: Architecture\.md changed on main while you were editing/);
+      expect(out.text).toMatch(/Read Architecture\.md again, redo the edit/);
+      expect(await r.repo.headSha('main')).toBe(before);
+      expect(await mainText()).toContain("Para two, Bob's version.");
+      // the working copy shows the current text, ready for the edit to be redone
+      expect(scratchText()).toBe(await mainText());
+      expect(r.stub.changes).toHaveLength(0);
+    });
+
+    it("counts only what the commit changes in main's current text against the size rule", async () => {
+      // the orchestrator rewrites 3 paragraphs (the limit); Bob meanwhile rewrote 2 others. Bob's are already in main,
+      // so the commit replaces 3 of main's paragraphs, not 5.
+      edit(
+        r,
+        'Architecture.md',
+        para(1, 'One.').replace('Para 2.', 'Two.').replace('Para 3.', 'Three.'),
+      );
+      await otherWriter(r, {
+        'Architecture.md': para(4, 'Four.').replace('Para 5.', 'Five.'),
+      });
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(false);
+      const text = (await mainText())!;
+      expect(text).toContain('Three.');
+      expect(text).toContain('Five.');
+    });
+
+    it('applies the size rule to the merged result: a change over the limit is refused even when main moved', async () => {
+      edit(
+        r,
+        'Architecture.md',
+        para(1, 'One.')
+          .replace('Para 2.', 'Two.')
+          .replace('Para 3.', 'Three.')
+          .replace('Para 4.', 'Four.'),
+      );
+      await otherWriter(r, { 'Architecture.md': para(5, 'Five, edited by Bob.') });
+      const before = await r.repo.headSha('main');
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(true);
+      expect(out.text).toMatch(/deletes or rewrites 4 existing paragraphs/);
+      expect(await r.repo.headSha('main')).toBe(before);
+      expect(scratchText()).toBe(await mainText());
+    });
+
+    it('says the text is already there when someone made the same change', async () => {
+      edit(r, 'Architecture.md', para(2, 'Para two, edited.'));
+      await otherWriter(r, { 'Architecture.md': para(2, 'Para two, edited.') });
+      const out = await r.run('commit_main', args());
+      expect(out.isError).toBe(true);
+      expect(out.text).toMatch(/Nothing to commit: Architecture\.md on main already has this text/);
+      expect(r.stub.changes).toHaveLength(0);
+    });
+
+    it('holds the write queue while it checks and commits: a writer queued behind it sees the commit', async () => {
+      edit(r, 'Architecture.md', `${DOC}\n## Latency\n\np99 under 200 ms.\n`);
+      let seenByWriter = '';
+      const first = r.run('commit_main', args());
+      // queued behind commit_main's use of the lock
+      const second = r.repo.withMainLock(async () => {
+        seenByWriter = (await r.repo.readFile('Architecture.md')) ?? '';
+      });
+      await Promise.all([first, second]);
+      // either order is a correct serialization, but commit_main's check and commit are never interleaved with it
+      expect(seenByWriter === DOC || seenByWriter.includes('## Latency')).toBe(true);
+      expect(await mainText()).toContain('## Latency');
+    });
+  });
+
+  describe('ids the model supplies reach commit trailers, so they are validated', () => {
+    it('drops trigger ids that are not message ids, and says so', async () => {
+      edit(r, 'Architecture.md', `${DOC}\nAdded.\n`);
+      const out = await r.run(
+        'commit_main',
+        args({
+          triggerMessageIds: [
+            'msg_abc123',
+            'msg_1\nQuorum-Actor: user:user_alice',
+            'x',
+            'msg_abc123',
+          ],
+        }),
+      );
+      expect(out.isError).toBe(false);
+      expect(out.text).toMatch(/Ignored trigger ids that are not message ids/);
+      const sha = /committed ([0-9a-f]{40})/.exec(out.text)![1]!;
+      expect((await r.repo.show(sha)).trailers.triggerMessageIds).toEqual(['msg_abc123']);
+      expect(r.stub.changes[0]!.triggerMessageIds).toEqual(['msg_abc123']);
+    });
+
+    it('drops a proposal id that is not one', async () => {
+      edit(r, 'Architecture.md', `${DOC}\nAdded.\n`);
+      const out = await r.run('commit_main', args({ proposalId: 'prop_1\nQuorum-Reverts: abc' }));
+      expect(out.text).toMatch(/Ignored proposalId/);
+      const sha = /committed ([0-9a-f]{40})/.exec(out.text)![1]!;
+      expect((await r.repo.show(sha)).trailers.proposalId).toBeNull();
+      edit(r, 'Architecture.md', `${await mainText()}\nMore.\n`);
+      const ok = await r.run('commit_main', args({ proposalId: 'prop_abc123' }));
+      const sha2 = /committed ([0-9a-f]{40})/.exec(ok.text)![1]!;
+      expect((await r.repo.show(sha2)).trailers.proposalId).toBe('prop_abc123');
+    });
   });
 });
 
@@ -294,8 +471,8 @@ describe('open_proposal', () => {
     ...over,
   });
 
-  beforeEach(() => {
-    r = rig();
+  beforeEach(async () => {
+    r = await rig();
   });
 
   it('opens a proposal for branches that change only the document, using the real fork point', async () => {
@@ -445,7 +622,7 @@ describe('request_merge and the voting rule', () => {
   }
 
   it('refuses to merge what the room has not passed, and never calls the merge pipeline', async () => {
-    const r = rig();
+    const r = await rig();
     r.stub.proposals.push(makeProposal({ votes: [vote(alice, 'opt_a')] }));
     const out = await r.run('request_merge', { proposalId: 'prop_1', optionId: 'opt_a' });
     expect(out.isError).toBe(true);
@@ -457,7 +634,7 @@ describe('request_merge and the voting rule', () => {
   });
 
   it('requests the merge once the rule is satisfied', async () => {
-    const r = rig();
+    const r = await rig();
     r.stub.proposals.push(makeProposal({ votes: [vote(alice, 'opt_a'), vote(bob, 'opt_a')] }));
     const out = await r.run('request_merge', { proposalId: 'prop_1', optionId: 'opt_a' });
     expect(out).toEqual({ text: 'merge requested', isError: false });
@@ -465,7 +642,7 @@ describe('request_merge and the voting rule', () => {
   });
 
   it('validates the proposal, its state and the option', async () => {
-    const r = rig();
+    const r = await rig();
     expect(
       (await r.run('request_merge', { proposalId: 'prop_x', optionId: 'opt_a' })).text,
     ).toMatch(/unknown proposal/);
@@ -573,7 +750,7 @@ describe('request_merge and the voting rule', () => {
 
 describe('other tools', () => {
   it('post_chat posts as the agent with the reply ids, anchor and exploration card', async () => {
-    const r = rig();
+    const r = await rig();
     const anchor = {
       documentId: 'doc_1',
       baseSha: 'b'.repeat(40),
@@ -606,7 +783,7 @@ describe('other tools', () => {
   });
 
   it('resolve_suggestion updates the card status and resolution sha', async () => {
-    const r = rig();
+    const r = await rig();
     const anchor = {
       documentId: 'doc_1',
       baseSha: 'b'.repeat(40),
@@ -656,7 +833,7 @@ describe('other tools', () => {
   });
 
   it('read_transcript and get_room_state return compact JSON', async () => {
-    const r = rig();
+    const r = await rig();
     const m = r.stub.human('user_alice', 'Alice', 'hello');
     const transcript = JSON.parse((await r.run('read_transcript', { ids: [m.id] })).text);
     expect(transcript).toEqual([
@@ -671,7 +848,7 @@ describe('other tools', () => {
   });
 
   it('close_proposal archives with the reason', async () => {
-    const r = rig();
+    const r = await rig();
     r.stub.proposals.push(makeProposal());
     expect(
       (
@@ -685,14 +862,19 @@ describe('other tools', () => {
   });
 
   it('start_exploration hands the request to the runtime, or says it is unavailable', async () => {
-    const r = rig({ withExploration: true });
+    const r = await rig({ withExploration: true });
     const out = await r.run('start_exploration', {
       documentPath: 'Architecture.md',
       topic: 'storage',
       theses: ['PostgreSQL', 'ClickHouse'],
       triggerMessageIds: ['msg_1'],
     });
-    expect(JSON.parse(out.text)).toEqual({ branchBase: 'abc', workers: [] });
+    // returns whatever the runtime reports once the workers are started: it does not wait for them
+    expect(JSON.parse(out.text)).toEqual({
+      explorationId: 'expl_1',
+      branches: ['architecture/storage/a'],
+      baseSha: 'abc',
+    });
     expect(r.explorations[0]).toMatchObject({
       documentPath: 'Architecture.md',
       topic: 'storage',
@@ -701,7 +883,9 @@ describe('other tools', () => {
     });
     expect(
       (
-        await rig().run('start_exploration', {
+        await (
+          await rig()
+        ).run('start_exploration', {
           documentPath: 'Architecture.md',
           topic: 't',
           theses: ['x'],
@@ -710,8 +894,65 @@ describe('other tools', () => {
     ).toMatch(/explorations are not available/);
   });
 
+  it('start_exploration passes the mode and the announcement on, and defaults to drafting', async () => {
+    const r = await rig({ withExploration: true });
+    await r.run('start_exploration', {
+      documentPath: 'Architecture.md',
+      topic: 'p99',
+      theses: ['What latency do comparable systems promise?'],
+      mode: 'research',
+      announcement: 'Looking into typical p99 targets',
+    });
+    expect(r.explorations[0]).toMatchObject({
+      mode: 'research',
+      announcement: 'Looking into typical p99 targets',
+    });
+    await r.run('start_exploration', {
+      documentPath: 'Architecture.md',
+      topic: 'storage',
+      theses: ['PostgreSQL'],
+    });
+    // the schema's default ('draft') is applied by the SDK, which parses the arguments before the handler runs
+    expect(r.explorations[1]!.mode ?? 'draft').toBe('draft');
+    expect(r.explorations[1]!.triggerMessageIds).toEqual([]);
+  });
+
+  it('start_exploration and open_proposal drop trigger ids that are not message ids (they reach commit trailers)', async () => {
+    const r = await rig({ withExploration: true });
+    const out = await r.run('start_exploration', {
+      documentPath: 'Architecture.md',
+      topic: 'storage',
+      theses: ['PostgreSQL'],
+      triggerMessageIds: ['msg_abc', 'msg_x\nQuorum-Actor: user:user_alice', '../../etc'],
+    });
+    expect(r.explorations[0]!.triggerMessageIds).toEqual(['msg_abc']);
+    expect(JSON.parse(out.text).note).toMatch(/Ignored trigger ids that are not message ids/);
+
+    await branchWith(r.repo, 'architecture/storage/a', {
+      'Architecture.md': `${DOC}\nPostgreSQL.\n`,
+    });
+    const opened = await r.run('open_proposal', {
+      documentPath: 'Architecture.md',
+      kind: 'review',
+      title: 'Storage',
+      branchBase: await r.repo.headSha('main'),
+      options: [
+        {
+          label: 'A',
+          branch: 'architecture/storage/a',
+          summary: 's',
+          tradeoffs: 't',
+        },
+      ],
+      triggerMessageIds: ['msg_ok1', 'not an id'],
+    });
+    expect(opened.isError).toBe(false);
+    expect(r.stub.proposals[0]!.triggerMessageIds).toEqual(['msg_ok1']);
+    expect(JSON.parse(opened.text).ignoredTriggerIds).toMatch(/not message ids/);
+  });
+
   it('set_status goes through the status hook when there is one, else straight to the room', async () => {
-    const hooked = rig({ withStatusHook: true });
+    const hooked = await rig({ withStatusHook: true });
     await hooked.run('set_status', { status: 'thinking', detail: 'Exploring A vs B' });
     await hooked.run('set_status', { status: 'idle' });
     expect(hooked.statusCalls).toEqual([
@@ -720,7 +961,7 @@ describe('other tools', () => {
     ]);
     expect(hooked.stub.statuses).toEqual([]);
 
-    const direct = rig();
+    const direct = await rig();
     await direct.run('set_status', { status: 'thinking', detail: 'x' });
     expect(direct.stub.statuses).toEqual([{ status: 'thinking', detail: 'x' }]);
   });

@@ -17,11 +17,13 @@ import type {
   RoomRepository,
 } from '../../contracts/index.js';
 import {
+  DIGEST_BUDGET_USD,
   SIGN_IN_DETAIL,
   errMessage,
   fallbackDigest,
   noopLogger,
   resolveTunables,
+  workerBudgetUsd,
   type Logger,
   type Tunables,
 } from '../common.js';
@@ -29,12 +31,13 @@ import { StatusBoard } from '../status.js';
 import { Listener, type ListenerBatch, type ListenerClient } from './listener.js';
 import { Orchestrator } from './orchestrator.js';
 import { createSdkListenerClient } from './sdkListener.js';
-import type { ClaudeProcessConfig, QueryFn } from './sdk.js';
+import type { ClaudeProcessConfig, QueryFn, SandboxMode } from './sdk.js';
+import { tryApplySuggestion, type SuggestionOutcome } from './suggestions.js';
 import type { ExplorationRequest } from './tools.js';
 import {
-  runExploration,
   runMergeDriver,
   runSemanticRevert,
+  startExploration,
   writeDigest,
   type WorkerEnv,
 } from './workers.js';
@@ -42,8 +45,24 @@ import {
 export interface ClaudeRuntimeOptions extends AgentRuntimeOptions {
   /** API key for the listener's Messages API calls and for the Claude Code subprocess */
   anthropicApiKey?: string;
-  /** per-session spending cap handed to the Agent SDK (maxBudgetUsd) */
+  /**
+   * Per-session spending cap handed to the Agent SDK (maxBudgetUsd). The SDK counts a cap per `query()` call, so this is
+   * a cap per session, not per room: the orchestrator, the merge driver and the semantic revert get it whole,
+   * exploration workers a share of it (workerBudgetUsd) and the digest writer a small fixed one. There is no per-room
+   * ledger yet.
+   */
   maxBudgetUsd?: number;
+  /** Per-session cap of an exploration or research worker. Default: a quarter of maxBudgetUsd, at least $1. */
+  workerBudgetUsd?: number;
+  /** Bash isolation in agent sessions: 'auto' (default; needs bubblewrap on Linux, runs unsandboxed with a warning without it), 'required' or 'off'. */
+  sandbox?: SandboxMode;
+  /**
+   * A room's sessions (orchestrator process, listener, timers) are stopped after this long with nobody connected and
+   * nothing in flight, and started again by the next event. Default 15 minutes; 0 keeps every room running.
+   */
+  idleAfterMs?: number;
+  /** How often rooms are checked for idleness (default 30 s). */
+  idleCheckMs?: number;
   /** Claude Code executable the Agent SDK spawns (`pathToClaudeCodeExecutable`); omit for the SDK's bundled binary */
   claudeBinary?: string;
   /** Credential environment added to every Claude Code subprocess (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN). Read at each query(). */
@@ -66,6 +85,47 @@ interface RoomRuntime {
   listener: Listener;
   orchestrator: Orchestrator;
   abort: AbortController;
+  /** work the queues of the listener and orchestrator do not show: background explorations, merges, digests */
+  ops: InFlight;
+}
+
+/** Counts work in flight, so a room that has some is not taken for idle. */
+class InFlight {
+  private n = 0;
+  get active(): number {
+    return this.n;
+  }
+  begin(): void {
+    this.n += 1;
+  }
+  end(): void {
+    this.n = Math.max(0, this.n - 1);
+  }
+  track(run: Promise<unknown>): void {
+    this.begin();
+    run.then(
+      () => this.end(),
+      () => this.end(),
+    );
+  }
+}
+
+const DEFAULT_IDLE_AFTER_MS = 15 * 60_000;
+const DEFAULT_IDLE_CHECK_MS = 30_000;
+/** Events that arrive after a suggestion wait this long for its direct application, so they keep their order. */
+const SUGGESTION_ORDER_WAIT_MS = 2000;
+
+/** Resolves when `p` settles or after `ms`, whichever is first (it never rejects). */
+function within(p: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    p.then(done, done);
+  });
 }
 
 /** Status details are shown to everyone in the room: keep them to one short line. */
@@ -90,6 +150,12 @@ export class ClaudeRuntime implements AgentRuntime {
   private lastAvailable: boolean | null = null;
   private unsubscribe: (() => unknown) | null = null;
   private closed = false;
+  /** when each live room last had an event, work or a connected participant */
+  private readonly lastActive = new Map<RoomId, number>();
+  /** rooms whose sessions were stopped for idleness: they stay idle (also across sign-ins) until the next event */
+  private readonly idleRooms = new Set<RoomId>();
+  private idleTimer: NodeJS.Timeout | null = null;
+  private readonly idleAfterMs: number;
 
   constructor(
     private readonly actions: RoomActions,
@@ -100,9 +166,11 @@ export class ClaudeRuntime implements AgentRuntime {
     this.tunables = resolveTunables(options);
     this.queryFn = deps.queryFn ?? query;
     const claudeEnv = options.claudeEnv;
+    this.idleAfterMs = options.idleAfterMs ?? DEFAULT_IDLE_AFTER_MS;
     this.claude = {
       binary: options.claudeBinary,
       apiKey: options.anthropicApiKey,
+      sandbox: options.sandbox,
       env: claudeEnv
         ? () => {
             try {
@@ -119,6 +187,13 @@ export class ClaudeRuntime implements AgentRuntime {
     if (options.onCredentialsChanged) {
       const off = options.onCredentialsChanged(() => this.credentialsChanged());
       this.unsubscribe = typeof off === 'function' ? off : null;
+    }
+    if (this.idleAfterMs > 0) {
+      this.idleTimer = setInterval(
+        () => this.sweepIdle(),
+        options.idleCheckMs ?? DEFAULT_IDLE_CHECK_MS,
+      );
+      this.idleTimer.unref?.();
     }
   }
 
@@ -151,6 +226,12 @@ export class ClaudeRuntime implements AgentRuntime {
         await this.teardown(roomId);
         if (this.closed || !this.active.has(roomId)) return;
         const board = this.board(roomId);
+        if (this.idleRooms.has(roomId)) {
+          // nobody is there and nothing runs: the next event starts the sessions with whatever login exists then
+          if (available) board.reset();
+          else board.reset({ key: 'credentials', detail: SIGN_IN_DETAIL });
+          return;
+        }
         if (!available) {
           this.log('info', 'claude credentials gone; agent unavailable', { roomId });
           board.reset({ key: 'credentials', detail: SIGN_IN_DETAIL });
@@ -172,7 +253,66 @@ export class ClaudeRuntime implements AgentRuntime {
       return null;
     }
     this.board(roomId).recover('credentials');
+    this.idleRooms.delete(roomId);
+    this.touch(roomId);
     return this.room(roomId);
+  }
+
+  // --- idle rooms (M4) --------------------------------------------------------------------
+
+  private touch(roomId: RoomId): void {
+    this.lastActive.set(roomId, Date.now());
+  }
+
+  /** Looks for rooms with live sessions that have had nobody and nothing for `idleAfterMs`, and stops them. */
+  private sweepIdle(): void {
+    if (this.closed) return;
+    for (const roomId of [...this.rooms.keys()]) {
+      // on the room's queue, so an event that arrives meanwhile is handled before the check or after the teardown
+      void this.enqueue(roomId, 'idle check', async () => {
+        if (this.closed || !(await this.isIdle(roomId))) return;
+        this.log('info', 'room idle; stopping its agent sessions until the next event', { roomId });
+        this.idleRooms.add(roomId);
+        await this.teardown(roomId);
+        this.boards.get(roomId)?.reset();
+      });
+    }
+  }
+
+  private async isIdle(roomId: RoomId): Promise<boolean> {
+    const pending = this.rooms.get(roomId);
+    if (!pending) return false;
+    let r: RoomRuntime;
+    try {
+      r = await pending;
+    } catch {
+      return false;
+    }
+    const quietFor = Date.now() - (this.lastActive.get(roomId) ?? 0);
+    if (quietFor < this.idleAfterMs) return false;
+    if (
+      r.orchestrator.pendingCount > 0 ||
+      r.listener.pendingCount > 0 ||
+      r.ops.active > 0 ||
+      this.board(roomId).current.status === 'thinking'
+    ) {
+      this.touch(roomId);
+      return false;
+    }
+    try {
+      const { presence } = await this.actions.getRoomState(roomId);
+      if (presence.some((p) => p.connected)) {
+        this.touch(roomId);
+        return false;
+      }
+    } catch (e) {
+      this.log('warn', 'could not read presence to check for an idle room', {
+        roomId,
+        error: errMessage(e),
+      });
+      return false;
+    }
+    return true;
   }
 
   // --- lifecycle --------------------------------------------------------------------------
@@ -186,12 +326,16 @@ export class ClaudeRuntime implements AgentRuntime {
 
   async stopRoom(roomId: RoomId): Promise<void> {
     this.active.delete(roomId);
+    this.idleRooms.delete(roomId);
+    this.lastActive.delete(roomId);
     await this.teardown(roomId);
     this.boards.get(roomId)?.reset();
   }
 
   async stopAll(): Promise<void> {
     this.closed = true;
+    if (this.idleTimer) clearInterval(this.idleTimer);
+    this.idleTimer = null;
     try {
       this.unsubscribe?.();
     } catch {
@@ -279,6 +423,8 @@ export class ClaudeRuntime implements AgentRuntime {
       dataDir: this.options.dataDir,
       claude: this.claude,
       maxBudgetUsd: this.options.maxBudgetUsd,
+      workerBudgetUsd: workerBudgetUsd(this.options.maxBudgetUsd, this.options.workerBudgetUsd),
+      digestBudgetUsd: Math.min(this.options.maxBudgetUsd ?? Infinity, DIGEST_BUDGET_USD),
       signal,
       status: this.board(roomId),
     };
@@ -288,7 +434,8 @@ export class ClaudeRuntime implements AgentRuntime {
     const repo = await this.actions.repo(roomId);
     const abort = new AbortController();
     const board = this.board(roomId);
-    const orchestrator = new Orchestrator({
+    const ops = new InFlight();
+    const orchestrator: Orchestrator = new Orchestrator({
       roomId,
       actions: this.actions,
       repo,
@@ -298,8 +445,13 @@ export class ClaudeRuntime implements AgentRuntime {
       claude: this.claude,
       maxBudgetUsd: this.options.maxBudgetUsd,
       status: board,
+      // Returns as soon as the workers are started; their results come back to the orchestrator as an event, so it is
+      // free to handle suggestions and chat meanwhile. The workers run on the room's abort signal.
       startExploration: (req: ExplorationRequest) =>
-        runExploration(this.workerEnv(roomId, abort.signal), repo, req),
+        startExploration(this.workerEnv(roomId, abort.signal), repo, req, {
+          onFinished: (outcome) => orchestrator.send({ type: 'exploration_finished', outcome }),
+          track: (run) => ops.track(run),
+        }),
     });
     const listener = new Listener({
       roomId,
@@ -307,14 +459,14 @@ export class ClaudeRuntime implements AgentRuntime {
       client: this.client(),
       tunables: this.options.tunables,
       logger: this.log,
-      onIntents: (batch) => this.forwardIntents(roomId, orchestrator, batch),
+      onIntents: (batch) => this.forwardIntents(roomId, orchestrator, ops, batch),
       onHealth: (ok, detail) => {
         if (ok) board.recover('listener');
         else board.fail('listener', statusDetail(detail ?? 'The listener is failing'));
       },
     });
     orchestrator.start();
-    return { repo, listener, orchestrator, abort };
+    return { repo, listener, orchestrator, abort, ops };
   }
 
   /**
@@ -322,8 +474,14 @@ export class ClaudeRuntime implements AgentRuntime {
    * classified slice (a divergence points at an earlier message), and the proposals that are open right now, so the
    * orchestrator can also judge expiry on every listener cycle (PRD 7.4).
    */
-  private forwardIntents(roomId: RoomId, orchestrator: Orchestrator, batch: ListenerBatch): void {
+  private forwardIntents(
+    roomId: RoomId,
+    orchestrator: Orchestrator,
+    ops: InFlight,
+    batch: ListenerBatch,
+  ): void {
     const byId = new Map(batch.context.map((m) => [m.id, m]));
+    ops.begin();
     void (async () => {
       let openProposals: Proposal[] = [];
       try {
@@ -347,14 +505,21 @@ export class ClaudeRuntime implements AgentRuntime {
           openProposals,
         });
       }
-    })().catch((e) =>
-      this.log('error', 'forwarding intents failed', { roomId, error: errMessage(e) }),
-    );
+    })()
+      .catch((e) =>
+        this.log('error', 'forwarding intents failed', { roomId, error: errMessage(e) }),
+      )
+      .finally(() => ops.end());
   }
 
   /** Runs `fn` against the room's sessions in arrival order. Never throws; without a credential the event is dropped. */
-  private dispatch(roomId: RoomId, what: string, fn: (r: RoomRuntime) => void): void {
+  private dispatch(
+    roomId: RoomId,
+    what: string,
+    fn: (r: RoomRuntime) => void | Promise<void>,
+  ): void {
     this.active.add(roomId);
+    this.touch(roomId);
     void this.enqueue(roomId, what, async () => {
       const r = await this.sessions(roomId);
       if (!r) {
@@ -365,7 +530,7 @@ export class ClaudeRuntime implements AgentRuntime {
         );
         return;
       }
-      fn(r);
+      await fn(r);
     });
   }
 
@@ -376,10 +541,51 @@ export class ClaudeRuntime implements AgentRuntime {
     this.dispatch(roomId, 'onChatMessage', (r) => r.listener.push(message));
   }
 
+  /**
+   * A suggestion whose anchored lines on main still match its text hash, and that is within the size rule, is applied
+   * here, under the write queue, with no model turn (PRD 5.2, 12: within 10 s); the orchestrator is only told.
+   * Everything else reaches it as a suggestion event, as before. Later events wait for the direct application for a
+   * moment (SUGGESTION_ORDER_WAIT_MS), so they keep their order; they do not wait longer: the write queue can be busy
+   * for minutes (a semantic revert), and chat must not wait behind it.
+   */
   onSuggestion(roomId: RoomId, message: Message): void {
-    this.dispatch(roomId, 'onSuggestion', (r) =>
-      r.orchestrator.send({ type: 'suggestion', message }),
-    );
+    this.dispatch(roomId, 'onSuggestion', async (r) => {
+      r.ops.begin();
+      const work = this.applyOrForward(roomId, r, message).finally(() => r.ops.end());
+      await within(work, SUGGESTION_ORDER_WAIT_MS);
+    });
+  }
+
+  private async applyOrForward(roomId: RoomId, r: RoomRuntime, message: Message): Promise<void> {
+    let outcome: SuggestionOutcome;
+    try {
+      outcome = await tryApplySuggestion(
+        {
+          roomId,
+          actions: this.actions,
+          repo: r.repo,
+          rewriteLimit: this.tunables.immediateRewriteLimit,
+          logger: this.log,
+        },
+        message,
+      );
+    } catch (e) {
+      this.log('warn', 'applying a suggestion directly failed; handing it to the orchestrator', {
+        roomId,
+        messageId: message?.id,
+        error: errMessage(e),
+      });
+      outcome = { applied: false, reason: `applying it directly failed: ${errMessage(e)}` };
+    }
+    if (outcome.applied)
+      r.orchestrator.send({
+        type: 'suggestion_applied',
+        message,
+        sha: outcome.sha,
+        documentPath: outcome.documentPath,
+        bookkeepingFailed: outcome.bookkeepingFailed,
+      });
+    else r.orchestrator.send({ type: 'suggestion', message, notApplied: outcome.reason });
   }
 
   onAsk(roomId: RoomId, message: Message): void {
@@ -413,7 +619,12 @@ export class ClaudeRuntime implements AgentRuntime {
   ): Promise<{ reconciled: boolean; summary: string }> {
     const r = await this.sessions(roomId);
     if (!r) throw new Error(SIGN_IN_DETAIL);
-    return runMergeDriver(this.workerEnv(roomId, r.abort.signal), input);
+    r.ops.begin();
+    try {
+      return await runMergeDriver(this.workerEnv(roomId, r.abort.signal), input);
+    } finally {
+      r.ops.end();
+    }
   }
 
   async runSemanticRevert(
@@ -422,7 +633,12 @@ export class ClaudeRuntime implements AgentRuntime {
   ): Promise<Sha> {
     const r = await this.sessions(roomId);
     if (!r) throw new Error(SIGN_IN_DETAIL);
-    return runSemanticRevert(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+    r.ops.begin();
+    try {
+      return await runSemanticRevert(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+    } finally {
+      r.ops.end();
+    }
   }
 
   /**
@@ -436,7 +652,13 @@ export class ClaudeRuntime implements AgentRuntime {
     try {
       const r = await this.sessions(roomId);
       if (!r) return fallbackDigest(input.events);
-      const text = await writeDigest(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+      r.ops.begin();
+      let text: string;
+      try {
+        text = await writeDigest(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+      } finally {
+        r.ops.end();
+      }
       if (text) return text;
       this.log('warn', 'digest writer returned nothing; using the plain digest', { roomId });
     } catch (e) {

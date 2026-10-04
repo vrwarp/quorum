@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULTS, EFFORT, MODELS } from '@quorum/shared';
 import { createStubActions, type StubActions } from '../testing/stubActions.js';
 import { MemoryRepo } from '../testing/memoryRepo.js';
@@ -14,13 +14,17 @@ import {
   type QueryCall,
 } from '../testing/fakeQuery.js';
 import { decide, makeProposal, tunables } from '../testing/fixtures.js';
+import { RESEARCH_SYSTEM } from '../prompts.js';
 import type { StatusSink } from '../status.js';
 import {
   runExploration,
   runExplorationWorker,
   runMergeDriver,
+  runResearchWorker,
   runSemanticRevert,
+  startExploration,
   writeDigest,
+  type ExplorationOutcome,
   type WorkerEnv,
 } from './workers.js';
 
@@ -95,6 +99,8 @@ function rig(opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Rig {
     dataDir,
     claude,
     maxBudgetUsd: 3,
+    workerBudgetUsd: 1,
+    digestBudgetUsd: 0.5,
     signal: opts.signal,
     status,
   };
@@ -164,7 +170,12 @@ describe('exploration worker', () => {
   });
 
   it('launches the session with the credentials, the worker model, its worktree and the schema', async () => {
-    await runExplorationWorker(r.env, params(r));
+    process.env.QUORUM_PASSWORD = 'hunter2';
+    try {
+      await runExplorationWorker(r.env, params(r));
+    } finally {
+      delete process.env.QUORUM_PASSWORD;
+    }
     const [call] = r.sdk.calls;
     const o = call!.options;
     expect(o.pathToClaudeCodeExecutable).toBe('/opt/claude/bin/claude');
@@ -173,11 +184,18 @@ describe('exploration worker', () => {
       CLAUDE_CODE_OAUTH_TOKEN: 'tok',
     });
     expect(o.env!.PATH).toBe(process.env.PATH);
+    expect(o.env!.QUORUM_PASSWORD).toBeUndefined(); // the server's own secrets never reach a session
+    expect(o.verbatimPrompts).toBe(true); // chat text in the context is never expanded into @path attachments
+    expect(o.sandbox).toMatchObject({
+      enabled: true,
+      autoAllowBashIfSandboxed: false,
+      filesystem: { allowWrite: [o.cwd] },
+    });
     expect(o).toMatchObject({
       model: MODELS.worker,
       effort: EFFORT.worker,
       maxTurns: DEFAULTS.workerMaxTurns,
-      maxBudgetUsd: 3,
+      maxBudgetUsd: 1, // a worker gets its own, smaller cap than the 3 of the merge driver
       persistSession: false,
       permissionMode: 'default',
       settingSources: [],
@@ -351,7 +369,19 @@ describe('worker timeout', () => {
   });
 });
 
-describe('start_exploration (runExploration)', () => {
+describe('start_exploration (startExploration, runExploration)', () => {
+  const REQ = {
+    documentPath: 'Architecture.md',
+    topic: 'Storage Engine',
+    theses: ['PostgreSQL', 'ClickHouse', 'both'],
+    triggerMessageIds: ['msg_1'],
+  };
+  const draftScript = () =>
+    oneShot(
+      (call) => editDoc(call, `${DOC}\nDraft ${call.index}.\n`),
+      resultMessage({ structured: WORKER_OUT }),
+    );
+
   it('runs one worker per thesis on branches a, b, c from one shared base and returns the outcome', async () => {
     const r = rig();
     r.stub.human('user_alice', 'Alice', "let's use PostgreSQL");
@@ -372,13 +402,9 @@ describe('start_exploration (runExploration)', () => {
     );
     const base = await r.repo.headSha('main');
 
-    const out = await runExploration(r.env, r.repo, {
-      documentPath: 'Architecture.md',
-      topic: 'Storage Engine',
-      theses: ['PostgreSQL', 'ClickHouse', 'both'],
-      triggerMessageIds: ['msg_1'],
-    });
+    const out = await runExploration(r.env, r.repo, REQ);
 
+    expect(out.mode).toBe('draft');
     expect(out.branchBase).toBe(base);
     expect(out.workers.map((w) => [w.label, w.branch])).toEqual([
       ['A', 'architecture/storage-engine/a'],
@@ -386,69 +412,437 @@ describe('start_exploration (runExploration)', () => {
       ['C', 'architecture/storage-engine/c'],
     ]);
     expect(out.workers.every((w) => w.changed && w.baseSha === base)).toBe(true);
+    // diff stats come from the branches: one added line and a blank, no paragraph removed
+    expect(out.workers[0]!.diffStat).toEqual({ removed: 0, added: 2 });
     expect(out.failures).toEqual([]);
+    expect(out.partial).toBe(false);
     // every branch was forked from the same sha, read once, not from "main" three times
     expect(created.map(([, from]) => from)).toEqual([base, base, base]);
     // what the room said while the workers ran comes back with the result (PRD 6.5)
     expect(out.chatSinceStart.map((m) => m.body)).toEqual(['actually ClickHouse']);
-    // the status board shows the exploration
+    // the status board shows the exploration while it runs
     expect(r.status.events).toEqual([
-      'busy exploration:storage-engine (Exploring Storage Engine)',
-      'done exploration:storage-engine',
+      `busy exploration:${out.explorationId} (Exploring Storage Engine)`,
+      `done exploration:${out.explorationId}`,
     ]);
     // the recent chat reached the workers as context
     expect(r.sdk.calls[0]!.prompt).toContain("Alice: let's use PostgreSQL");
-    // three result messages, three usage records
     expect(r.stub.usage).toHaveLength(0); // the scripted results carried no usage
   });
 
-  it('picks a fresh topic slug when the branches already exist', async () => {
-    const r = rig();
-    await r.repo.createBranch('architecture/storage/a');
-    r.sdk.respond(
-      oneShot((call) => editDoc(call, `${DOC}\nx\n`), resultMessage({ structured: WORKER_OUT })),
-    );
-    const out = await runExploration(r.env, r.repo, {
-      documentPath: 'Architecture.md',
-      topic: 'storage',
-      theses: ['one'],
-      triggerMessageIds: [],
+  describe('returns at once and runs the workers in the background', () => {
+    /** a worker script that waits on a gate before it finishes */
+    function gated() {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const script = async function* (call: QueryCall) {
+        editDoc(call, `${DOC}\nDraft ${call.index}.\n`);
+        await gate;
+        yield resultMessage({ structured: WORKER_OUT });
+      };
+      return { script, release };
+    }
+
+    it('answers with the branches and the base before any worker is done, and delivers the outcome later', async () => {
+      const r = rig();
+      const g = gated();
+      r.sdk.respond(g.script);
+      const delivered: ExplorationOutcome[] = [];
+      const base = await r.repo.headSha('main');
+
+      const started = await startExploration(r.env, r.repo, REQ, {
+        onFinished: (o) => delivered.push(o),
+      });
+
+      expect(started).toMatchObject({
+        mode: 'draft',
+        branches: [
+          'architecture/storage-engine/a',
+          'architecture/storage-engine/b',
+          'architecture/storage-engine/c',
+        ],
+        baseSha: base,
+      });
+      expect(started.explorationId).toMatch(/^expl_[0-9a-f]{12}$/);
+      expect(started.note).toMatch(/exploration_finished/);
+      // the branches are reserved already; nothing has finished
+      expect(
+        (await r.repo.listBranches()).filter((b) => b.startsWith('architecture/')),
+      ).toHaveLength(3);
+      expect(delivered).toEqual([]);
+      expect(r.status.events).toEqual([
+        `busy exploration:${started.explorationId} (Exploring Storage Engine)`,
+      ]);
+
+      g.release();
+      await vi.waitFor(() => expect(delivered).toHaveLength(1));
+      expect(delivered[0]).toMatchObject({
+        explorationId: started.explorationId,
+        documentPath: 'Architecture.md',
+        topic: 'Storage Engine',
+        branchBase: base,
+        partial: false,
+      });
+      expect(delivered[0]!.workers.map((w) => w.branch)).toEqual(started.branches);
+      expect(r.status.events.at(-1)).toBe(`done exploration:${started.explorationId}`);
     });
-    expect(out.workers[0]!.branch).toBe('architecture/storage-2/a');
+
+    it('posts the exploration card itself, before returning (the orchestrator does not post one)', async () => {
+      const r = rig();
+      r.sdk.respond(draftScript());
+      await runExploration(r.env, r.repo, REQ);
+      const [card] = r.stub.messages.filter((m) => m.card?.type === 'exploration_started');
+      expect(card!.card).toEqual({
+        type: 'exploration_started',
+        documentId: 'doc_1',
+        title: 'Exploring Storage Engine for Architecture',
+        theses: ['PostgreSQL', 'ClickHouse', 'both'],
+      });
+      expect(card!.body).toBe('Exploring Storage Engine for Architecture');
+      expect(card!.inReplyTo).toEqual(['msg_1']);
+      expect(card!.author).toEqual({ kind: 'agent', role: 'orchestrator' });
+    });
+
+    it('uses the announcement the model wrote for the card', async () => {
+      const r = rig();
+      r.sdk.respond(draftScript());
+      await runExploration(r.env, r.repo, {
+        ...REQ,
+        announcement: 'Exploring PostgreSQL vs ClickHouse for Architecture.md',
+      });
+      expect(r.stub.messages[0]!.body).toBe(
+        'Exploring PostgreSQL vs ClickHouse for Architecture.md',
+      );
+    });
+
+    it('still explores when the card cannot be posted', async () => {
+      const r = rig();
+      r.stub.actions.postChat = async () => {
+        throw new Error('chat is down');
+      };
+      r.sdk.respond(draftScript());
+      const out = await runExploration(r.env, r.repo, REQ);
+      expect(out.workers).toHaveLength(3);
+      expect(r.logs).toContain('warn:could not post the exploration card');
+    });
+
+    it('removes the worktrees once the results are delivered; the branches stay', async () => {
+      const r = rig();
+      r.sdk.respond(draftScript());
+      const removed: string[] = [];
+      const original = r.repo.removeWorktree.bind(r.repo);
+      r.repo.removeWorktree = async (branch) => {
+        removed.push(branch);
+        return original(branch);
+      };
+      const out = await new Promise<ExplorationOutcome>((resolve) => {
+        void startExploration(r.env, r.repo, REQ, { onFinished: resolve });
+      });
+      await vi.waitFor(() => expect(removed).toHaveLength(3));
+      expect(removed.sort()).toEqual(out.workers.map((w) => w.branch).sort());
+      for (const w of out.workers) {
+        expect(r.repo.worktrees.has(w.branch)).toBe(false);
+        expect(await r.repo.headSha(w.branch)).toBe(w.headSha); // the drafts are on their branches
+      }
+    });
+
+    it('lets the runtime track the background run', async () => {
+      const r = rig();
+      const g = gated();
+      r.sdk.respond(g.script);
+      const tracked: Promise<unknown>[] = [];
+      await startExploration(r.env, r.repo, REQ, {
+        onFinished: () => undefined,
+        track: (run) => tracked.push(run),
+      });
+      expect(tracked).toHaveLength(1);
+      let done = false;
+      void tracked[0]!.then(() => (done = true));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(done).toBe(false);
+      g.release();
+      await tracked[0];
+      expect(done).toBe(true);
+    });
+
+    it('delivers an outcome even when the exploration blows up, so the orchestrator is never left waiting', async () => {
+      const r = rig();
+      r.stub.actions.readTranscript = vi
+        .fn()
+        .mockResolvedValueOnce([]) // start marker
+        .mockResolvedValueOnce([]) // recent chat
+        .mockRejectedValue(new Error('db gone')); // after the workers
+      r.sdk.respond(draftScript());
+      const out = await runExploration(r.env, r.repo, REQ);
+      // the transcript read after the workers is best effort: the results still arrive
+      expect(out.workers).toHaveLength(3);
+      expect(out.chatSinceStart).toEqual([]);
+    });
+
+    it('keeps cleaning up when delivering the results throws', async () => {
+      const r = rig();
+      r.sdk.respond(draftScript());
+      let removed = 0;
+      const original = r.repo.removeWorktree.bind(r.repo);
+      r.repo.removeWorktree = async (branch) => {
+        removed += 1;
+        return original(branch);
+      };
+      await startExploration(r.env, r.repo, REQ, {
+        onFinished: () => {
+          throw new Error('listener bug');
+        },
+      });
+      await vi.waitFor(() => expect(removed).toBe(3));
+      expect(r.logs).toContain('error:delivering the exploration results failed');
+    });
   });
 
-  it('reports a worker that could not even start under failures and keeps the others', async () => {
-    const r = rig();
-    await r.repo.createBranch('architecture/storage/b'); // thesis 2 cannot create its branch
-    r.sdk.respond(
-      oneShot((call) => editDoc(call, `${DOC}\nx\n`), resultMessage({ structured: WORKER_OUT })),
-    );
-    const out = await runExploration(r.env, r.repo, {
-      documentPath: 'Architecture.md',
-      topic: 'storage',
-      theses: ['one', 'two'],
-      triggerMessageIds: [],
+  describe('branch names are allocated atomically', () => {
+    it('gives two explorations of the same topic started together different names', async () => {
+      const r = rig();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      r.sdk.respond(async function* (call) {
+        editDoc(call, `${DOC}\nDraft ${call.index}.\n`);
+        await gate;
+        yield resultMessage({ structured: WORKER_OUT });
+      });
+      const hooks = { onFinished: () => undefined };
+      const [one, two, three] = await Promise.all([
+        startExploration(r.env, r.repo, { ...REQ, theses: ['x', 'y'] }, hooks),
+        startExploration(r.env, r.repo, { ...REQ, theses: ['x', 'y'] }, hooks),
+        startExploration(r.env, r.repo, { ...REQ, theses: ['x'] }, hooks),
+      ]);
+      const all = [...one.branches, ...two.branches, ...three.branches];
+      expect(new Set(all).size).toBe(all.length); // no name twice
+      expect(all.sort()).toEqual([
+        'architecture/storage-engine-2/a',
+        'architecture/storage-engine-2/b',
+        'architecture/storage-engine-3/a',
+        'architecture/storage-engine/a',
+        'architecture/storage-engine/b',
+      ]);
+      release();
     });
-    expect(out.workers.map((w) => w.label)).toEqual(['A']);
-    expect(out.failures).toEqual([
-      { thesis: 'two', error: 'branch exists: architecture/storage/b' },
-    ]);
-    expect(r.logs.some((l) => l.startsWith('error:exploration worker failed'))).toBe(true);
+
+    it('picks a fresh topic slug when the branches already exist', async () => {
+      const r = rig();
+      await r.repo.createBranch('architecture/storage/a');
+      r.sdk.respond(draftScript());
+      const out = await runExploration(r.env, r.repo, {
+        documentPath: 'Architecture.md',
+        topic: 'storage',
+        theses: ['one'],
+        triggerMessageIds: [],
+      });
+      expect(out.workers[0]!.branch).toBe('architecture/storage-2/a');
+    });
+
+    it('rolls back the branches it made when it cannot make them all, and tells the caller', async () => {
+      const r = rig();
+      const original = r.repo.createBranch.bind(r.repo);
+      let n = 0;
+      r.repo.createBranch = async (branch, from) => {
+        if (++n === 2) throw new Error('disk full');
+        return original(branch, from);
+      };
+      await expect(
+        startExploration(
+          r.env,
+          r.repo,
+          { ...REQ, theses: ['one', 'two'] },
+          { onFinished: () => undefined },
+        ),
+      ).rejects.toThrow('disk full');
+      expect((await r.repo.listBranches()).filter((b) => b.startsWith('architecture/'))).toEqual(
+        [],
+      );
+      expect(r.sdk.calls).toHaveLength(0); // no worker was started
+      expect(r.status.events).toEqual([]);
+    });
   });
 
-  it('timed-out workers still come back with their branches', async () => {
+  it('refuses an unknown or archived document before reserving anything', async () => {
+    const r = rig();
+    await expect(
+      startExploration(
+        r.env,
+        r.repo,
+        { ...REQ, documentPath: 'Nope.md' },
+        { onFinished: () => undefined },
+      ),
+    ).rejects.toThrow(/no document with path Nope\.md; known: Architecture\.md, PRD\.md/);
+    r.stub.documents[0]!.status = 'archived';
+    await expect(
+      startExploration(r.env, r.repo, REQ, { onFinished: () => undefined }),
+    ).rejects.toThrow(/archived/);
+    expect((await r.repo.listBranches()).filter((b) => b.startsWith('architecture/'))).toEqual([]);
+  });
+
+  it("reports a worker whose commit failed on that worker, and keeps the others' results", async () => {
+    const r = rig();
+    r.sdk.respond(draftScript());
+    const commit = r.repo.commitWorktree.bind(r.repo);
+    r.repo.commitWorktree = async (path, subject, meta) => {
+      if (subject.startsWith('Draft: two')) throw new Error('commit exploded');
+      return commit(path, subject, meta);
+    };
+    const out = await runExploration(r.env, r.repo, { ...REQ, theses: ['one', 'two'] });
+    expect(out.workers.map((w) => w.label)).toEqual(['A', 'B']);
+    // the commit failure is reported on the worker, which keeps whatever the branch holds
+    expect(out.workers[1]!.error).toBe('commit exploded');
+    expect(out.partial).toBe(true);
+    expect(out.failures).toEqual([]);
+  });
+
+  it('timed-out workers still come back with their branches, and the outcome says it is partial', async () => {
     const r = rig({ timeoutMs: 40 });
     r.sdk.respond(hang({ before: (call) => editDoc(call, `${DOC}\nPartial.\n`) }));
-    const out = await runExploration(r.env, r.repo, {
-      documentPath: 'Architecture.md',
-      topic: 'storage',
-      theses: ['one', 'two'],
-      triggerMessageIds: [],
-    });
+    const out = await runExploration(r.env, r.repo, { ...REQ, theses: ['one', 'two'] });
     expect(out.workers.map((w) => [w.timedOut, w.changed])).toEqual([
       [true, true],
       [true, true],
     ]);
+    expect(out.partial).toBe(true);
+  });
+
+  it('runs on the room abort signal: stopping the room cancels the workers, which still report their branches', async () => {
+    const ac = new AbortController();
+    const r = rig({ signal: ac.signal });
+    r.sdk.respond(hang({ before: (call) => editDoc(call, `${DOC}\nPartial.\n`) }));
+    const finished = new Promise<ExplorationOutcome>((resolve) => {
+      void startExploration(r.env, r.repo, { ...REQ, theses: ['one'] }, { onFinished: resolve });
+    });
+    await vi.waitFor(() => expect(r.sdk.calls).toHaveLength(1));
+    ac.abort();
+    const out = await finished;
+    expect(out.workers[0]).toMatchObject({ timedOut: false, changed: true });
+    expect(out.workers[0]!.summary).toMatch(/cancelled/);
+    expect(out.partial).toBe(false); // cancelled by the room, not a failure of the work
+  });
+
+  it('gives each worker the smaller per-session budget', async () => {
+    const r = rig();
+    r.sdk.respond(draftScript());
+    await runExploration(r.env, r.repo, { ...REQ, theses: ['one', 'two'] });
+    expect(r.sdk.calls.map((c) => c.options.maxBudgetUsd)).toEqual([1, 1]);
+  });
+
+  describe('research mode (questions that need the web)', () => {
+    const RESEARCH = {
+      documentPath: 'Architecture.md',
+      topic: 'p99 targets',
+      theses: ['What p99 latency do comparable systems promise?'],
+      triggerMessageIds: ['msg_1'],
+      mode: 'research' as const,
+    };
+    const FINDINGS = {
+      summary: 'Comparable systems promise p99 between 100 and 300 ms.',
+      tradeoffs: 'Vendor claims, not measurements.',
+      assumptions: [],
+      openQuestions: [],
+      sourcesConsulted: ['https://example.com/latency'],
+    };
+
+    it('starts read-only researchers: no branch, no card, no draft', async () => {
+      const r = rig();
+      r.sdk.respond(oneShot(undefined, resultMessage({ structured: FINDINGS })));
+      const branchesBefore = await r.repo.listBranches();
+      let started!: Awaited<ReturnType<typeof startExploration>>;
+      const out = await new Promise<ExplorationOutcome>((resolve) => {
+        void startExploration(r.env, r.repo, RESEARCH, { onFinished: resolve }).then(
+          (s) => (started = s),
+        );
+      });
+
+      expect(started).toMatchObject({ mode: 'research', branches: [] });
+      expect(await r.repo.listBranches()).toEqual(branchesBefore); // nothing was created
+      expect(r.stub.messages.filter((m) => m.card)).toEqual([]); // no "Exploring" card for a question
+      expect(out.mode).toBe('research');
+      expect(out.workers).toEqual([]);
+      expect(out.findings).toEqual([
+        {
+          label: 'A',
+          question: RESEARCH.theses[0],
+          timedOut: false,
+          ...FINDINGS,
+        },
+      ]);
+      expect(out.partial).toBe(false);
+      expect(r.status.events[0]).toMatch(
+        /^busy exploration:expl_[0-9a-f]+ \(Researching p99 targets\)$/,
+      );
+    });
+
+    it('cannot edit anything: no Edit or Write tool, and the policy denies writes everywhere', async () => {
+      const r = rig();
+      r.sdk.respond(oneShot(undefined, resultMessage({ structured: FINDINGS })));
+      await runExploration(r.env, r.repo, RESEARCH);
+      const o = r.sdk.calls[0]!.options;
+      expect(o.tools).toEqual(['Read', 'Grep', 'Glob', 'Bash', 'WebSearch', 'WebFetch']);
+      expect(o.systemPrompt).toBe(RESEARCH_SYSTEM);
+      expect(o.maxBudgetUsd).toBe(1);
+      expect(o.verbatimPrompts).toBe(true);
+      const ask = (tool: string, input: Record<string, unknown>) =>
+        decide(o.canUseTool!, tool, input);
+      expect((await ask('Write', { file_path: 'Architecture.md' })).behavior).toBe('deny');
+      expect((await ask('Edit', { file_path: 'Architecture.md' })).behavior).toBe('deny');
+      expect((await ask('Write', { file_path: 'Anything.md' })).behavior).toBe('deny');
+      expect((await ask('Read', { file_path: 'Architecture.md' })).behavior).toBe('allow');
+      expect((await ask('WebFetch', { url: 'https://example.com/x' })).behavior).toBe('allow');
+      expect((await ask('WebFetch', { url: 'http://169.254.169.254/' })).behavior).toBe('deny');
+      expect((await ask('mcp__quorum__post_chat', { body: 'hi' })).behavior).toBe('deny');
+      expect((await ask('mcp__quorum__read_transcript', {})).behavior).toBe('allow');
+      expect(r.sdk.calls[0]!.prompt).toContain(`Question: ${RESEARCH.theses[0]}`);
+      expect(r.sdk.calls[0]!.prompt).not.toMatch(/Draft the change/);
+    });
+
+    it('works in a throwaway worktree at the exploration base, which is removed afterwards', async () => {
+      const r = rig();
+      r.sdk.respond(oneShot(undefined, resultMessage({ structured: FINDINGS })));
+      const removed: string[] = [];
+      const original = r.repo.removeWorktree.bind(r.repo);
+      r.repo.removeWorktree = async (name) => {
+        removed.push(name);
+        return original(name);
+      };
+      const out = await runExploration(r.env, r.repo, RESEARCH);
+      expect(r.sdk.calls[0]!.options.cwd).toContain('quorum-memrepo-detached-');
+      await vi.waitFor(() => expect(removed).toContain(`research-${out.explorationId}-a`));
+    });
+
+    it('runs one researcher per question, and reports a researcher that timed out as partial', async () => {
+      const r = rig({ timeoutMs: 40 });
+      r.sdk.respond(hang());
+      const out = await runExploration(r.env, r.repo, {
+        ...RESEARCH,
+        theses: ['first question', 'second question'],
+      });
+      expect(out.findings.map((f) => [f.label, f.question, f.timedOut])).toEqual([
+        ['A', 'first question', true],
+        ['B', 'second question', true],
+      ]);
+      expect(out.findings[0]!.summary).toMatch(/timed out/);
+      expect(out.partial).toBe(true);
+    });
+
+    it('runResearchWorker reports a crash as findings with an error, not as a thrown exception', async () => {
+      const r = rig();
+      r.sdk.respond(oneShot(undefined, resultMessage({ subtype: 'error_during_execution' })));
+      const base = (await r.repo.headSha('main'))!;
+      const f = await runResearchWorker(r.env, {
+        repo: r.repo,
+        id: 'expl_x',
+        label: 'a',
+        documentPath: 'Architecture.md',
+        question: 'q',
+        context: '',
+        baseSha: base,
+      });
+      expect(f.error).toBe('worker ended with error_during_execution');
+      expect(f.summary).toMatch(/did not finish/);
+    });
   });
 });
 
@@ -500,6 +894,9 @@ describe('merge driver', () => {
       cwd: worktreePath,
       persistSession: false,
       maxTurns: DEFAULTS.workerMaxTurns,
+      maxBudgetUsd: 3, // the merge driver keeps the whole per-session cap: one Opus session, serialized by the queue
+      verbatimPrompts: true,
+      sandbox: { enabled: true, filesystem: { allowWrite: [worktreePath] } },
       pathToClaudeCodeExecutable: '/opt/claude/bin/claude',
     });
     expect(o.env).toMatchObject({ CLAUDE_CONFIG_DIR: '/data/claude' });
@@ -619,6 +1016,13 @@ describe('semantic revert', () => {
       locks += 1;
       return withLock(fn);
     };
+    // the main worktree is shared, so the revert commits only the document it changed
+    const commitPaths: Array<string[] | undefined> = [];
+    const commit = r.repo.commitWorktree.bind(r.repo);
+    r.repo.commitWorktree = (path, subject, meta, paths) => {
+      commitPaths.push(paths);
+      return commit(path, subject, meta);
+    };
     r.sdk.respond(
       oneShot(
         (call) => editDoc(call, `${DOC}\n## Throughput\n\n10k writes per second.\n`),
@@ -634,6 +1038,7 @@ describe('semantic revert', () => {
     const sha = await runSemanticRevert(r.env, r.repo, { change, byUserId: 'user_bob' });
 
     expect(locks).toBe(1);
+    expect(commitPaths).toEqual([['Architecture.md']]);
     expect(await r.repo.headSha('main')).toBe(sha);
     expect(await r.repo.readFile('Architecture.md')).toBe(
       `${DOC}\n## Throughput\n\n10k writes per second.\n`,
@@ -735,8 +1140,11 @@ describe('digest writer', () => {
       cwd: r.dataDir,
       tools: [],
       maxTurns: 8,
+      maxBudgetUsd: 0.5, // a small fixed cap, not the per-session cap of the big sessions
+      verbatimPrompts: true,
       pathToClaudeCodeExecutable: '/opt/claude/bin/claude',
     });
+    expect(call.options.sandbox).toBeUndefined(); // no Bash, nothing to isolate
     expect(call.options.env).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: 'tok' });
     expect(call.prompt).toContain('The participant last saw message msg_5');
     expect(call.prompt).toContain('- Proposal opened: PG vs CH');

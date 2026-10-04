@@ -51,9 +51,51 @@ export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
 
+/** Message and proposal ids end up in commit trailers (Quorum-Trigger, Quorum-Proposal): only well-formed ones may. */
+const MESSAGE_ID = /^msg_[A-Za-z0-9]+$/;
+const PROPOSAL_ID = /^prop_[A-Za-z0-9]+$/;
+
+/** Splits model-supplied message ids into the well-formed ones (in order, without duplicates) and the rest. */
+export function splitMessageIds(ids: readonly string[] | undefined): {
+  valid: string[];
+  rejected: string[];
+} {
+  const valid: string[] = [];
+  const rejected: string[] = [];
+  for (const id of ids ?? []) {
+    if (MESSAGE_ID.test(id)) {
+      if (!valid.includes(id)) valid.push(id);
+    } else rejected.push(id);
+  }
+  return { valid, rejected };
+}
+
+export function isProposalId(id: unknown): id is string {
+  return typeof id === 'string' && PROPOSAL_ID.test(id);
+}
+
+/** Shows rejected ids in a tool result without letting a long or odd one flood it. */
+export function describeRejectedIds(ids: readonly string[]): string {
+  return ids.map((id) => JSON.stringify(id.length > 40 ? `${id.slice(0, 39)}…` : id)).join(', ');
+}
+
 /** True when text contains git conflict markers (start or end marker on a line of its own). */
 export function hasConflictMarkers(text: string): boolean {
   return /^<{7}(?:\s|$)/m.test(text) || /^>{7}(?:\s|$)/m.test(text);
+}
+
+/** Spending cap of one digest writer session: a short summary of a few messages. */
+export const DIGEST_BUDGET_USD = 0.5;
+
+/**
+ * Per-session cap for an exploration or research worker. Several run at once and each is its own `query()` call (whose
+ * cap counts only its own spend), so they get a share of the configured cap: a quarter by default, at least $1 and never
+ * more than the cap itself. `undefined` (no cap configured) stays uncapped.
+ */
+export function workerBudgetUsd(cap: number | undefined, override?: number): number | undefined {
+  if (override !== undefined) return override;
+  if (cap === undefined) return undefined;
+  return Math.min(cap, Math.max(1, cap / 4));
 }
 
 /** Agent status detail shown to the room while the server has no usable Claude credential. */

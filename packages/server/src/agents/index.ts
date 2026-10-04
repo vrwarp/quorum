@@ -19,11 +19,17 @@ export type AgentRuntimeKind = 'fake' | 'claude';
  * Claude option. For e2e runs, QUORUM_FAKE_EXPLORE_MS tunes how long fake explorations take (default 500).
  *
  * `options` for the claude runtime (see ClaudeRuntimeOptions):
- * - `anthropicApiKey`, `maxBudgetUsd`: API key and per-session spending cap;
+ * - `anthropicApiKey`, `maxBudgetUsd`: API key and per-session spending cap (the SDK counts a cap per `query()`: the
+ *   orchestrator and the merge driver get it whole, exploration workers a quarter of it, at least $1, and the digest
+ *   writer $0.50; `workerBudgetUsd` overrides the worker share);
  * - `claudeBinary`: the Claude Code executable the Agent SDK launches (`pathToClaudeCodeExecutable`);
  * - `claudeEnv()`: credential environment merged over `process.env` for every `query()` (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN);
  * - `claudeAvailable()`: false while there is no credential, which makes the agent "unavailable" (no model work);
- * - `onCredentialsChanged(listener)`: sign-in / sign-out notifications; sessions restart or stop accordingly.
+ * - `onCredentialsChanged(listener)`: sign-in / sign-out notifications; sessions restart or stop accordingly;
+ * - `sandbox`: Bash isolation in agent sessions, 'auto' (default; needs bubblewrap on Linux and otherwise runs without,
+ *   with a CLI warning), 'required' (such a session fails) or 'off';
+ * - `idleAfterMs`, `idleCheckMs`: a room with nobody connected and nothing in flight is stopped after `idleAfterMs`
+ *   (default 15 minutes, 0 = never) and starts again with the next event.
  */
 export function createAgentRuntime(
   kind: AgentRuntimeKind,

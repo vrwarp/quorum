@@ -90,7 +90,10 @@ describe('createSdkListenerClient', () => {
       cwd: '/data',
       pathToClaudeCodeExecutable: '/opt/claude',
       outputFormat: { type: 'json_schema', schema: IntentBatchJsonSchema },
+      // the transcript is chat text: the CLI must not expand @path mentions in it or run slash commands
+      verbatimPrompts: true,
     });
+    expect(call.options.sandbox).toBeUndefined(); // no Bash here, nothing to isolate
     expect(call.options.maxTurns).toBeGreaterThan(1); // structured output ends the turn through a synthetic tool call
     expect(call.options.env).toMatchObject({
       CLAUDE_CONFIG_DIR: '/data/claude',

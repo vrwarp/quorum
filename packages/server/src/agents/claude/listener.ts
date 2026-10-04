@@ -23,12 +23,37 @@ import {
   type Tunables,
 } from '../common.js';
 
+/** Per-request options of the Anthropic client. */
+export interface ListenerRequestOptions {
+  signal?: AbortSignal;
+  timeout?: number;
+}
+
 /** The slice of the Anthropic client the listener uses; tests inject a mock. */
 export interface ListenerClient {
   messages: {
-    create(params: Anthropic.MessageCreateParamsNonStreaming): Promise<Anthropic.Message>;
+    create(
+      params: Anthropic.MessageCreateParamsNonStreaming,
+      options?: ListenerRequestOptions,
+    ): Promise<Anthropic.Message>;
+  };
+  /**
+   * The beta Messages API (the real client has it). The listener asks it for server-side fallbacks: when the model
+   * declines for policy reasons the API retries on the model's default fallback instead of returning a refusal.
+   * Clients without it (the Agent SDK listener, mocks) classify without.
+   */
+  beta?: {
+    messages: {
+      create(
+        params: Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
+        options?: ListenerRequestOptions,
+      ): Promise<Anthropic.Beta.Messages.BetaMessage>;
+    };
   };
 }
+
+/** The beta that turns on the `fallbacks` request parameter. */
+export const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 
 export interface ListenerBatch {
   intents: Intent[];
@@ -49,6 +74,8 @@ export interface ListenerDeps {
   onIntents: (batch: ListenerBatch) => void;
   /** classification succeeded / failed; the runtime maps these to agent status */
   onHealth?: (ok: boolean, detail?: string) => void;
+  /** a classification request is abandoned after this long (default 60 s) */
+  requestTimeoutMs?: number;
 }
 
 /** Messages of already-classified context kept when the checkpoint is re-anchored. */
@@ -57,6 +84,9 @@ const MAX_TOKENS = 4096;
 /** After a failed classification the pending messages are retried on their own: 10 s, doubling, capped at 5 min. */
 const RETRY_BASE_MS = 10_000;
 const RETRY_MAX_MS = 5 * 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+/** A batch the model keeps answering with something unusable (a refusal, cut-off or broken JSON) is given up after this many tries. */
+const MAX_UNUSABLE = 3;
 
 export function formatTranscriptLine(m: Message): string {
   const flat = m.body.replace(/\s*\n\s*/g, ' ').trim();
@@ -101,6 +131,12 @@ export class Listener {
   private lastContext: string | null = null;
   private checkpoints = 0;
   private failures = 0;
+  /** consecutive answers that could not be used */
+  private unusable = 0;
+  /** request in flight, aborted by stop() */
+  private inflight: AbortController | null = null;
+  /** false once the API has rejected `fallbacks` (a model or account without them): classify without from then on */
+  private useFallbacks = true;
 
   constructor(private readonly deps: ListenerDeps) {
     this.log = deps.logger ?? noopLogger;
@@ -111,6 +147,8 @@ export class Listener {
   push(message: Message): void {
     if (this.stopped) return;
     this.window.push(message);
+    // not while a classification holds a slice of the window: it bounds the backlog itself when it starts
+    if (!this.running) this.boundPending();
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => this.fire(), this.t.listenerDebounceMs);
     this.debounceTimer.unref?.();
@@ -123,6 +161,22 @@ export class Listener {
   stop(): void {
     this.stopped = true;
     this.clearTimers();
+    this.inflight?.abort();
+  }
+
+  /**
+   * While classification keeps failing, unclassified messages pile up, and every retry would send all of them. Beyond
+   * twice `listenerCheckpointMessages` the oldest unclassified ones are dropped: after that long nobody is waiting for
+   * them.
+   */
+  private boundPending(): void {
+    const excess = this.pendingCount - 2 * this.t.listenerCheckpointMessages;
+    if (excess <= 0) return;
+    this.window.splice(this.classifiedCount, excess);
+    this.log('warn', 'listener backlog too long; dropping the oldest unclassified messages', {
+      roomId: this.deps.roomId,
+      dropped: excess,
+    });
   }
 
   /** Classify now (used by timers and tests). Resolves when no classification is running. */
@@ -233,7 +287,8 @@ export class Listener {
 
   /** Returns false when the classification could not be completed (messages stay pending for a retry). */
   private async classify(): Promise<boolean> {
-    const { actions, roomId, client } = this.deps;
+    const { actions, roomId } = this.deps;
+    this.boundPending();
     let upTo = this.window.length; // messages arriving during the call stay pending for the next one
     let context: string;
     try {
@@ -261,10 +316,15 @@ export class Listener {
     if (newMessages.length === 0) return true;
 
     const lastClassified = this.classifiedCount > 0 ? slice[this.classifiedCount - 1]! : null;
-    const content: Anthropic.TextBlockParam[] = slice.map((m) => ({
-      type: 'text',
-      text: formatTranscriptLine(m),
-    }));
+    // Room name, display names and document headings are text participants wrote: they ride in the first user block
+    // (cached like the transcript behind it), never in the system prompt.
+    const content: Anthropic.TextBlockParam[] = [
+      { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
+      ...slice.map((m): Anthropic.TextBlockParam => ({
+        type: 'text',
+        text: formatTranscriptLine(m),
+      })),
+    ];
     content[content.length - 1] = {
       ...content[content.length - 1]!,
       cache_control: { type: 'ephemeral' },
@@ -276,45 +336,87 @@ export class Listener {
         : `None of these ${slice.length} messages have been classified yet. Classify them and return the intents JSON.`,
     });
 
+    const ac = new AbortController();
+    this.inflight = ac;
+    const timeoutMs = this.deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    timer.unref?.();
     let response: Anthropic.Message;
     try {
-      response = await client.messages.create({
-        model: MODELS.listener,
-        max_tokens: MAX_TOKENS,
-        thinking: { type: 'adaptive' },
-        output_config: {
-          effort: EFFORT.listener,
-          format: {
-            type: 'json_schema',
-            schema: IntentBatchJsonSchema as unknown as Record<string, unknown>,
+      response = await Promise.race([
+        this.createMessage(
+          {
+            model: MODELS.listener,
+            max_tokens: MAX_TOKENS,
+            thinking: { type: 'adaptive' },
+            output_config: {
+              effort: EFFORT.listener,
+              format: {
+                type: 'json_schema',
+                schema: IntentBatchJsonSchema as unknown as Record<string, unknown>,
+              },
+            },
+            system: [{ type: 'text', text: LISTENER_SYSTEM, cache_control: { type: 'ephemeral' } }],
+            messages: [{ role: 'user', content }],
           },
-        },
-        system: [
-          { type: 'text', text: LISTENER_SYSTEM, cache_control: { type: 'ephemeral' } },
-          { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
-        ],
-        messages: [{ role: 'user', content }],
-      });
+          { signal: ac.signal, timeout: timeoutMs },
+        ),
+        new Promise<never>((_, reject) =>
+          ac.signal.addEventListener(
+            'abort',
+            () =>
+              reject(
+                new Error(
+                  this.stopped
+                    ? 'listener stopped'
+                    : `listener request timed out after ${Math.round(timeoutMs / 1000)}s`,
+                ),
+              ),
+            { once: true },
+          ),
+        ),
+      ]);
     } catch (e) {
+      if (this.stopped) return true;
       // leave the messages unclassified: a retry (or the next push) classifies them
       this.log('warn', 'listener request failed', { roomId, error: errMessage(e) });
       this.failures++;
       this.deps.onHealth?.(false, errMessage(e));
       this.scheduleRetry();
       return false;
+    } finally {
+      clearTimeout(timer);
+      if (this.inflight === ac) this.inflight = null;
     }
 
     await this.recordUsage(response);
-    this.failures = 0;
-    this.deps.onHealth?.(true);
     if (this.stopped) return true;
-    this.classifiedCount = slice.length;
 
     const intents = this.parse(
       response,
       new Set(slice.map((m) => m.id)),
       newMessages.map((m) => m.id),
     );
+    if (intents === null) {
+      // A refusal, a cut-off answer or broken JSON says nothing about these messages. They stay pending and are tried
+      // again; only a batch the model keeps failing on is given up, so one bad message cannot block the room's chat.
+      this.unusable += 1;
+      this.failures += 1;
+      if (this.unusable < MAX_UNUSABLE) {
+        this.scheduleRetry();
+        return false;
+      }
+      this.log('warn', 'listener gave up on a batch it could not classify', {
+        roomId,
+        messages: newMessages.length,
+      });
+    }
+    this.unusable = 0;
+    this.failures = 0;
+    this.deps.onHealth?.(true);
+    this.classifiedCount = slice.length;
+    if (intents === null) return true;
+
     const threshold = this.t.listenerConfidenceThreshold;
     const forward = intents.filter((i) => i.type !== 'none' && i.confidence >= threshold);
     this.log('debug', 'listener classified', {
@@ -334,16 +436,55 @@ export class Listener {
   }
 
   /**
-   * Validates intents one by one, so a single malformed entry does not discard the others. Message ids the model made
-   * up are dropped (they would end up in commit trailers); an intent left with none refers to the new messages.
+   * One request, on the beta Messages API with server-side fallbacks when the client has it: if the listener model
+   * declines for policy reasons the API retries on the model's default fallback, so a refusal does not cost the room its
+   * classification. A client or account that cannot use `fallbacks` is rejected with a 400; the listener then settles
+   * for the plain API and stops asking.
    */
-  private parse(response: Anthropic.Message, known: Set<string>, fallbackIds: string[]): Intent[] {
+  private async createMessage(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    options: ListenerRequestOptions,
+  ): Promise<Anthropic.Message> {
+    const { client } = this.deps;
+    if (this.useFallbacks && client.beta) {
+      try {
+        return (await client.beta.messages.create(
+          {
+            ...params,
+            betas: [FALLBACK_BETA],
+            fallbacks: 'default',
+          } as unknown as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
+          options,
+        )) as unknown as Anthropic.Message;
+      } catch (e) {
+        const status = (e as { status?: number }).status;
+        if (status !== 400 || !/fallback|beta/i.test(errMessage(e))) throw e;
+        this.useFallbacks = false;
+        this.log('warn', 'the API rejected server-side fallbacks; classifying without them', {
+          roomId: this.deps.roomId,
+          error: errMessage(e),
+        });
+      }
+    }
+    return client.messages.create(params, options);
+  }
+
+  /**
+   * Validates intents one by one, so a single malformed entry does not discard the others. Message ids the model made
+   * up are dropped (they would end up in commit trailers); an intent left with none refers to the new messages. Returns
+   * null when the answer as a whole is unusable (refusal, cut off, not JSON, no intents array).
+   */
+  private parse(
+    response: Anthropic.Message,
+    known: Set<string>,
+    fallbackIds: string[],
+  ): Intent[] | null {
     if (response.stop_reason === 'refusal' || response.stop_reason === 'max_tokens') {
       this.log('warn', 'listener response unusable', {
         roomId: this.deps.roomId,
         stop: response.stop_reason,
       });
-      return [];
+      return null;
     }
     const text = response.content
       .filter((b): b is Anthropic.TextBlock => b.type === 'text')
@@ -357,11 +498,11 @@ export class Listener {
         roomId: this.deps.roomId,
         error: errMessage(e),
       });
-      return [];
+      return null;
     }
     if (!Array.isArray(raw)) {
       this.log('warn', 'listener output has no intents array', { roomId: this.deps.roomId });
-      return [];
+      return null;
     }
     const out: Intent[] = [];
     let invalid = 0;

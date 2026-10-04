@@ -13,6 +13,7 @@ import {
   formatRehydrate,
   type OrchestratorEvent,
 } from './events.js';
+import type { ExplorationOutcome } from './workers.js';
 
 const stub = createStubActions({
   repo: new MemoryRepo(),
@@ -233,6 +234,214 @@ describe('formatEvent', () => {
       id: 'prop_1',
       openedAt: '2026-10-04T10:00:00.000Z',
     });
+  });
+
+  describe('exploration_finished', () => {
+    const worker = (label: string, over: Record<string, unknown> = {}) => ({
+      label,
+      branch: `architecture/storage/${label.toLowerCase()}`,
+      thesis: `thesis ${label}`,
+      baseSha: 'b'.repeat(40),
+      headSha: 'c'.repeat(40),
+      committed: true,
+      changed: true,
+      diffStat: { removed: 1, added: 4 },
+      timedOut: false,
+      summary: `summary ${label}`,
+      tradeoffs: `tradeoffs ${label}`,
+      assumptions: ['one node'],
+      openQuestions: [],
+      sourcesConsulted: ['postgresql.org'],
+      ...over,
+    });
+    const outcome = (over: Partial<ExplorationOutcome> = {}): ExplorationOutcome => ({
+      explorationId: 'expl_abc123',
+      mode: 'draft',
+      documentPath: 'Architecture.md',
+      topic: 'storage',
+      branchBase: 'b'.repeat(40),
+      workers: [
+        worker('A'),
+        worker('B', { timedOut: true, error: 'timed out', scopeReverted: ['PRD.md'] }),
+      ],
+      findings: [],
+      failures: [{ thesis: 'thesis C', error: 'worktree add failed' }],
+      chatSinceStart: [{ id: bob.id, from: 'Bob', body: 'agreed' }],
+      partial: true,
+      ...over,
+    });
+
+    it('delivers the workers, their diff stats, the base and what the room said meanwhile', () => {
+      const { header, payload } = parse(
+        formatEvent({ type: 'exploration_finished', outcome: outcome() }),
+      );
+      expect(header).toBe('[event:exploration_finished]');
+      expect(payload).toMatchObject({
+        explorationId: 'expl_abc123',
+        mode: 'draft',
+        document: 'Architecture.md',
+        topic: 'storage',
+        partial: true,
+        branchBase: 'b'.repeat(40),
+        failures: [{ thesis: 'thesis C', error: 'worktree add failed' }],
+        chatSinceStart: [{ id: bob.id, from: 'Bob', body: 'agreed' }],
+      });
+      expect(payload.workers).toHaveLength(2);
+      expect(payload.workers[0]).toEqual({
+        label: 'A',
+        branch: 'architecture/storage/a',
+        thesis: 'thesis A',
+        changed: true,
+        headSha: 'c'.repeat(40),
+        diffStat: { removed: 1, added: 4 },
+        summary: 'summary A',
+        tradeoffs: 'tradeoffs A',
+        assumptions: ['one node'],
+        openQuestions: [],
+        sourcesConsulted: ['postgresql.org'],
+        timedOut: false,
+      });
+      expect(payload.workers[1]).toMatchObject({
+        timedOut: true,
+        error: 'timed out',
+        scopeReverted: ['PRD.md'],
+      });
+      expect(payload.next).toMatch(/open_proposal/);
+    });
+
+    it('delivers the findings of a research exploration, with no branches', () => {
+      const { payload } = parse(
+        formatEvent({
+          type: 'exploration_finished',
+          outcome: outcome({
+            mode: 'research',
+            workers: [],
+            failures: [],
+            partial: false,
+            findings: [
+              {
+                label: 'A',
+                question: 'What p99 do comparable systems promise?',
+                timedOut: false,
+                summary: 'Between 100 and 300 ms.',
+                tradeoffs: 'Vendor claims.',
+                assumptions: [],
+                openQuestions: [],
+                sourcesConsulted: ['https://example.com'],
+              },
+            ],
+          }),
+        }),
+      );
+      expect(payload.mode).toBe('research');
+      expect(payload.findings[0].summary).toBe('Between 100 and 300 ms.');
+      expect(payload.workers).toBeUndefined();
+      expect(payload.next).toMatch(/Answer the question in chat/);
+    });
+
+    it('is labelled for the in-flight list', () => {
+      expect(eventLabel({ type: 'exploration_finished', outcome: outcome() })).toBe(
+        'exploration_finished expl_abc123 (storage)',
+      );
+    });
+  });
+
+  describe('suggestions the server dealt with itself', () => {
+    const suggestion = stub.human('user_bob', 'Bob', 'tighten this', {
+      kind: 'card',
+      anchor,
+      card: {
+        type: 'suggestion',
+        anchor: { ...anchor, startLine: 3, endLine: 4 },
+        replacement: '',
+        status: 'applied',
+        resolutionSha: 'd'.repeat(40),
+        note: null,
+      },
+    });
+
+    it('tells the orchestrator a suggestion was applied and that nothing is left to do', () => {
+      const { header, payload } = parse(
+        formatEvent({
+          type: 'suggestion_applied',
+          message: suggestion,
+          sha: 'd'.repeat(40),
+          documentPath: 'Architecture.md',
+        }),
+      );
+      expect(header).toBe('[event:suggestion_applied]');
+      expect(payload).toMatchObject({
+        messageId: suggestion.id,
+        author: 'Bob',
+        authorUserId: 'user_bob',
+        document: 'Architecture.md',
+        lines: [3, 4],
+        replacement: '',
+        sha: 'd'.repeat(40),
+      });
+      expect(payload.note).toMatch(/Nothing to edit or resolve/);
+      expect(payload.problem).toBeUndefined();
+      expect(
+        eventLabel({
+          type: 'suggestion_applied',
+          message: suggestion,
+          sha: 'x',
+          documentPath: 'A.md',
+        }),
+      ).toBe(`suggestion_applied ${suggestion.id}`);
+    });
+
+    it('says what to finish when the commit landed but its bookkeeping did not', () => {
+      const { payload } = parse(
+        formatEvent({
+          type: 'suggestion_applied',
+          message: suggestion,
+          sha: 'd'.repeat(40),
+          documentPath: 'Architecture.md',
+          bookkeepingFailed: 'could not resolve the suggestion card: db busy',
+        }),
+      );
+      expect(payload.problem).toBe('could not resolve the suggestion card: db busy');
+      expect(payload.note).toMatch(/call resolve_suggestion with status "applied" and this sha/);
+    });
+
+    it('a suggestion the server could not apply says why', () => {
+      const { payload } = parse(
+        formatEvent({
+          type: 'suggestion',
+          message: suggestion,
+          notApplied: 'the anchored text changed since the suggestion was made',
+        }),
+      );
+      expect(payload.notAppliedByServer).toBe(
+        'the anchored text changed since the suggestion was made',
+      );
+      expect(
+        parse(formatEvent({ type: 'suggestion', message: suggestion })).payload.notAppliedByServer,
+      ).toBeUndefined();
+    });
+  });
+
+  it('points a question that needs the web at research mode', () => {
+    const question: Intent = {
+      ...intent,
+      type: 'question',
+      summary: 'typical p99?',
+      needsResearch: true,
+    };
+    const { payload } = parse(formatEvent({ type: 'intent', intent: question, messages: [alice] }));
+    expect(payload.hint).toMatch(/mode "research"/);
+    const plain = parse(
+      formatEvent({
+        type: 'intent',
+        intent: { ...question, needsResearch: false },
+        messages: [alice],
+      }),
+    );
+    expect(plain.payload.hint).toBeUndefined();
+    expect(
+      parse(formatEvent({ type: 'intent', intent, messages: [alice] })).payload.hint,
+    ).toBeUndefined();
   });
 
   it('labels events briefly for the in-flight list', () => {

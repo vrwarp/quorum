@@ -8,6 +8,7 @@ import {
   listWorktreeFiles,
   paragraphChange,
   restoreFiles,
+  threeWayMerge,
 } from './worktree.js';
 
 const FILES = {
@@ -109,5 +110,50 @@ describe('paragraphChange', () => {
       removed: 5,
       added: 2,
     });
+  });
+});
+
+describe('threeWayMerge', () => {
+  const base = '# Doc\n\nOne.\n\nTwo.\n\nThree.\n\nFour.\n';
+
+  it('applies what theirs changed on top of ours when the edits are in different paragraphs', async () => {
+    const ours = base.replace('One.', 'One, by someone else.');
+    const theirs = base.replace('Three.', 'Three, by the orchestrator.');
+    expect(await threeWayMerge(base, ours, theirs)).toEqual({
+      ok: true,
+      text: '# Doc\n\nOne, by someone else.\n\nTwo.\n\nThree, by the orchestrator.\n\nFour.\n',
+    });
+  });
+
+  it('keeps both sides when one adds a section and the other edits a paragraph', async () => {
+    const ours = `${base}\n## Added by someone else\n\nText.\n`;
+    const theirs = base.replace('Two.', 'Two, edited.');
+    const merged = await threeWayMerge(base, ours, theirs);
+    expect(merged.ok).toBe(true);
+    if (merged.ok) {
+      expect(merged.text).toContain('Two, edited.');
+      expect(merged.text).toContain('## Added by someone else');
+    }
+  });
+
+  it('conflicts when both sides changed the same paragraph, and never returns text with markers', async () => {
+    const merged = await threeWayMerge(
+      base,
+      base.replace('Two.', 'Two, my way.'),
+      base.replace('Two.', 'Two, your way.'),
+    );
+    expect(merged.ok).toBe(false);
+    if (!merged.ok) expect(merged.reason).toMatch(/1 conflicting change/);
+    expect(JSON.stringify(merged)).not.toContain('<<<<<<<');
+  });
+
+  it('needs no merge when only one side changed anything', async () => {
+    expect(await threeWayMerge(base, base, 'theirs\n')).toEqual({ ok: true, text: 'theirs\n' });
+    expect(await threeWayMerge(base, 'ours\n', base)).toEqual({ ok: true, text: 'ours\n' });
+    expect(await threeWayMerge(base, 'same\n', 'same\n')).toEqual({ ok: true, text: 'same\n' });
+  });
+
+  it('treats a document that did not exist at the base as an addition on both sides: a conflict', async () => {
+    expect((await threeWayMerge('', 'ours\n', 'theirs\n')).ok).toBe(false);
   });
 });

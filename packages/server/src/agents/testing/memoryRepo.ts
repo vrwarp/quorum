@@ -171,11 +171,21 @@ export class MemoryRepo implements RoomRepository {
     worktreePath: string,
     subject: string,
     meta: CommitMeta,
+    paths?: string[],
   ): Promise<Sha | null> {
     const branch = [...this.worktrees.entries()].find(([, dir]) => dir === worktreePath)?.[0];
     if (!branch) throw new Error(`unknown worktree ${worktreePath}`);
     const head = this.commitAt(branch)!;
-    const snapshot = this.readDir(worktreePath);
+    let snapshot = this.readDir(worktreePath);
+    if (paths) {
+      // only these paths are committed; everything else stays as the branch has it
+      const only = { ...head.files };
+      for (const f of paths) {
+        if (f in snapshot) only[f] = snapshot[f]!;
+        else delete only[f];
+      }
+      snapshot = only;
+    }
     if (JSON.stringify(sortKeys(snapshot)) === JSON.stringify(sortKeys(head.files))) return null;
     const c = this.addCommit(head.sha, snapshot, subject, meta);
     this.refs.set(branch, c.sha);

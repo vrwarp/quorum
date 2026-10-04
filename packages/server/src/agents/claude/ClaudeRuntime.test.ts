@@ -1,5 +1,7 @@
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MODELS, type Message } from '@quorum/shared';
+import { MODELS, textHash, type Anchor, type Message } from '@quorum/shared';
 import { createStubActions, type StubActions } from '../testing/stubActions.js';
 import { MemoryRepo } from '../testing/memoryRepo.js';
 import {
@@ -349,7 +351,22 @@ describe('every query() gets the binary and the credential environment', () => {
       CLAUDE_CODE_OAUTH_TOKEN: 'tok',
     });
     expect(call.options.env!.PATH).toBe(process.env.PATH); // the server environment is kept
+    expect(call.options.env!.HOME).toBe(process.env.HOME);
+    // the server's own configuration is not: no QUORUM_PASSWORD (or any QUORUM_*) in an agent session
+    expect(Object.keys(call.options.env!).filter((k) => k.startsWith('QUORUM_'))).toEqual([]);
+    // chat text in prompts is taken verbatim: no @path expansion, no slash commands (M3)
+    expect(call.options.verbatimPrompts).toBe(true);
   };
+
+  let savedPassword: string | undefined;
+  beforeEach(() => {
+    savedPassword = process.env.QUORUM_PASSWORD;
+    process.env.QUORUM_PASSWORD = 'hunter2';
+  });
+  afterEach(() => {
+    if (savedPassword === undefined) delete process.env.QUORUM_PASSWORD;
+    else process.env.QUORUM_PASSWORD = savedPassword;
+  });
 
   it('orchestrator, exploration workers, merge driver, semantic revert and digest writer', async () => {
     const r = rig();
@@ -388,9 +405,11 @@ describe('every query() gets the binary and the credential environment', () => {
       },
       {},
     );
+    // the workers run in the background: start_exploration has already returned
+    await vi.waitFor(() => expect(r.sdk.calls.at(-1)!.options.model).toBe(MODELS.worker));
     const worker = r.sdk.calls.at(-1)!;
-    expect(worker.options.model).toBe(MODELS.worker);
     expectProcess(worker);
+    expect(worker.options.verbatimPrompts).toBe(true);
 
     // the merge driver (a merge in progress in a detached worktree)
     const worktree = await r.repo.createDetachedWorktree('merge-1', 'main');
@@ -792,5 +811,637 @@ describe('listener client', () => {
     expect(r.client.calls).toHaveLength(0); // the Messages API was not used
     expect(r.stub.usage.some((u) => u.role === 'listener' && u.inputTokens === 120)).toBe(true);
     await r.runtime.stopAll();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+const WORKER_OUT = {
+  summary: 'Drafted it.',
+  tradeoffs: 'Simple.',
+  assumptions: [],
+  openQuestions: [],
+  sourcesConsulted: [],
+};
+
+type RegisteredTools = Record<
+  string,
+  { handler: (a: unknown, e: unknown) => Promise<{ content: Array<{ text: string }> }> }
+>;
+const toolsOf = (call: QueryCall): RegisteredTools =>
+  (
+    call.options.mcpServers!.quorum as unknown as {
+      instance: { _registeredTools: RegisteredTools };
+    }
+  ).instance._registeredTools;
+
+/** Line numbers of the rig document: 1 "# Architecture", 2 blank, 3 "Intro.". */
+async function suggestionFor(
+  r: Rig,
+  opts: { replacement: string; start?: number; end?: number; hash?: string },
+): Promise<Message> {
+  const start = opts.start ?? 3;
+  const end = opts.end ?? start;
+  const text = ((await r.repo.readFile('Architecture.md')) ?? '')
+    .split('\n')
+    .slice(start - 1, end)
+    .join('\n');
+  const anchor: Anchor = {
+    documentId: 'doc_1',
+    baseSha: (await r.repo.headSha('main'))!,
+    startLine: start,
+    endLine: end,
+    textHash: opts.hash ?? textHash(text),
+    text,
+  };
+  return r.stub.human('user_bob', 'Bob', 'suggestion', {
+    kind: 'card',
+    anchor,
+    card: {
+      type: 'suggestion',
+      anchor,
+      replacement: opts.replacement,
+      status: 'pending',
+      resolutionSha: null,
+      note: null,
+    },
+  });
+}
+
+const turnsWith = (r: Rig, marker: string) =>
+  (r.sessions()[0]?.turns ?? []).filter((t) => t.includes(marker));
+
+describe('explorations run in the background (H2)', () => {
+  /** Orchestrator turns answer at once; exploration workers (string prompts) wait for `release()`. */
+  function gated(r: Rig, onAsk: (call: QueryCall) => Promise<void>) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const orchestrate = session(async (text, call) => {
+      if (text.includes('[event:ask]')) await onAsk(call);
+    });
+    r.sdk.respond(async function* (call) {
+      if (typeof call.prompt === 'string') {
+        writeFileSync(
+          join(call.options.cwd!, 'Architecture.md'),
+          `# Architecture\n\nIntro.\n\nDraft ${call.index}.\n`,
+        );
+        await gate;
+        yield resultMessage({ structured: WORKER_OUT });
+        return;
+      }
+      yield* orchestrate(call);
+    });
+    return release;
+  }
+
+  it('start_exploration returns at once, and a suggestion is processed while the exploration is pending', async () => {
+    const r = rig();
+    let started: { explorationId: string; branches: string[]; baseSha: string } | null = null;
+    const release = gated(r, async (call) => {
+      const out = await toolsOf(call).start_exploration!.handler(
+        {
+          documentPath: 'Architecture.md',
+          topic: 'storage',
+          theses: ['PostgreSQL', 'ClickHouse'],
+          triggerMessageIds: [],
+        },
+        {},
+      );
+      started = JSON.parse(out.content[0]!.text);
+    });
+    await r.runtime.startRoom(r.stub.roomId);
+    const id = r.stub.roomId;
+    const baseSha = await r.repo.headSha('main');
+
+    r.runtime.onAsk(id, r.alice('what should we do about storage?'));
+    await vi.waitFor(() => expect(started).not.toBeNull());
+    expect(started).toMatchObject({
+      branches: ['architecture/storage/a', 'architecture/storage/b'],
+      baseSha,
+    });
+    expect(started!.explorationId).toMatch(/^expl_/);
+    // the orchestrator's turn is over although both workers are still running
+    await vi.waitFor(() => expect(r.statuses()).toContain('thinking:Exploring storage'));
+    expect(r.sdk.calls.filter((c) => typeof c.prompt === 'string')).toHaveLength(2);
+    expect(turnsWith(r, '[event:exploration_finished]')).toEqual([]);
+
+    // Carol's typo fix arrives now. A suggestion whose paragraph changed goes to the orchestrator ...
+    const stale = await suggestionFor(r, {
+      replacement: 'Intro, fixed.',
+      hash: 'feedfacefeedface',
+    });
+    r.runtime.onSuggestion(id, stale);
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion]')).toHaveLength(1));
+    expect(turnsWith(r, '[event:suggestion]')[0]).toContain('"notAppliedByServer"');
+    // ... and one that matches is applied straight away
+    const exact = await suggestionFor(r, { replacement: 'Intro, fixed.' });
+    r.runtime.onSuggestion(id, exact);
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion_applied]')).toHaveLength(1));
+    expect(await r.repo.readFile('Architecture.md')).toBe('# Architecture\n\nIntro, fixed.\n');
+    // all of that happened with the workers still running
+    expect(turnsWith(r, '[event:exploration_finished]')).toEqual([]);
+
+    // the workers finish: the orchestrator is told, with summaries, diff stats and what was said meanwhile
+    release();
+    await vi.waitFor(() => expect(turnsWith(r, '[event:exploration_finished]')).toHaveLength(1));
+    const turn = turnsWith(r, '[event:exploration_finished]')[0]!;
+    const payload = JSON.parse(
+      turn.slice(turn.indexOf('{', turn.indexOf('[event:exploration_finished]'))),
+    );
+    expect(payload).toMatchObject({
+      explorationId: started!.explorationId,
+      mode: 'draft',
+      document: 'Architecture.md',
+      partial: false,
+      branchBase: baseSha,
+    });
+    expect(
+      payload.workers.map((w: { branch: string; summary: string; changed: boolean }) => [
+        w.branch,
+        w.summary,
+        w.changed,
+      ]),
+    ).toEqual([
+      ['architecture/storage/a', 'Drafted it.', true],
+      ['architecture/storage/b', 'Drafted it.', true],
+    ]);
+    expect(payload.workers[0].diffStat).toEqual({ removed: 0, added: 2 });
+    // chatSinceStart: what the room said while the workers ran (here the two suggestions)
+    expect(payload.chatSinceStart.map((m: { id: string }) => m.id)).toEqual([stale.id, exact.id]);
+    await vi.waitFor(() => expect(r.statuses().at(-1)).toBe('idle'));
+    // the worktrees are gone, the branches are not
+    expect([...r.repo.worktrees.keys()].filter((b) => b.startsWith('architecture/'))).toEqual([]);
+    expect((await r.repo.listBranches()).filter((b) => b.startsWith('architecture/'))).toHaveLength(
+      2,
+    );
+    await r.runtime.stopAll();
+  });
+
+  it('two explorations of the same topic can run at once, with their own branches', async () => {
+    const r = rig();
+    const started: Array<{ branches: string[] }> = [];
+    const release = gated(r, async (call) => {
+      const out = await toolsOf(call).start_exploration!.handler(
+        {
+          documentPath: 'Architecture.md',
+          topic: 'storage',
+          theses: ['x', 'y'],
+          triggerMessageIds: [],
+        },
+        {},
+      );
+      started.push(JSON.parse(out.content[0]!.text));
+    });
+    await r.runtime.startRoom(r.stub.roomId);
+    r.runtime.onAsk(r.stub.roomId, r.alice('first'));
+    r.runtime.onAsk(r.stub.roomId, r.alice('second'));
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    expect(started.flatMap((s) => s.branches).sort()).toEqual([
+      'architecture/storage-2/a',
+      'architecture/storage-2/b',
+      'architecture/storage/a',
+      'architecture/storage/b',
+    ]);
+    release();
+    await vi.waitFor(() => expect(turnsWith(r, '[event:exploration_finished]')).toHaveLength(2));
+    await r.runtime.stopAll();
+  });
+
+  it('stopping the room cancels the workers, and the room is not revived by their results', async () => {
+    const r = rig();
+    gated(r, async (call) => {
+      await toolsOf(call).start_exploration!.handler(
+        { documentPath: 'Architecture.md', topic: 'storage', theses: ['x'], triggerMessageIds: [] },
+        {},
+      );
+    });
+    await r.runtime.startRoom(r.stub.roomId);
+    r.runtime.onAsk(r.stub.roomId, r.alice('go'));
+    await vi.waitFor(() =>
+      expect(r.sdk.calls.filter((c) => typeof c.prompt === 'string')).toHaveLength(1),
+    );
+    await r.runtime.stopRoom(r.stub.roomId);
+    const worker = r.sdk.calls.find((c) => typeof c.prompt === 'string')!;
+    expect(worker.options.abortController!.signal.aborted).toBe(true); // on the room's abort signal
+    await settle();
+    expect(r.sessions()).toHaveLength(1);
+    expect(r.statuses().at(-1)).toBe('idle');
+  });
+});
+
+describe('suggestions: the exact-match fast path (M5)', () => {
+  it('applies a suggestion whose anchored text still matches without asking the orchestrator to edit, then notifies it', async () => {
+    const r = rig();
+    await r.runtime.startRoom(r.stub.roomId);
+    const m = await suggestionFor(r, { replacement: 'Intro, tightened.' });
+    r.runtime.onSuggestion(r.stub.roomId, m);
+
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion_applied]')).toHaveLength(1));
+    expect(await r.repo.readFile('Architecture.md')).toBe('# Architecture\n\nIntro, tightened.\n');
+    const sha = await r.repo.headSha('main');
+    expect((await r.repo.show(sha!)).trailers).toMatchObject({
+      actor: 'user:user_bob',
+      triggerMessageIds: [m.id],
+    });
+    expect(r.stub.changes).toEqual([
+      expect.objectContaining({ sha, documentId: 'doc_1', triggerMessageIds: [m.id] }),
+    ]);
+    expect(m.card).toMatchObject({ type: 'suggestion', status: 'applied', resolutionSha: sha });
+    // the orchestrator got a short notification, not a request to edit
+    expect(turnsWith(r, '[event:suggestion]\n')).toEqual([]);
+    const note = turnsWith(r, '[event:suggestion_applied]')[0]!;
+    expect(note).toContain(sha!);
+    expect(note).toMatch(/Nothing to edit or resolve/);
+    await r.runtime.stopAll();
+  });
+
+  it('hands a suggestion over to the orchestrator when its paragraph changed meanwhile, with the reason', async () => {
+    const r = rig();
+    await r.runtime.startRoom(r.stub.roomId);
+    const m = await suggestionFor(r, { replacement: 'Intro, tightened.' });
+    await r.repo.commitToMain(
+      { 'Architecture.md': '# Architecture\n\nIntro, by Alice.\n' },
+      'Edit',
+      {
+        actor: { kind: 'user', userId: 'user_alice', displayName: 'Alice' },
+        triggerMessageIds: [],
+      },
+    );
+    r.runtime.onSuggestion(r.stub.roomId, m);
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion]')).toHaveLength(1));
+    expect(turnsWith(r, '[event:suggestion]')[0]).toContain(
+      '"notAppliedByServer": "the anchored text changed since the suggestion was made"',
+    );
+    expect(turnsWith(r, '[event:suggestion_applied]')).toEqual([]);
+    expect(await r.repo.readFile('Architecture.md')).toBe('# Architecture\n\nIntro, by Alice.\n');
+    expect(r.stub.changes).toEqual([]);
+    expect(m.card).toMatchObject({ status: 'pending' });
+    await r.runtime.stopAll();
+  });
+
+  it('hands an oversized suggestion over to the orchestrator (it becomes a Review proposal)', async () => {
+    const r = rig();
+    const five = '# Architecture\n\nOne.\n\nTwo.\n\nThree.\n\nFour.\n\nFive.\n';
+    await r.repo.commitToMain({ 'Architecture.md': five }, 'Five paragraphs', {
+      actor: { kind: 'agent', role: 'orchestrator' },
+      triggerMessageIds: [],
+    });
+    await r.runtime.startRoom(r.stub.roomId);
+    // lines 3-9: four paragraphs rewritten into one, more than the limit of three
+    const m = await suggestionFor(r, { start: 3, end: 9, replacement: 'Merged.' });
+    r.runtime.onSuggestion(r.stub.roomId, m);
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion]')).toHaveLength(1));
+    expect(turnsWith(r, '[event:suggestion]')[0]).toMatch(
+      /notAppliedByServer.*4 existing paragraphs/,
+    );
+    expect(await r.repo.readFile('Architecture.md')).toBe(five);
+    await r.runtime.stopAll();
+  });
+
+  it('hands the suggestion over when applying it directly fails', async () => {
+    const r = rig();
+    await r.runtime.startRoom(r.stub.roomId);
+    const m = await suggestionFor(r, { replacement: 'Intro, tightened.' });
+    r.repo.commitToMain = async () => {
+      throw new Error('disk full');
+    };
+    r.runtime.onSuggestion(r.stub.roomId, m);
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion]')).toHaveLength(1));
+    expect(turnsWith(r, '[event:suggestion]')[0]).toContain(
+      'applying it directly failed: disk full',
+    );
+    expect(r.logs.some((l) => l.startsWith('warn:applying a suggestion directly failed'))).toBe(
+      true,
+    );
+    await r.runtime.stopAll();
+  });
+
+  it('keeps the chat moving while the write queue is busy: events after a suggestion wait only a moment for it', async () => {
+    const r = rig();
+    await r.runtime.startRoom(r.stub.roomId);
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    void r.repo.withMainLock(() => hold); // e.g. a semantic revert holding the queue for minutes
+    const m = await suggestionFor(r, { replacement: 'Intro, tightened.' });
+    r.runtime.onSuggestion(r.stub.roomId, m);
+    r.runtime.onAsk(r.stub.roomId, r.alice('a question meanwhile'));
+    // the ask is not stuck behind the suggestion
+    await vi.waitFor(() => expect(turnsWith(r, '[event:ask]')).toHaveLength(1), { timeout: 5000 });
+    expect(r.stub.changes).toEqual([]);
+    release();
+    await vi.waitFor(() => expect(turnsWith(r, '[event:suggestion_applied]')).toHaveLength(1));
+    expect(await r.repo.readFile('Architecture.md')).toContain('Intro, tightened.');
+    await r.runtime.stopAll();
+  });
+
+  it('keeps events in order in the common case: a suggestion is handled before the event that follows it', async () => {
+    const r = rig();
+    await r.runtime.startRoom(r.stub.roomId);
+    const m = await suggestionFor(r, { replacement: 'Intro, tightened.' });
+    r.runtime.onSuggestion(r.stub.roomId, m);
+    r.runtime.onAsk(r.stub.roomId, r.alice('and a question'));
+    await vi.waitFor(() => expect(r.sessions()[0]?.turns).toHaveLength(2));
+    const kinds = r
+      .sessions()[0]!
+      .turns.map((t) => /\[event:(suggestion_applied|ask)\]/.exec(t)?.[1]);
+    expect(kinds).toEqual(['suggestion_applied', 'ask']);
+    await r.runtime.stopAll();
+  });
+});
+
+describe('budgets per session (M1)', () => {
+  /** Runs a worker, the merge driver and the digest writer, and returns the caps they were given. */
+  async function caps(options: Partial<ClaudeRuntimeOptions>) {
+    const r = rig({ options });
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    const orchestratorCap = r.sessions()[0]!.options.maxBudgetUsd;
+    r.runtime.onAsk(r.stub.roomId, r.alice('x'));
+    await vi.waitFor(() => expect(r.sessions()[0]!.turns.length).toBeGreaterThan(0));
+
+    r.sdk.respond(oneShot(undefined, resultMessage({ structured: WORKER_OUT })));
+    await toolsOf(r.sessions()[0]!).start_exploration!.handler(
+      { documentPath: 'Architecture.md', topic: 'x', theses: ['one'], triggerMessageIds: [] },
+      {},
+    );
+    await vi.waitFor(() =>
+      expect(r.sdk.calls.filter((c) => c.options.model === MODELS.worker)).toHaveLength(1),
+    );
+    const worker = r.sdk.calls.find((c) => c.options.model === MODELS.worker)!.options.maxBudgetUsd;
+
+    const worktree = await r.repo.createDetachedWorktree('merge-1', 'main');
+    r.sdk.respond(
+      oneShot(undefined, resultMessage({ structured: { reconciled: false, summary: 's' } })),
+    );
+    await r.runtime.runMergeDriver(r.stub.roomId, {
+      proposal: makeProposal(),
+      optionId: 'opt_a',
+      worktreePath: worktree,
+      conflictedFiles: [],
+      documentPath: 'Architecture.md',
+    });
+    const merge = r.sdk.calls.at(-1)!.options.maxBudgetUsd;
+
+    r.sdk.respond(oneShot(undefined, resultMessage({ text: '- x' })));
+    await r.runtime.writeDigest(r.stub.roomId, {
+      userId: 'u',
+      sinceMessageId: null,
+      events: ['e'],
+    });
+    const digest = r.sdk.calls.at(-1)!.options.maxBudgetUsd;
+    await r.runtime.stopAll();
+    return { orchestrator: orchestratorCap, worker, merge, digest };
+  }
+
+  it('gives a worker a quarter of the configured cap, the orchestrator and merge driver the whole of it, and the digest writer a small fixed one', async () => {
+    expect(await caps({ maxBudgetUsd: 20 })).toEqual({
+      orchestrator: 20,
+      worker: 5,
+      merge: 20,
+      digest: 0.5,
+    });
+  });
+
+  it('never gives a worker less than $1, nor more than the cap itself', async () => {
+    expect((await caps({ maxBudgetUsd: 2 })).worker).toBe(1); // a quarter would be $0.50
+    const tiny = await caps({ maxBudgetUsd: 0.4 });
+    expect(tiny.worker).toBe(0.4); // the floor does not exceed the cap
+    expect(tiny.digest).toBe(0.4);
+  });
+
+  it('takes an explicit worker cap', async () => {
+    expect((await caps({ maxBudgetUsd: 20, workerBudgetUsd: 2.5 })).worker).toBe(2.5);
+  });
+
+  it('leaves everything uncapped when no cap is configured, except the digest writer', async () => {
+    expect(await caps({ maxBudgetUsd: undefined })).toEqual({
+      orchestrator: undefined,
+      worker: undefined,
+      merge: undefined,
+      digest: 0.5,
+    });
+  });
+});
+
+describe('idle rooms (M4)', () => {
+  const IDLE = { idleAfterMs: 80, idleCheckMs: 10 };
+
+  /** Presence is read from the room state: this lets a test decide who is connected. */
+  function presence(r: Rig, initial: boolean) {
+    const state = { connected: initial, broken: false };
+    const original = r.stub.actions.getRoomState;
+    r.stub.actions.getRoomState = async (roomId) => {
+      if (state.broken) throw new Error('db busy');
+      const s = await original(roomId);
+      return { ...s, presence: s.presence.map((p) => ({ ...p, connected: state.connected })) };
+    };
+    return state;
+  }
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('stops the sessions of a room nobody is in and nothing is happening in, and starts them again with the next event', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    const removed: string[] = [];
+    const original = r.repo.removeWorktree.bind(r.repo);
+    r.repo.removeWorktree = async (name) => {
+      removed.push(name);
+      return original(name);
+    };
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    const first = r.sessions()[0]!;
+
+    await vi.waitFor(() => expect(first.closed).toBe(true), { timeout: 3000 });
+    expect(first.options.abortController!.signal.aborted).toBe(true);
+    expect(r.logs).toContain('info:room idle; stopping its agent sessions until the next event');
+    expect(removed.filter((n) => n === 'orchestrator')).toHaveLength(2); // the stale one at start, its own at teardown
+    expect(r.statuses()).toEqual([]); // the room never showed anything but idle
+    await wait(150);
+    expect(r.sessions()).toHaveLength(1); // nothing came back by itself
+
+    // the next event brings it back, transparently: a new session that rehydrates and handles the event
+    r.runtime.onAsk(r.stub.roomId, r.alice('anyone there?'));
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(2));
+    await vi.waitFor(() => expect(r.sessions()[1]!.turns.length).toBe(1));
+    expect(r.sessions()[1]!.turns[0]).toContain('[event:rehydrate]');
+    expect(r.sessions()[1]!.turns[0]).toContain('anyone there?');
+    await r.runtime.stopAll();
+  });
+
+  it('does it again after the room has been quiet for as long once more', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()[0]?.closed).toBe(true), { timeout: 3000 });
+    r.runtime.onAsk(r.stub.roomId, r.alice('back'));
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(2));
+    await vi.waitFor(() => expect(r.sessions()[1]!.closed).toBe(true), { timeout: 3000 });
+    await r.runtime.stopAll();
+  });
+
+  it('also stops the listener: chat after the teardown gets a new one', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()[0]?.closed).toBe(true), { timeout: 3000 });
+    r.runtime.onChatMessage(r.stub.roomId, r.alice('we should add a latency section'));
+    await vi.waitFor(() => expect(r.client.calls).toHaveLength(1)); // the new listener classifies it
+    await r.runtime.stopAll();
+  });
+
+  it('keeps a room with someone connected, however quiet it is', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, true);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    await wait(400); // five times the idle time
+    expect(r.sessions()[0]!.closed).toBe(false);
+    expect(r.sessions()).toHaveLength(1);
+    await r.runtime.stopAll();
+  });
+
+  it('treats presence it cannot read as somebody being there', async () => {
+    const r = rig({ options: IDLE });
+    const p = presence(r, false);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    p.broken = true;
+    await wait(300);
+    expect(r.sessions()[0]!.closed).toBe(false);
+    expect(r.logs.some((l) => l.startsWith('warn:could not read presence'))).toBe(true);
+    await r.runtime.stopAll();
+  });
+
+  it('keeps a room that is busy: an orchestrator turn in progress, then stops it once it is over', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    r.sdk.respond(
+      session(async () => {
+        await gate;
+      }),
+    );
+    await r.runtime.startRoom(r.stub.roomId);
+    r.runtime.onAsk(r.stub.roomId, r.alice('a long one'));
+    await vi.waitFor(() => expect(r.sessions()[0]?.turns).toHaveLength(1));
+    await wait(300);
+    expect(r.sessions()[0]!.closed).toBe(false);
+    release();
+    await vi.waitFor(() => expect(r.sessions()[0]!.closed).toBe(true), { timeout: 3000 });
+    await r.runtime.stopAll();
+  });
+
+  it('keeps a room whose exploration is still running', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const orchestrate = session(async (text, call) => {
+      if (text.includes('[event:ask]'))
+        await toolsOf(call).start_exploration!.handler(
+          { documentPath: 'Architecture.md', topic: 'x', theses: ['one'], triggerMessageIds: [] },
+          {},
+        );
+    });
+    r.sdk.respond(async function* (call) {
+      if (typeof call.prompt === 'string') {
+        await gate;
+        yield resultMessage({ structured: WORKER_OUT });
+        return;
+      }
+      yield* orchestrate(call);
+    });
+    await r.runtime.startRoom(r.stub.roomId);
+    r.runtime.onAsk(r.stub.roomId, r.alice('explore'));
+    await vi.waitFor(() =>
+      expect(r.sdk.calls.filter((c) => typeof c.prompt === 'string')).toHaveLength(1),
+    );
+    await wait(300); // the orchestrator has long been idle, the workers have not finished
+    expect(r.sessions()[0]!.closed).toBe(false);
+    release();
+    // the results are delivered to the orchestrator first; only then does the room go quiet and idle
+    await vi.waitFor(() => expect(turnsWith(r, '[event:exploration_finished]')).toHaveLength(1));
+    await vi.waitFor(() => expect(r.sessions()[0]!.closed).toBe(true), { timeout: 3000 });
+    await r.runtime.stopAll();
+  });
+
+  it('keeps a room while a merge is running', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    r.sdk.respond(async function* () {
+      await gate;
+      yield resultMessage({ structured: { reconciled: false, summary: 'clean' } });
+    });
+    const worktree = await r.repo.createDetachedWorktree('merge-1', 'main');
+    const merging = r.runtime.runMergeDriver(r.stub.roomId, {
+      proposal: makeProposal(),
+      optionId: 'opt_a',
+      worktreePath: worktree,
+      conflictedFiles: [],
+      documentPath: 'Architecture.md',
+    });
+    await wait(300);
+    expect(r.sessions()[0]!.closed).toBe(false);
+    release();
+    await merging;
+    await vi.waitFor(() => expect(r.sessions()[0]!.closed).toBe(true), { timeout: 3000 });
+    await r.runtime.stopAll();
+  });
+
+  it('is kept alive by events', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(1));
+    for (let i = 0; i < 8; i++) {
+      r.runtime.onAsk(r.stub.roomId, r.alice(`question ${i}`));
+      await wait(30); // well inside the 80 ms idle time
+    }
+    expect(r.sessions()).toHaveLength(1);
+    expect(r.sessions()[0]!.closed).toBe(false);
+    await r.runtime.stopAll();
+  });
+
+  it('leaves an idle room idle across a sign-in, and does not show it as unavailable after a sign-out', async () => {
+    const r = rig({ options: IDLE });
+    presence(r, false);
+    await r.runtime.startRoom(r.stub.roomId);
+    await vi.waitFor(() => expect(r.sessions()[0]?.closed).toBe(true), { timeout: 3000 });
+    r.creds.set(true); // a new login while nobody is there
+    await settle();
+    expect(r.sessions()).toHaveLength(1); // no process was started for an empty room
+    r.creds.set(false);
+    await settle();
+    r.creds.set(true);
+    await settle();
+    expect(r.sessions()).toHaveLength(1);
+    r.runtime.onAsk(r.stub.roomId, r.alice('someone is back'));
+    await vi.waitFor(() => expect(r.sessions()).toHaveLength(2));
+    await r.runtime.stopAll();
+  });
+
+  it('can be switched off, and is on by default with a 15 minute idle time', async () => {
+    const off = rig({ options: { idleAfterMs: 0, idleCheckMs: 10 } });
+    presence(off, false);
+    await off.runtime.startRoom(off.stub.roomId);
+    await vi.waitFor(() => expect(off.sessions()).toHaveLength(1));
+    await wait(200);
+    expect(off.sessions()[0]!.closed).toBe(false);
+    await off.runtime.stopAll();
+
+    // with the defaults a room is not stopped within the first minutes (the timer is armed but far from due)
+    const normal = rig();
+    presence(normal, false);
+    await normal.runtime.startRoom(normal.stub.roomId);
+    await vi.waitFor(() => expect(normal.sessions()).toHaveLength(1));
+    await wait(100);
+    expect(normal.sessions()[0]!.closed).toBe(false);
+    await normal.runtime.stopAll();
   });
 });

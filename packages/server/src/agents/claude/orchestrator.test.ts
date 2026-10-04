@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { DEFAULTS, EFFORT, MODELS, type Message } from '@quorum/shared';
@@ -14,10 +16,12 @@ import {
 import { decide, makeProposal, tunables } from '../testing/fixtures.js';
 import { StatusBoard } from '../status.js';
 import { SIGN_IN_DETAIL } from '../common.js';
+import { ScratchWorktree } from './scratch.js';
 import {
   ORCHESTRATOR_BUILTIN_TOOLS,
   Orchestrator,
   buildOrchestratorOptions,
+  type ApiRetryPolicy,
   type OrchestratorDeps,
   type RestartPolicy,
 } from './orchestrator.js';
@@ -48,6 +52,7 @@ interface Rig {
 function rig(
   opts: {
     restart?: Partial<RestartPolicy>;
+    apiRetry?: Partial<ApiRetryPolicy>;
     tunables?: Record<string, number>;
     withStatus?: boolean;
   } = {},
@@ -76,6 +81,7 @@ function rig(
     maxBudgetUsd: 7,
     status: opts.withStatus === false ? undefined : board,
     restart: opts.restart ?? FAST,
+    apiRetry: opts.apiRetry,
     startExploration: async () => ({ workers: [] }),
   };
   const orch = new Orchestrator(deps);
@@ -99,21 +105,33 @@ const statuses = (r: Rig) =>
 afterEach(() => vi.useRealTimers());
 
 describe('buildOrchestratorOptions', () => {
-  it('describes the PRD session: Opus at medium effort in the main worktree with the quorum tools and a restricted Bash', async () => {
+  it("describes the PRD session: Opus at medium effort in its own scratch worktree (not main's) with the quorum tools and a restricted Bash", async () => {
     const r = rig();
     let compacted = 0;
     const abort = new AbortController();
-    const o = buildOrchestratorOptions(r.deps, { onCompact: () => compacted++ }, abort);
+    const scratch = await ScratchWorktree.create(r.repo);
+    const o = buildOrchestratorOptions(r.deps, { onCompact: () => compacted++ }, abort, {
+      scratch,
+    });
 
     expect(o).toMatchObject({
       model: MODELS.orchestrator,
       effort: EFFORT.orchestrator,
-      cwd: r.repo.mainWorktree,
+      cwd: scratch.dir,
       maxBudgetUsd: 7,
       permissionMode: 'default',
       settingSources: [],
       abortController: abort,
       pathToClaudeCodeExecutable: '/opt/claude/bin/claude',
+      verbatimPrompts: true,
+    });
+    expect(scratch.dir).not.toBe(r.repo.mainWorktree);
+    // Bash is isolated, with writes limited to the session's own directory, and still goes through canUseTool
+    expect(o.sandbox).toMatchObject({
+      enabled: true,
+      autoAllowBashIfSandboxed: false,
+      allowUnsandboxedCommands: false,
+      filesystem: { allowWrite: [scratch.dir] },
     });
     expect(o.env).toMatchObject({ CLAUDE_CONFIG_DIR: '/data/claude' });
     expect(o.systemPrompt).toContain('You are the Quorum orchestrator');
@@ -148,12 +166,17 @@ describe('buildOrchestratorOptions', () => {
     expect((await ask('Bash', { command: 'cat $HOME/.claude/.credentials.json' })).behavior).toBe(
       'deny',
     );
+    expect((await ask('Edit', { file_path: `${scratch.dir}/Architecture.md` })).behavior).toBe(
+      'allow',
+    );
+    expect((await ask('Write', { file_path: `${scratch.dir}/.prettierrc.js` })).behavior).toBe(
+      'deny',
+    );
+    // the main worktree is outside the session's reach altogether
     expect(
       (await ask('Edit', { file_path: `${r.repo.mainWorktree}/Architecture.md` })).behavior,
-    ).toBe('allow');
-    expect(
-      (await ask('Write', { file_path: `${r.repo.mainWorktree}/.prettierrc.js` })).behavior,
     ).toBe('deny');
+    expect((await ask('Bash', { command: 'git add Architecture.md' })).behavior).toBe('deny');
     expect((await ask('WebFetch', { url: 'https://example.com' })).behavior).toBe('deny');
 
     // the PreCompact hook reminds the session and arms the reminder for the next turn
@@ -165,12 +188,13 @@ describe('buildOrchestratorOptions', () => {
     expect(compacted).toBe(1);
   });
 
-  it('omits the credential environment when none is configured (the subprocess inherits the server environment)', () => {
+  it('omits the credential environment when none is configured (the subprocess inherits the server environment)', async () => {
     const r = rig();
     const o = buildOrchestratorOptions(
       { ...r.deps, claude: undefined },
       { onCompact: () => undefined },
       new AbortController(),
+      { scratch: await ScratchWorktree.create(r.repo) },
     );
     expect('pathToClaudeCodeExecutable' in o).toBe(false);
     expect(o.env!.PATH).toBe(process.env.PATH);
@@ -182,6 +206,7 @@ describe('buildOrchestratorOptions', () => {
       r.deps,
       { onCompact: () => undefined },
       new AbortController(),
+      { scratch: await ScratchWorktree.create(r.repo) },
     );
     const server = o.mcpServers!.quorum as unknown as {
       instance: {
@@ -264,20 +289,17 @@ describe('Orchestrator turns', () => {
     let handled = 0;
     r.sdk.respond(
       session(async () => {
-        const mine = ++handled;
-        if (mine === 1) await gate; // the first turn is still being handled
-        return [resultMessage({ queued: mine === 1 ? 1 : 0 })];
+        if (++handled === 1) await gate; // the first turn is still being handled
       }),
     );
     r.orch.start();
     r.orch.send(askEvent(r.ask('one')));
     await vi.waitFor(() => expect(r.sdk.calls[0]?.turns).toHaveLength(1));
-    const second = r.ask('two');
-    r.orch.send(askEvent(second));
+    r.orch.send(askEvent(r.ask('two')));
+    release();
     await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(2));
     expect(r.sdk.calls[0]!.turns[1]).toContain('"otherEventsInFlight"');
     expect(r.sdk.calls[0]!.turns[1]).toMatch(/ask msg_/);
-    release();
     await r.orch.stop();
   });
 
@@ -334,21 +356,20 @@ describe('agent status', () => {
     let handled = 0;
     r.sdk.respond(
       session(async () => {
-        const mine = ++handled;
-        if (mine === 1) await gate;
-        // while the first turn runs, the second is already queued in the CLI; only the last result drains the queue
-        return [resultMessage({ queued: mine === 1 ? 1 : 0 })];
+        if (++handled === 1) await gate;
       }),
     );
     r.orch.start();
     r.orch.send(askEvent(r.ask('one')));
     r.orch.send(askEvent(r.ask('two')));
-    await vi.waitFor(() => expect(r.sdk.calls[0]?.turns).toHaveLength(2)); // both are handed to the session at once
+    await vi.waitFor(() => expect(r.sdk.calls[0]?.turns).toHaveLength(1)); // the second waits its turn
     await r.board.settled();
     expect(statuses(r)).toEqual(['thinking']);
     release();
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(2));
     await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
     await r.board.settled();
+    // one stretch of thinking across both events, not a flicker to idle in between
     expect(statuses(r)).toEqual(['thinking', 'idle']);
     await r.orch.stop();
   });
@@ -528,6 +549,97 @@ describe('restart and recovery', () => {
       await r.orch.stop();
     });
 
+    describe('usage totals across a restart', () => {
+      /**
+       * Result messages carry totals cumulative for the conversation. A resumed session continues from the totals saved with
+       * its transcript, so its first result already includes everything the earlier process spent.
+       */
+      const totals = (i: number, o: number, c: number) => ({
+        model: MODELS.orchestrator,
+        input: i,
+        output: o,
+        cost: c,
+      });
+      const sum = (r: Rig, key: 'inputTokens' | 'outputTokens' | 'costUsd') =>
+        r.stub.usage.reduce((total, u) => total + u[key], 0);
+
+      it('records a resumed session once: the totals it inherits are not counted again (M2)', async () => {
+        const r = rig({ restart: { ...FAST, max: 10 } });
+        let n = 0;
+        r.sdk.respond(async function* (call) {
+          const resumed = call.options.resume !== undefined;
+          const id = n++ === 0 ? 'sess_A' : 'sess_B';
+          let turns = 0;
+          for await (const msg of call.prompt as AsyncIterable<SDKUserMessage>) {
+            call.turns.push(userText(msg));
+            turns += 1;
+            if (!resumed && turns === 3) throw new Error('process died');
+            const usage = resumed
+              ? totals(1800, 190, 0.1) // the saved 1500/160/$0.08 plus this turn's 300/30/$0.02
+              : turns === 1
+                ? totals(1000, 100, 0.05)
+                : totals(1500, 160, 0.08);
+            yield resultMessage({ sessionId: id, usage });
+          }
+        });
+        r.orch.start();
+        r.orch.send(askEvent(r.ask('one')));
+        await vi.waitFor(() => expect(r.stub.usage).toHaveLength(1));
+        r.orch.send(askEvent(r.ask('two')));
+        await vi.waitFor(() => expect(r.stub.usage).toHaveLength(2));
+        r.orch.send(askEvent(r.ask('three, which kills the session')));
+        await vi.waitFor(() => expect(r.sdk.calls[1]?.turns.length).toBeGreaterThan(0));
+        await vi.waitFor(() => expect(r.stub.usage).toHaveLength(3));
+
+        expect(r.sdk.calls[1]!.options.resume).toBe('sess_A');
+        expect(r.stub.usage.map((u) => [u.sessionId, u.inputTokens, u.outputTokens])).toEqual([
+          ['sess_A', 1000, 100],
+          ['sess_A', 500, 60],
+          ['sess_B', 300, 30], // not 1800/190: the first 1500/160 was recorded by session A
+        ]);
+        // the room's recorded total is exactly what the conversation has spent
+        expect(sum(r, 'inputTokens')).toBe(1800);
+        expect(sum(r, 'outputTokens')).toBe(190);
+        expect(sum(r, 'costUsd')).toBeCloseTo(0.1, 10);
+        await r.orch.stop();
+      });
+
+      it('counts a session that starts over in full, even when its totals are below what the dead one had', async () => {
+        const r = rig({ restart: { ...FAST, max: 10 } });
+        let n = 0;
+        r.sdk.respond(async function* (call) {
+          const mode = n++; // 0 answers once then dies, 1 (resumed) dies unanswered, 2 (fresh) answers
+          let turns = 0;
+          for await (const msg of call.prompt as AsyncIterable<SDKUserMessage>) {
+            call.turns.push(userText(msg));
+            turns += 1;
+            if (mode === 0 && turns === 2) throw new Error('process died');
+            if (mode === 1) throw new Error('process died');
+            yield resultMessage({
+              sessionId: mode === 0 ? 'sess_A' : 'sess_C',
+              usage: mode === 0 ? totals(1000, 100, 0.05) : totals(400, 40, 0.02),
+            });
+          }
+        });
+        r.orch.start();
+        r.orch.send(askEvent(r.ask('one')));
+        await vi.waitFor(() => expect(r.stub.usage).toHaveLength(1));
+        r.orch.send(askEvent(r.ask('two, which kills the session')));
+        await vi.waitFor(() => expect(r.sdk.calls.length).toBeGreaterThanOrEqual(3));
+        r.orch.send(askEvent(r.ask('three')));
+        await vi.waitFor(() => expect(r.stub.usage).toHaveLength(2));
+
+        expect(r.sdk.calls[2]!.options.resume).toBeUndefined(); // started over
+        // the fresh conversation's 400/40/$0.02 is new spend, although it is below the dead session's 1000/100/$0.05
+        expect(r.stub.usage.map((u) => [u.sessionId, u.inputTokens, u.outputTokens])).toEqual([
+          ['sess_A', 1000, 100],
+          ['sess_C', 400, 40],
+        ]);
+        expect(sum(r, 'costUsd')).toBeCloseTo(0.07, 10);
+        await r.orch.stop();
+      });
+    });
+
     it('does not resume after a session that never answered anything', async () => {
       const r = rig();
       r.sdk.respond(crashFirst(2));
@@ -705,20 +817,18 @@ describe('expiry timer (5 minutes)', () => {
     await r.orch.stop();
   });
 
-  it('re-checks unchanged proposals only every few ticks, and right away when something changed', async () => {
+  it('asks again at every 5 minute tick while a proposal is open, changed or not (the answer depends on elapsed time)', async () => {
     const r = expiryRig();
     r.orch.start();
     await vi.advanceTimersByTimeAsync(FIVE);
     expect(expiryTurns(r)).toHaveLength(1);
 
-    // five more quiet ticks: same proposal, no votes, no chat
-    await vi.advanceTimersByTimeAsync(FIVE * 5);
-    expect(expiryTurns(r)).toHaveLength(1);
-    // the sixth tick after the last check is due
-    await vi.advanceTimersByTimeAsync(FIVE);
-    expect(expiryTurns(r)).toHaveLength(2);
-
-    // a vote changes the picture: the next tick asks again
+    // quiet ticks: same proposal, no votes, no chat. The cadence is not stretched.
+    for (let tick = 2; tick <= 8; tick++) {
+      await vi.advanceTimersByTimeAsync(FIVE);
+      expect(expiryTurns(r)).toHaveLength(tick);
+    }
+    // a vote or new chat does not change the cadence either
     r.stub.proposals[0]!.votes.push({
       proposalId: 'prop_1',
       userId: 'user_alice',
@@ -726,12 +836,23 @@ describe('expiry timer (5 minutes)', () => {
       decision: 'approve',
       castAt: new Date().toISOString(),
     });
-    await vi.advanceTimersByTimeAsync(FIVE);
-    expect(expiryTurns(r)).toHaveLength(3);
-    // so does new chat
     r.stub.human('user_bob', 'Bob', 'never mind the vote');
     await vi.advanceTimersByTimeAsync(FIVE);
-    expect(expiryTurns(r)).toHaveLength(4);
+    expect(expiryTurns(r)).toHaveLength(9);
+    await r.orch.stop();
+  });
+
+  it('stops asking as soon as nothing is open, and starts again when something is', async () => {
+    const r = expiryRig();
+    r.orch.start();
+    await vi.advanceTimersByTimeAsync(FIVE);
+    expect(expiryTurns(r)).toHaveLength(1);
+    r.stub.proposals[0]!.state = 'merged';
+    await vi.advanceTimersByTimeAsync(FIVE * 3);
+    expect(expiryTurns(r)).toHaveLength(1);
+    r.stub.proposals.push(makeProposal({ id: 'prop_2' }));
+    await vi.advanceTimersByTimeAsync(FIVE);
+    expect(expiryTurns(r)).toHaveLength(2); // the very next tick: no quiet-room multiplier delays a new proposal
     await r.orch.stop();
   });
 
@@ -744,5 +865,283 @@ describe('expiry timer (5 minutes)', () => {
     expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(FIVE * 2);
     expect(expiryTurns(r)).toHaveLength(0);
+  });
+});
+
+describe('one event at a time, in a scratch worktree', () => {
+  /** a spy standing in for the scratch worktree, to count resets */
+  function spyScratch(r: Rig) {
+    const events: string[] = [];
+    return {
+      events,
+      dir: r.repo.mainWorktree, // only a stand-in directory; nothing is edited here
+      base: 'b'.repeat(40),
+      reset: async () => {
+        events.push('reset');
+        return 'b'.repeat(40);
+      },
+    };
+  }
+
+  it('hands an event over only after the previous one was answered (the SDK is never given a backlog)', async () => {
+    const r = rig();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let handled = 0;
+    r.sdk.respond(
+      session(async () => {
+        if (++handled === 1) await gate;
+      }),
+    );
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('alpha')));
+    r.orch.send(askEvent(r.ask('bravo')));
+    r.orch.send(askEvent(r.ask('charlie')));
+    await vi.waitFor(() => expect(r.sdk.calls[0]?.turns).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(r.sdk.calls[0]!.turns).toHaveLength(1); // bravo and charlie wait in the orchestrator, not in the CLI
+    expect(r.orch.pendingCount).toBe(3);
+    release();
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(3));
+    const order = r.sdk.calls[0]!.turns.map((t) => /alpha|bravo|charlie/.exec(t)?.[0]);
+    expect(order).toEqual(['alpha', 'bravo', 'charlie']);
+    await r.orch.stop();
+  });
+
+  it('resets the working copy before every turn: once per event, before the event is handed over', async () => {
+    const r = rig();
+    const scratch = spyScratch(r);
+    r.deps.scratch = scratch;
+    const orch = new Orchestrator(r.deps);
+    r.sdk.respond(
+      session((text) => {
+        scratch.events.push(`turn:${/\[event:[a-z_]+\]/.exec(text)?.[0]}`);
+      }),
+    );
+    orch.start();
+    orch.send(askEvent(r.ask('one')));
+    await vi.waitFor(() => expect(scratch.events).toHaveLength(2));
+    orch.send(askEvent(r.ask('two')));
+    await vi.waitFor(() => expect(scratch.events).toHaveLength(4));
+    expect(scratch.events).toEqual([
+      'reset',
+      'turn:[event:rehydrate]',
+      'reset',
+      'turn:[event:ask]',
+    ]);
+    await orch.stop();
+    expect(scratch.events).toHaveLength(4); // an injected scratch is not the orchestrator's to remove
+  });
+
+  it("works in a worktree of its own: an edit left over from one turn is gone at the start of the next, and main's news is in", async () => {
+    const r = rig();
+    const seen: string[] = [];
+    let turn = 0;
+    r.sdk.respond(
+      session((_text, call) => {
+        const doc = join(call.options.cwd!, 'Architecture.md');
+        seen.push(readFileSync(doc, 'utf8'));
+        if (++turn === 1) writeFileSync(doc, 'a half-finished edit the model never committed');
+      }),
+    );
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('one')));
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
+
+    // main moves between the turns (another writer)
+    await r.repo.commitToMain(
+      { 'Architecture.md': '# Architecture\n\nIntro, edited by Bob.\n' },
+      'Edit',
+      {
+        actor: { kind: 'user', userId: 'user_bob', displayName: 'Bob' },
+        triggerMessageIds: [],
+      },
+    );
+    r.orch.send(askEvent(r.ask('two')));
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+
+    expect(seen[0]).toBe('# Architecture\n\nIntro.\n');
+    expect(seen[1]).toBe('# Architecture\n\nIntro, edited by Bob.\n'); // neither the stale edit nor the stale text
+    expect(r.sdk.calls[0]!.options.cwd).not.toBe(r.repo.mainWorktree);
+    // main's own worktree was never touched
+    expect(readFileSync(join(r.repo.mainWorktree, 'Architecture.md'), 'utf8')).toBe(
+      '# Architecture\n\nIntro, edited by Bob.\n',
+    );
+    await r.orch.stop();
+  });
+
+  it('keeps the same working directory across a restart of the session, and removes it on stop()', async () => {
+    const r = rig();
+    r.sdk.respond(
+      session(() => {
+        throw new Error('boom');
+      }),
+    );
+    const removed: string[] = [];
+    const original = r.repo.removeWorktree.bind(r.repo);
+    r.repo.removeWorktree = async (name) => {
+      removed.push(name);
+      return original(name);
+    };
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('one')));
+    await vi.waitFor(() => expect(r.sdk.calls.length).toBeGreaterThanOrEqual(2));
+    expect(r.sdk.calls[1]!.options.cwd).toBe(r.sdk.calls[0]!.options.cwd);
+    expect(removed).toEqual(['orchestrator']); // only the stale one it replaced at start
+    await r.orch.stop();
+    expect(removed).toEqual(['orchestrator', 'orchestrator']);
+  });
+
+  it('treats a failure to create the working directory like any session failure: unavailable, retried, recovers', async () => {
+    const r = rig({ restart: { ...FAST, max: 10 } });
+    let attempts = 0;
+    const original = r.repo.createDetachedWorktree.bind(r.repo);
+    r.repo.createDetachedWorktree = async (name, ref) => {
+      if (++attempts === 1) throw new Error('worktree add failed');
+      return original(name, ref);
+    };
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('one')));
+    await vi.waitFor(() => expect(r.sdk.calls[0]?.turns).toHaveLength(1));
+    expect(attempts).toBe(2);
+    expect(r.logs.some((l) => l.startsWith('error:orchestrator session failed'))).toBe(true);
+    await r.orch.stop();
+  });
+});
+
+describe('temporary API failures (429, 5xx, overloaded)', () => {
+  const RETRY = { baseMs: 20, maxMs: 80, maxAgeMs: 60_000 };
+  const overloaded = () => [
+    assistantMessage({ model: MODELS.orchestrator, error: 'overloaded' }),
+    resultMessage({ isError: true, text: 'API Error: 529 {"type":"overloaded_error"}' }),
+  ];
+  const detail = 'The Claude API is unavailable; retrying';
+
+  it('hands the event over again after a growing backoff, shows the agent as unavailable meanwhile, and recovers by itself', async () => {
+    const r = rig({ apiRetry: RETRY });
+    const arrivals: number[] = [];
+    r.sdk.respond(
+      session(() => {
+        arrivals.push(Date.now());
+        return arrivals.length <= 2 ? overloaded() : [resultMessage({ sessionId: 'sess_ok' })];
+      }),
+    );
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('please answer this')));
+    await vi.waitFor(() => expect(r.board.current).toEqual({ status: 'unavailable', detail }));
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(3)); // two failures, then the answer
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle')); // no sign-in, no restart needed
+
+    const turns = r.sdk.calls[0]!.turns;
+    for (const t of turns) expect(t).toContain('please answer this');
+    expect(turns[0]).not.toContain('temporarily unavailable');
+    expect(turns[1]).toContain('the Claude API was temporarily unavailable');
+    expect(turns[2]!.match(/temporarily unavailable/g)).toHaveLength(1); // the note is not stacked
+    // the backoff doubles: 20 ms, then 40 ms
+    expect(arrivals[1]! - arrivals[0]!).toBeGreaterThanOrEqual(15);
+    expect(arrivals[2]! - arrivals[1]!).toBeGreaterThanOrEqual(30);
+    expect(
+      r.logs.filter((l) =>
+        l.startsWith('warn:orchestrator turn failed with a temporary API error'),
+      ),
+    ).toHaveLength(2);
+    // one session throughout: nothing was restarted
+    expect(r.sdk.calls).toHaveLength(1);
+    await r.orch.stop();
+  });
+
+  it('does not lose the events queued behind the failing one, and keeps their order', async () => {
+    const r = rig({ apiRetry: RETRY });
+    let n = 0;
+    r.sdk.respond(session(() => (++n === 1 ? overloaded() : [resultMessage()])));
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('first')));
+    r.orch.send(askEvent(r.ask('second')));
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(3));
+    const order = r.sdk.calls[0]!.turns.map((t) => (t.includes('first') ? 'first' : 'second'));
+    expect(order).toEqual(['first', 'first', 'second']);
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
+    await r.orch.stop();
+  });
+
+  it('recognizes a rate limit or server error from the error message alone', async () => {
+    const r = rig({ apiRetry: RETRY });
+    let n = 0;
+    r.sdk.respond(
+      session(() => {
+        n += 1;
+        if (n === 1)
+          return [
+            assistantMessage({ model: MODELS.orchestrator, error: 'rate_limit' }),
+            resultMessage({ isError: true }),
+          ];
+        if (n === 2)
+          return [resultMessage({ isError: true, text: 'API Error: 503 Service Unavailable' })];
+        return [resultMessage()];
+      }),
+    );
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('x')));
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(3));
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
+    await r.orch.stop();
+  });
+
+  it('does not retry what is not a temporary failure: a rejected request, a failed turn, a 5xx number in a good answer', async () => {
+    const r = rig({ apiRetry: RETRY });
+    let n = 0;
+    r.sdk.respond(
+      session(() => {
+        n += 1;
+        if (n === 1)
+          return [
+            assistantMessage({ model: MODELS.orchestrator, error: 'invalid_request' }),
+            resultMessage({ isError: true, text: 'API Error: 400 invalid request' }),
+          ];
+        if (n === 2) return [resultMessage({ subtype: 'error_max_turns' })];
+        return [resultMessage({ text: 'The log showed 500 errors and a 429 or two; fixed.' })];
+      }),
+    );
+    r.orch.start();
+    for (const w of ['a', 'b', 'c']) r.orch.send(askEvent(r.ask(`question ${w}`)));
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns).toHaveLength(3));
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
+    expect(r.sdk.calls[0]!.turns.some((t) => t.includes('temporarily unavailable'))).toBe(false);
+    expect(r.board.current.status).toBe('idle');
+    await r.orch.stop();
+  });
+
+  it('gives up on an event the API keeps failing for too long, and does not leave the room unavailable', async () => {
+    const r = rig({ apiRetry: { baseMs: 5, maxMs: 10, maxAgeMs: 40 } });
+    let outage = true;
+    r.sdk.respond(session(() => (outage ? overloaded() : [resultMessage()])));
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('stale by the time the API is back')));
+    await vi.waitFor(() =>
+      expect(
+        r.logs.some((l) => l.startsWith('warn:dropping an event that the API kept failing')),
+      ).toBe(true),
+    );
+    await vi.waitFor(() => expect(r.board.current.status).toBe('idle'));
+    const delivered = r.sdk.calls[0]!.turns.length;
+    outage = false;
+    r.orch.send(askEvent(r.ask('fresh')));
+    await vi.waitFor(() => expect(r.sdk.calls[0]!.turns.length).toBe(delivered + 1));
+    expect(r.sdk.calls[0]!.turns.at(-1)).toContain('fresh');
+    expect(r.sdk.calls[0]!.turns.at(-1)).not.toContain('temporarily unavailable');
+    await r.orch.stop();
+  });
+
+  it('stop() during a backoff returns promptly and hands nothing over', async () => {
+    const r = rig({ apiRetry: { baseMs: 60_000, maxMs: 60_000, maxAgeMs: 600_000 } });
+    r.sdk.respond(session(() => overloaded()));
+    r.orch.start();
+    r.orch.send(askEvent(r.ask('x')));
+    await vi.waitFor(() => expect(r.board.current.status).toBe('unavailable'));
+    const started = Date.now();
+    await r.orch.stop();
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(r.sdk.calls[0]!.turns).toHaveLength(1);
   });
 });

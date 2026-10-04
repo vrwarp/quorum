@@ -17,6 +17,13 @@ export function userMessage(text: string): SDKUserMessage {
   return { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null };
 }
 
+/**
+ * How Bash is isolated in sessions that have it: 'auto' (default) turns the SDK sandbox on and degrades to an
+ * unsandboxed Bash, with a CLI warning, where the host cannot run it (no bubblewrap); 'required' makes such a session
+ * fail instead; 'off' leaves the sandbox out.
+ */
+export type SandboxMode = 'off' | 'auto' | 'required';
+
 /** How the Claude Code subprocess is launched and authenticated. Applied to every `query()` the runtime makes. */
 export interface ClaudeProcessConfig {
   /** Claude Code executable the SDK spawns (pathToClaudeCodeExecutable); omit to use the SDK's bundled binary. */
@@ -25,20 +32,63 @@ export interface ClaudeProcessConfig {
   env?: () => Record<string, string>;
   /** ANTHROPIC_API_KEY handed to the subprocess when it is not already in the server's environment. */
   apiKey?: string;
+  /** Bash isolation for sessions that have Bash (default 'auto'). */
+  sandbox?: SandboxMode;
 }
 
 /**
- * `Options.env` REPLACES the subprocess environment, so the server's own environment is spread in first (PATH, HOME,
- * and an ambient ANTHROPIC_API_KEY), then the configured API key, then the credential environment from the sign-in
- * service.
+ * The server's environment as an agent session may see it: the server's own configuration (QUORUM_PASSWORD,
+ * QUORUM_DATA_DIR, ...) is removed, everything else (PATH, HOME, an ambient ANTHROPIC_API_KEY, proxy settings) stays.
+ */
+export function agentEnvironment(
+  base: NodeJS.ProcessEnv = process.env,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (!key.toUpperCase().startsWith('QUORUM_')) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * `Options.env` REPLACES the subprocess environment, so the server's environment (without its own QUORUM_* settings)
+ * is spread in first (PATH, HOME, and an ambient ANTHROPIC_API_KEY), then the configured API key, then the credential
+ * environment from the sign-in service.
+ *
+ * `verbatimPrompts` is on for every session: chat text reaches prompts, and the CLI would otherwise expand `@path`
+ * mentions in it (attaching files, credentials included, without ever asking `canUseTool`) and dispatch slash commands.
  */
 export function sdkProcessOptions(
   cfg?: ClaudeProcessConfig,
-): Pick<Options, 'env' | 'pathToClaudeCodeExecutable'> {
-  const env: Record<string, string | undefined> = { ...process.env };
+): Pick<Options, 'env' | 'pathToClaudeCodeExecutable' | 'verbatimPrompts'> {
+  const env = agentEnvironment();
   if (cfg?.apiKey) env.ANTHROPIC_API_KEY = cfg.apiKey;
   Object.assign(env, cfg?.env?.() ?? {});
-  return { env, ...(cfg?.binary ? { pathToClaudeCodeExecutable: cfg.binary } : {}) };
+  return {
+    env,
+    verbatimPrompts: true,
+    ...(cfg?.binary ? { pathToClaudeCodeExecutable: cfg.binary } : {}),
+  };
+}
+
+/**
+ * SDK sandbox for a session with Bash: commands run isolated, writing only inside `cwd`. Everything is still decided by
+ * `canUseTool`: `autoAllowBashIfSandboxed` is off (it would approve sandboxed commands without asking the callback) and
+ * `dangerouslyDisableSandbox` is ignored. Without bubblewrap the CLI cannot isolate anything; 'auto' lets the session
+ * run unsandboxed (the permission callback is then the only gate), 'required' fails it.
+ */
+export function sandboxOptions(cwd: string, cfg?: ClaudeProcessConfig): Pick<Options, 'sandbox'> {
+  const mode = cfg?.sandbox ?? 'auto';
+  if (mode === 'off') return {};
+  return {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: mode === 'required',
+      autoAllowBashIfSandboxed: false,
+      allowUnsandboxedCommands: false,
+      filesystem: { allowWrite: [cwd] },
+    },
+  };
 }
 
 /** Single-consumer async queue used as streaming input. */
@@ -91,6 +141,11 @@ interface UsageEntry {
 /**
  * Result messages carry totals that are cumulative for the query() call (and per-model). This turns them
  * into per-result deltas so usage is recorded once.
+ *
+ * A resumed session's first result already carries the totals saved with its transcript, so one tracker must outlive
+ * the session it was created for and serve the sessions that resume it. When a session starts over instead (nothing to
+ * resume, or a /clear), its totals go back to zero: a total that goes backwards is such a reset, and the new totals
+ * count in full.
  */
 export class UsageTracker {
   private seen = new Map<
@@ -144,12 +199,19 @@ export class UsageTracker {
         cost: u.costUSD,
       };
       this.seen.set(model, cur);
+      const reset =
+        cur.input < prev.input ||
+        cur.output < prev.output ||
+        cur.cacheRead < prev.cacheRead ||
+        cur.cacheWrite < prev.cacheWrite ||
+        cur.cost < prev.cost;
+      const from = reset ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } : prev;
       const d = {
-        input: Math.max(0, cur.input - prev.input),
-        output: Math.max(0, cur.output - prev.output),
-        cacheRead: Math.max(0, cur.cacheRead - prev.cacheRead),
-        cacheWrite: Math.max(0, cur.cacheWrite - prev.cacheWrite),
-        cost: Math.max(0, cur.cost - prev.cost),
+        input: cur.input - from.input,
+        output: cur.output - from.output,
+        cacheRead: cur.cacheRead - from.cacheRead,
+        cacheWrite: cur.cacheWrite - from.cacheWrite,
+        cost: cur.cost - from.cost,
       };
       if (d.input + d.output + d.cacheRead + d.cacheWrite === 0 && d.cost === 0) continue;
       out.push({

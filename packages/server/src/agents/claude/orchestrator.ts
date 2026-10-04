@@ -18,9 +18,11 @@ import { PRECOMPACT_REMINDER, REHYDRATE_PREAMBLE, orchestratorSystemPrompt } fro
 import type { StatusSink } from '../status.js';
 import { eventLabel, formatEvent, formatRehydrate, type OrchestratorEvent } from './events.js';
 import { makeCanUseTool } from './permissions.js';
+import { ScratchWorktree, type Scratch } from './scratch.js';
 import {
   UsageTracker,
   recordResultUsage,
+  sandboxOptions,
   sdkProcessOptions,
   userMessage,
   type ClaudeProcessConfig,
@@ -68,11 +70,34 @@ export interface OrchestratorDeps {
   /** the room's status board; without one the orchestrator reports nothing */
   status?: StatusSink;
   restart?: Partial<RestartPolicy>;
+  /** how a temporary API failure (429, 5xx, overloaded) is retried */
+  apiRetry?: Partial<ApiRetryPolicy>;
+  /** starts exploration workers in the background; returns once they are started (their results come back as an
+   *  exploration_finished event, sent to this orchestrator by whoever runs the workers) */
   startExploration: (req: ExplorationRequest) => Promise<unknown>;
+  /** the session's working directory; by default the orchestrator creates its own scratch worktree at start() */
+  scratch?: Scratch;
 }
+
+export interface ApiRetryPolicy {
+  /** delay before the first retry of an event; doubles with each consecutive failure */
+  baseMs: number;
+  maxMs: number;
+  /** an event that has been failing for this long is dropped (the room has moved on) */
+  maxAgeMs: number;
+}
+
+export const DEFAULT_API_RETRY: ApiRetryPolicy = {
+  baseMs: 5_000,
+  maxMs: 2 * 60_000,
+  maxAgeMs: 30 * 60_000,
+};
 
 /**
  * Builds the Agent SDK options for the room's orchestrator session. Exported for tests.
+ *
+ * The session works in `extra.scratch`, a worktree of its own: it never sees or touches the main worktree, so what it
+ * edits cannot be swept into anyone else's commit, and it reaches main only through commit_main under the write queue.
  *
  * Nothing is pre-approved through `allowedTools`: tools listed there are auto-approved without consulting
  * `canUseTool` (the SDK warns about the overlap on every session start), and the whole policy lives in `canUseTool`:
@@ -82,14 +107,20 @@ export function buildOrchestratorOptions(
   deps: OrchestratorDeps,
   hooks: { onCompact: () => void },
   abortController: AbortController,
-  /** resume: continue this earlier session of the room instead of starting a fresh conversation */
-  extra: { resume?: string } = {},
+  extra: {
+    /** the session's working directory */
+    scratch: Scratch;
+    /** resume: continue this earlier session of the room instead of starting a fresh conversation */
+    resume?: string;
+  },
 ): Options {
   const status = deps.status;
+  const scratch = extra.scratch;
   const tools = orchestratorTools({
     roomId: deps.roomId,
     actions: deps.actions,
     repo: deps.repo,
+    scratch,
     logger: deps.logger ?? noopLogger,
     startExploration: deps.startExploration,
     immediateRewriteLimit: deps.tunables.immediateRewriteLimit,
@@ -102,11 +133,11 @@ export function buildOrchestratorOptions(
   return {
     model: MODELS.orchestrator,
     effort: EFFORT.orchestrator,
-    cwd: deps.repo.mainWorktree,
+    cwd: scratch.dir,
     systemPrompt: orchestratorSystemPrompt(deps.tunables),
     tools: ORCHESTRATOR_BUILTIN_TOOLS,
     canUseTool: makeCanUseTool({
-      cwd: deps.repo.mainWorktree,
+      cwd: scratch.dir,
       allowedMcpTools: mcpNames,
       writableRootMarkdown: true,
     }),
@@ -129,6 +160,7 @@ export function buildOrchestratorOptions(
     abortController,
     ...(extra.resume ? { resume: extra.resume } : {}),
     ...sdkProcessOptions(deps.claude),
+    ...sandboxOptions(scratch.dir, deps.claude),
   };
 }
 
@@ -141,10 +173,27 @@ const AUTH_ERRORS = new Set([
   'cloud_credential_error',
 ]);
 
+/** Assistant-message errors that pass: the API said no for now (rate limit, overload, server error). */
+const TRANSIENT_ERRORS = new Set(['rate_limit', 'overloaded', 'server_error']);
+const TRANSIENT_TEXT =
+  /\b(429|5\d\d)\b|overloaded|rate[ _-]?limit|server error|temporarily unavailable/i;
+
 /** Queue bound while the session is down or busy: oldest events are dropped beyond it. */
 const MAX_OUTBOX = 100;
-/** Unchanged open proposals are re-checked for expiry at most every this many timer ticks. */
-const UNCHANGED_EXPIRY_TICKS = 6;
+
+const API_UNAVAILABLE_DETAIL = 'The Claude API is unavailable; retrying';
+const API_RETRY_NOTE =
+  '[note] The previous attempt at this event failed because the Claude API was temporarily unavailable (rate limit, overload or a server error), so it is being delivered again. Before acting, check the transcript and room state: part of it may already be done.';
+
+/** A failed result that says the API, not the request, was the problem. */
+function isTransientFailure(result: SDKResultMessage): boolean {
+  if (result.subtype === 'error_max_turns' || result.subtype === 'error_max_budget_usd')
+    return false;
+  if (result.subtype === 'success' && !result.is_error) return false;
+  const text = 'result' in result && typeof result.result === 'string' ? result.result : '';
+  const errors = 'errors' in result && Array.isArray(result.errors) ? result.errors.join(' ') : '';
+  return TRANSIENT_TEXT.test(`${text} ${errors}`);
+}
 
 const RESUME_NOTE =
   '[note] The agent process restarted and this conversation was resumed where it ended. Your earlier context is intact, but the room may have changed meanwhile: call get_room_state before acting.';
@@ -157,16 +206,34 @@ interface Turn {
   text: string;
   label: string;
   redelivered: boolean;
+  /** when the API first failed this event (temporary errors), for the give-up age */
+  firstFailedAt?: number;
 }
 
 /**
  * One long-lived Agent SDK session per room. Events are queued as user turns on a streaming-input generator that
  * stays open until stop(). If the session ends unexpectedly it is restarted and rehydrated, and events that were
  * handed to the dead session without a result are delivered again (once).
+ *
+ * Events are handed over one at a time: the next one only after the previous one was answered. A turn therefore never
+ * starts while another is still working in the session's scratch directory, which is reset to main's head between
+ * turns. A turn that fails because the API is temporarily unavailable is retried with a backoff; the room shows the
+ * agent as unavailable meanwhile and recovers by itself at the first clean turn.
  */
 export class Orchestrator {
   private readonly log: Logger;
   private readonly policy: RestartPolicy;
+  private readonly apiRetry: ApiRetryPolicy;
+  /** the orchestrator's own working copy of main (see ScratchWorktree); created by the first session start */
+  private scratch: Scratch | null;
+  private readonly ownsScratch: boolean;
+  /** usage totals of the session's conversation: it outlives a session that is resumed, and starts over with a fresh one */
+  private usage = new UsageTracker();
+  /** do not hand the next event over before this time (backoff after a temporary API failure) */
+  private notBefore = 0;
+  private apiFailures = 0;
+  /** the current turn saw a temporary API error */
+  private turnApiError = false;
   /** queued, not yet handed to the session */
   private readonly outbox: Turn[] = [];
   /** handed to the session, no result yet */
@@ -187,11 +254,13 @@ export class Orchestrator {
   private runPromise: Promise<void> | null = null;
   private abort = new AbortController();
   private expiryTimer: NodeJS.Timeout | null = null;
-  private lastExpiry: { signature: string; at: number } | null = null;
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.log = deps.logger ?? noopLogger;
     this.policy = { ...DEFAULT_RESTART_POLICY, ...(deps.restart ?? {}) };
+    this.apiRetry = { ...DEFAULT_API_RETRY, ...(deps.apiRetry ?? {}) };
+    this.scratch = deps.scratch ?? null;
+    this.ownsScratch = !deps.scratch;
   }
 
   start(): void {
@@ -274,41 +343,57 @@ export class Orchestrator {
     ]);
     clearTimeout(timer);
     this.deps.status?.done('orchestrator');
+    if (this.ownsScratch) await this.scratch?.dispose?.();
   }
 
   private wakeUp(): void {
-    const ws = [...this.wakers];
-    this.wakers.clear();
-    for (const w of ws) w();
+    for (const w of [...this.wakers]) w();
+  }
+
+  /** Resolves at the next wakeUp(), or after `timeoutMs`. */
+  private waitForWake(timeoutMs?: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        this.wakers.delete(done);
+        resolve();
+      };
+      this.wakers.add(done);
+      if (timeoutMs !== undefined) timer = setTimeout(done, timeoutMs);
+    });
+  }
+
+  private async ensureScratch(): Promise<Scratch> {
+    this.scratch ??= await ScratchWorktree.create(this.deps.repo);
+    return this.scratch;
+  }
+
+  /** The scratch directory follows main at the start of every turn: yesterday's half-finished edit is gone. */
+  private async resetScratch(): Promise<void> {
+    try {
+      await this.scratch?.reset();
+    } catch (e) {
+      this.log('warn', 'could not reset the orchestrator working directory', {
+        roomId: this.deps.roomId,
+        error: errMessage(e),
+      });
+    }
   }
 
   /**
-   * The 5 minute expiry timer (PRD 7.4). At most one check is queued at a time, and unchanged proposals (same votes,
-   * no new chat) are only re-checked every few ticks: the model's answer depends on elapsed time, not on being asked
-   * every five minutes, and each check is an Opus turn.
+   * The 5 minute expiry timer (PRD 7.4). While any proposal is open, every tick asks the orchestrator to judge them:
+   * the answer depends on elapsed time (no vote for a sustained period), not only on what changed, so an unchanged room
+   * is asked again at the same cadence. At most one check is queued at a time, and with nothing open a tick costs one
+   * state read and no model turn.
    */
   private async checkExpiry(): Promise<void> {
     if (this.stopped || this.budgetExhausted) return;
     if ([...this.unacked, ...this.outbox].some((t) => t.type === 'expiry_check')) return;
     const state = await this.deps.actions.getRoomState(this.deps.roomId);
     const open = state.proposals.filter((p) => p.state === 'open');
-    if (open.length === 0) {
-      this.lastExpiry = null;
-      return;
-    }
-    const signature = JSON.stringify([
-      open.map((p) => [p.id, p.votes.length]),
-      state.recentMessages.at(-1)?.id ?? null,
-    ]);
-    const now = Date.now();
-    if (
-      this.lastExpiry &&
-      this.lastExpiry.signature === signature &&
-      now - this.lastExpiry.at < this.deps.tunables.expiryCheckMs * UNCHANGED_EXPIRY_TICKS
-    )
-      return;
-    this.lastExpiry = { signature, at: now };
-    this.send({ type: 'expiry_check', proposals: open, now: new Date(now).toISOString() });
+    if (open.length === 0) return;
+    this.send({ type: 'expiry_check', proposals: open, now: new Date().toISOString() });
   }
 
   private async preamble(): Promise<string> {
@@ -340,19 +425,27 @@ export class Orchestrator {
     return parts.join('\n\n');
   }
 
-  /** Streaming input: yields queued events one user turn at a time and stays open until stop() or restart. */
+  /**
+   * Streaming input: yields queued events one user turn at a time and stays open until stop() or restart. An event is
+   * handed over only when the previous one has been answered and any retry backoff has passed.
+   */
   private async *input(gen: number): AsyncGenerator<SDKUserMessage> {
     while (!this.stopped && gen === this.generation) {
-      const turn = this.outbox.shift();
-      if (!turn) {
-        await new Promise<void>((resolve) => {
-          this.wakers.add(resolve);
-        });
+      const turn = this.outbox[0];
+      if (!turn || this.unacked.length > 0) {
+        await this.waitForWake();
         continue;
       }
+      const backoff = this.notBefore - Date.now();
+      if (backoff > 0) {
+        await this.waitForWake(backoff);
+        continue;
+      }
+      this.outbox.shift();
       // Counted as handed over before anything is awaited: if the session dies from here on, the event is re-delivered.
       this.unacked.push(turn);
-      if (this.unacked.length === 1) this.deps.status?.busy('orchestrator');
+      this.deps.status?.busy('orchestrator');
+      await this.resetScratch();
       const pre = await this.preamble();
       if (this.stopped || gen !== this.generation) return;
       yield userMessage(pre ? `${pre}\n\n${turn.text}` : turn.text);
@@ -379,21 +472,28 @@ export class Orchestrator {
     const restarts: number[] = [];
     while (!this.stopped && !this.budgetExhausted) {
       const gen = ++this.generation;
-      const tracker = new UsageTracker();
       const resume = this.resumeId;
+      // A resumed session's first result carries the totals saved with its conversation, which this tracker has seen;
+      // a fresh session starts again from zero.
+      if (!resume) this.usage = new UsageTracker();
       this.answered = false;
+      this.turnApiError = false;
+      let launched = false;
       try {
+        const scratch = await this.ensureScratch();
+        if (this.stopped) break;
         const q = this.deps.queryFn({
           prompt: this.input(gen),
           options: buildOrchestratorOptions(
             this.deps,
             { onCompact: () => (this.compacted = true) },
             this.abort,
-            { resume: resume ?? undefined },
+            { resume: resume ?? undefined, scratch },
           ),
         });
         this.current = q;
-        for await (const msg of q) await this.onMessage(msg, tracker);
+        launched = true;
+        for await (const msg of q) await this.onMessage(msg);
       } catch (e) {
         if (!this.stopped)
           this.log('error', 'orchestrator session failed', {
@@ -409,7 +509,8 @@ export class Orchestrator {
       // session dies without answering anything, fresh and rehydrated from room state and the transcript. Events the
       // dead session never answered are handed to the new one.
       this.requeueUnacked();
-      if (resume && !this.answered) {
+      // (a failure before the session even started, such as the working directory, says nothing about resuming it)
+      if (resume && launched && !this.answered) {
         this.log('warn', 'resuming the orchestrator session failed; starting fresh', {
           roomId: this.deps.roomId,
         });
@@ -444,7 +545,7 @@ export class Orchestrator {
     }
   }
 
-  private async onMessage(msg: SDKMessage, tracker: UsageTracker): Promise<void> {
+  private async onMessage(msg: SDKMessage): Promise<void> {
     if (msg.type === 'assistant' && msg.error) {
       this.log('warn', 'orchestrator got an API error', {
         roomId: this.deps.roomId,
@@ -453,21 +554,66 @@ export class Orchestrator {
       if (AUTH_ERRORS.has(msg.error)) this.deps.status?.fail('auth', SIGN_IN_DETAIL);
       else if (msg.error === 'billing_error')
         this.deps.status?.fail('billing', 'The Claude account has a billing problem');
+      else if (TRANSIENT_ERRORS.has(msg.error)) this.turnApiError = true;
       return;
     }
     if (msg.type !== 'result') return;
-    await this.onResult(msg, tracker);
+    await this.onResult(msg);
   }
 
-  private async onResult(result: SDKResultMessage, tracker: UsageTracker): Promise<void> {
+  /**
+   * The turn failed because the API is temporarily unavailable (429, 5xx, overloaded): the event goes back to the front
+   * of the queue to be handed over again after a backoff that doubles with each consecutive failure, and the room shows
+   * the agent as unavailable until a turn succeeds. An event that has kept failing for `maxAgeMs` is dropped.
+   */
+  private retryAfterApiFailure(): void {
+    const turn = this.unacked.shift();
+    this.unacked = [];
+    this.apiFailures += 1;
+    const delay = Math.min(
+      this.apiRetry.maxMs,
+      this.apiRetry.baseMs * 2 ** Math.min(this.apiFailures - 1, 20),
+    );
+    this.notBefore = Date.now() + delay;
+    this.deps.status?.done('orchestrator');
+    this.deps.status?.fail('api', API_UNAVAILABLE_DETAIL);
+    if (turn) {
+      const firstFailedAt = turn.firstFailedAt ?? Date.now();
+      if (Date.now() - firstFailedAt > this.apiRetry.maxAgeMs) {
+        this.log('warn', 'dropping an event that the API kept failing', {
+          roomId: this.deps.roomId,
+          event: turn.label,
+        });
+        if (this.outbox.length === 0) this.deps.status?.recover('api');
+      } else {
+        this.outbox.unshift({
+          ...turn,
+          firstFailedAt,
+          text: turn.text.includes(API_RETRY_NOTE)
+            ? turn.text
+            : `${turn.text}\n\n${API_RETRY_NOTE}`,
+        });
+      }
+    }
+    this.log('warn', 'orchestrator turn failed with a temporary API error; retrying', {
+      roomId: this.deps.roomId,
+      attempt: this.apiFailures,
+      delayMs: delay,
+    });
+    this.wakeUp();
+  }
+
+  private async onResult(result: SDKResultMessage): Promise<void> {
     await recordResultUsage(
       this.deps.actions,
       this.deps.roomId,
       'orchestrator',
       result,
-      tracker,
+      this.usage,
       MODELS.orchestrator,
     );
+    const sawApiError = this.turnApiError;
+    this.turnApiError = false;
     if (result.subtype === 'error_max_budget_usd') {
       this.budgetExhausted = true;
       this.log('error', 'orchestrator hit its budget', {
@@ -485,14 +631,21 @@ export class Orchestrator {
       }
       return;
     }
-    if (result.subtype !== 'success' || result.is_error) {
+    const failed = result.subtype !== 'success' || result.is_error;
+    if (failed && (sawApiError || isTransientFailure(result))) {
+      this.retryAfterApiFailure();
+      return;
+    }
+    if (failed) {
       this.log('warn', 'orchestrator turn ended with an error', {
         roomId: this.deps.roomId,
         subtype: result.subtype,
       });
     } else {
       // a clean turn: whatever was wrong is over, and this session is worth resuming if the process dies
-      for (const key of ['auth', 'billing', 'orchestrator']) this.deps.status?.recover(key);
+      for (const key of ['auth', 'billing', 'api', 'orchestrator']) this.deps.status?.recover(key);
+      this.apiFailures = 0;
+      this.notBefore = 0;
       this.answered = true;
       this.resumeId = result.session_id;
     }
@@ -501,5 +654,7 @@ export class Orchestrator {
     else this.unacked.shift();
     if (this.unacked.length === 0 && this.outbox.length === 0)
       this.deps.status?.done('orchestrator');
+    // the next event can be handed over now
+    this.wakeUp();
   }
 }

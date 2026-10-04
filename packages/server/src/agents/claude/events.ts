@@ -1,11 +1,24 @@
 import type { Change, Intent, Message, Proposal, RoomState, Sha, UserId } from '@quorum/shared';
 import { authorName } from '../common.js';
+import type { ExplorationOutcome } from './workers.js';
 
 /** Everything the orchestrator hears about arrives as one of these, rendered as one user turn. */
 export type OrchestratorEvent =
   | { type: 'intent'; intent: Intent; messages: Message[]; openProposals?: Proposal[] }
-  | { type: 'suggestion'; message: Message }
+  /** `notApplied`: why the server did not apply the suggestion itself (changed text, too large, ...) */
+  | { type: 'suggestion'; message: Message; notApplied?: string }
+  /** the server applied an exact-match suggestion itself (commit `sha` on `documentPath`); nothing is left to apply */
+  | {
+      type: 'suggestion_applied';
+      message: Message;
+      sha: Sha;
+      documentPath: string;
+      /** the commit landed but the Change card or the suggestion card could not be updated */
+      bookkeepingFailed?: string;
+    }
   | { type: 'ask'; message: Message }
+  /** the workers of a start_exploration call finished (or timed out); this is when the orchestrator opens the proposal */
+  | { type: 'exploration_finished'; outcome: ExplorationOutcome }
   | { type: 'proposal_event'; event: ProposalEventInput }
   | { type: 'revert'; change: Change; revertSha: Sha; byUserId: UserId }
   | { type: 'expiry_check'; proposals: Proposal[]; now: string };
@@ -99,8 +112,12 @@ export function eventLabel(e: OrchestratorEvent): string {
       return `intent:${e.intent.type} ${e.intent.summary}`.slice(0, 120);
     case 'suggestion':
       return `suggestion ${e.message.id}`;
+    case 'suggestion_applied':
+      return `suggestion_applied ${e.message.id}`;
     case 'ask':
       return `ask ${e.message.id}`;
+    case 'exploration_finished':
+      return `exploration_finished ${e.outcome.explorationId} (${e.outcome.topic})`.slice(0, 120);
     case 'proposal_event':
       return `proposal ${e.event.type} ${e.event.proposal.id}`;
     case 'revert':
@@ -120,6 +137,11 @@ export function eventPayload(e: OrchestratorEvent): Record<string, unknown> {
         ...(e.openProposals && e.openProposals.length > 0
           ? { openProposals: e.openProposals.map(compactProposal) }
           : {}),
+        ...(e.intent.type === 'question' && e.intent.needsResearch
+          ? {
+              hint: 'This question needs the web: call start_exploration with mode "research" (never draft mode), then answer from its findings when exploration_finished arrives.',
+            }
+          : {}),
       };
     case 'suggestion': {
       const card = e.message.card;
@@ -131,6 +153,67 @@ export function eventPayload(e: OrchestratorEvent): Record<string, unknown> {
         replacement: card?.type === 'suggestion' ? card.replacement : null,
         cardStatus: card?.type === 'suggestion' ? card.status : null,
         note: e.message.body,
+        ...(e.notApplied ? { notAppliedByServer: e.notApplied } : {}),
+      };
+    }
+    case 'suggestion_applied': {
+      const card = e.message.card;
+      const anchor = card?.type === 'suggestion' ? card.anchor : e.message.anchor;
+      return {
+        messageId: e.message.id,
+        author: compactMessage(e.message).from,
+        authorUserId: e.message.author.kind === 'user' ? e.message.author.userId : null,
+        document: e.documentPath,
+        lines: anchor ? [anchor.startLine, anchor.endLine] : null,
+        replacement: card?.type === 'suggestion' ? card.replacement : null,
+        sha: e.sha,
+        ...(e.bookkeepingFailed
+          ? {
+              problem: e.bookkeepingFailed,
+              note: 'The server committed this suggestion as given, but its bookkeeping failed: call resolve_suggestion with status "applied" and this sha. Then check whether other documents now contradict it.',
+            }
+          : {
+              note: 'The server applied this suggestion as given and resolved its card. Nothing to edit or resolve; only check whether other documents now contradict it.',
+            }),
+      };
+    }
+    case 'exploration_finished': {
+      const o = e.outcome;
+      const common = {
+        explorationId: o.explorationId,
+        mode: o.mode,
+        document: o.documentPath,
+        topic: o.topic,
+        partial: o.partial,
+        failures: o.failures,
+        chatSinceStart: o.chatSinceStart,
+      };
+      if (o.mode === 'research')
+        return {
+          ...common,
+          findings: o.findings,
+          next: 'Answer the question in chat from these findings and their sources.',
+        };
+      return {
+        ...common,
+        branchBase: o.branchBase,
+        workers: o.workers.map((w) => ({
+          label: w.label,
+          branch: w.branch,
+          thesis: w.thesis,
+          changed: w.changed,
+          headSha: w.headSha,
+          diffStat: w.diffStat ?? null,
+          summary: w.summary,
+          tradeoffs: w.tradeoffs,
+          assumptions: w.assumptions,
+          openQuestions: w.openQuestions,
+          sourcesConsulted: w.sourcesConsulted,
+          timedOut: w.timedOut,
+          ...(w.error ? { error: w.error } : {}),
+          ...(w.scopeReverted ? { scopeReverted: w.scopeReverted } : {}),
+        })),
+        next: 'Read chatSinceStart, then open_proposal (branchBase as given): quorum for two or more changed options, review for one.',
       };
     }
     case 'ask': {

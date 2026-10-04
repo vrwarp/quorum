@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -7,6 +8,7 @@ import {
   MODELS,
   slugify,
   proposalBranchName,
+  type Card,
   type Change,
   type MessageId,
   type OptionId,
@@ -25,7 +27,13 @@ import {
   type Logger,
   type Tunables,
 } from '../common.js';
-import { DIGEST_SYSTEM, MERGE_SYSTEM, REVERT_SYSTEM, WORKER_SYSTEM } from '../prompts.js';
+import {
+  DIGEST_SYSTEM,
+  MERGE_SYSTEM,
+  RESEARCH_SYSTEM,
+  REVERT_SYSTEM,
+  WORKER_SYSTEM,
+} from '../prompts.js';
 import type { StatusSink } from '../status.js';
 import { compactMessage } from './events.js';
 import { makeCanUseTool } from './permissions.js';
@@ -35,6 +43,7 @@ import {
   drainQuery,
   recordAssistantUsage,
   recordResultUsage,
+  sandboxOptions,
   sdkProcessOptions,
   type ClaudeProcessConfig,
   type QueryFn,
@@ -57,7 +66,12 @@ export interface WorkerEnv {
   dataDir: string;
   /** how the Claude Code subprocess is launched and authenticated (binary, credential environment, API key) */
   claude?: ClaudeProcessConfig;
+  /** per-session spending cap of the merge driver and the semantic revert (each is a single Opus session) */
   maxBudgetUsd?: number;
+  /** per-session cap of an exploration or research worker: smaller, because several run at once (see workerBudgetUsd) */
+  workerBudgetUsd?: number;
+  /** per-session cap of the digest writer */
+  digestBudgetUsd?: number;
   /** aborts the session (room stopped) */
   signal?: AbortSignal;
   /** the room's status board, so long-running work shows as "thinking" with a detail */
@@ -135,9 +149,16 @@ async function runOneShot(
   let result: OneShotResult['result'] = null;
   let error: string | undefined;
   try {
+    const cwd = params.options.cwd;
+    const hasBash = Array.isArray(params.options.tools) && params.options.tools.includes('Bash');
     q = env.queryFn({
       ...params,
-      options: { ...params.options, ...sdkProcessOptions(env.claude), abortController: ac },
+      options: {
+        ...params.options,
+        ...sdkProcessOptions(env.claude),
+        ...(hasBash && cwd ? sandboxOptions(cwd, env.claude) : {}),
+        abortController: ac,
+      },
     });
     const drained = drainQuery(q, (m) => usage.observe(m));
     drained.catch(() => undefined); // it may settle after we stopped waiting for it
@@ -179,7 +200,7 @@ function structuredOr<T>(result: OneShotResult['result'], schema: z.ZodType<T>):
 
 const BUILTIN_TOOLS = ['Read', 'Edit', 'Write', 'Grep', 'Glob', 'Bash'];
 
-// --- exploration worker ---------------------------------------------------------------------
+// --- exploration workers --------------------------------------------------------------------
 
 export interface ExplorationParams {
   repo: RoomRepository;
@@ -190,6 +211,8 @@ export interface ExplorationParams {
   triggerMessageIds?: MessageId[];
   /** ref to fork the branch from (default main). start_exploration passes one sha for every worker. */
   fromRef?: string;
+  /** A branch and worktree that already exist: startExploration creates them up front, which is what reserves the names. */
+  prepared?: { worktreePath: string; baseSha: Sha };
 }
 
 export interface ExplorationResult extends WorkerOutput {
@@ -202,6 +225,8 @@ export interface ExplorationResult extends WorkerOutput {
   committed: boolean;
   /** the branch differs from its base: there is a draft to propose */
   changed: boolean;
+  /** lines of the document the draft removes and adds relative to its base */
+  diffStat?: { removed: number; added: number };
   /** files outside the assigned document that the session touched and the server reverted */
   scopeReverted?: string[];
   timedOut: boolean;
@@ -212,7 +237,7 @@ export async function runExplorationWorker(
   env: WorkerEnv,
   p: ExplorationParams,
 ): Promise<ExplorationResult> {
-  const { worktreePath, baseSha } = await p.repo.createBranch(p.branch, p.fromRef);
+  const { worktreePath, baseSha } = p.prepared ?? (await p.repo.createBranch(p.branch, p.fromRef));
   const tools = readOnlyTools({
     roomId: env.roomId,
     actions: env.actions,
@@ -244,7 +269,7 @@ export async function runExplorationWorker(
       }),
       mcpServers: { quorum: createQuorumServer(tools) },
       maxTurns: env.tunables.workerMaxTurns,
-      maxBudgetUsd: env.maxBudgetUsd,
+      maxBudgetUsd: env.workerBudgetUsd ?? env.maxBudgetUsd,
       outputFormat: {
         type: 'json_schema',
         schema: WorkerOutputJsonSchema as unknown as Record<string, unknown>,
@@ -278,6 +303,13 @@ export async function runExplorationWorker(
     env.logger('warn', 'worker commit failed', { branch: p.branch, error: commitError });
   }
   const headSha = await p.repo.headSha(p.branch);
+  const changed = headSha !== null && headSha !== baseSha;
+  let diffStat: ExplorationResult['diffStat'];
+  if (changed) {
+    diffStat = await p.repo
+      .rewrittenLineCount(p.documentPath, baseSha, p.branch)
+      .catch(() => undefined);
+  }
 
   const out = structuredOr(run.result, WorkerOutputSchema);
   const error =
@@ -299,7 +331,8 @@ export async function runExplorationWorker(
     baseSha,
     headSha,
     committed,
-    changed: headSha !== null && headSha !== baseSha,
+    changed,
+    ...(diffStat ? { diffStat } : {}),
     ...(scopeReverted.length > 0 ? { scopeReverted } : {}),
     timedOut: run.timedOut,
     ...(error ? { error } : {}),
@@ -311,35 +344,232 @@ export async function runExplorationWorker(
   };
 }
 
+/** What a research worker brings back: findings in the same shape as a draft summary, with no branch. */
+export interface ResearchResult extends WorkerOutput {
+  label: string;
+  question: string;
+  timedOut: boolean;
+  error?: string;
+}
+
+/**
+ * Research-only worker (PRD 6.3: research questions that need the web): reads the documents, searches and fetches, and
+ * returns findings. It has no Edit or Write tool and no branch, so nothing it does can leave a draft behind. Its working
+ * directory is a throwaway detached worktree at the exploration's base.
+ */
+export async function runResearchWorker(
+  env: WorkerEnv,
+  p: {
+    repo: RoomRepository;
+    id: string;
+    label: string;
+    documentPath: string;
+    question: string;
+    context: string;
+    baseSha: Sha;
+  },
+): Promise<ResearchResult> {
+  const name = `research-${p.id}-${p.label}`;
+  const dir = await p.repo.createDetachedWorktree(name, p.baseSha);
+  try {
+    const tools = readOnlyTools({
+      roomId: env.roomId,
+      actions: env.actions,
+      repo: p.repo,
+      logger: env.logger,
+    });
+    const prompt = [
+      `Document for context: ${p.documentPath} (your working directory holds the room's documents)`,
+      `Question: ${p.question}`,
+      p.context ? `\nContext:\n${p.context}` : '',
+      '\nResearch the question, then return the structured findings.',
+    ].join('\n');
+    const run = await runOneShot(env, 'worker', MODELS.worker, {
+      prompt,
+      options: {
+        model: MODELS.worker,
+        effort: EFFORT.worker,
+        cwd: dir,
+        systemPrompt: RESEARCH_SYSTEM,
+        tools: ['Read', 'Grep', 'Glob', 'Bash', 'WebSearch', 'WebFetch'],
+        canUseTool: makeCanUseTool({
+          cwd: dir,
+          allowWeb: true,
+          allowedMcpTools: mcpToolNames(tools),
+          writableFiles: [],
+        }),
+        mcpServers: { quorum: createQuorumServer(tools) },
+        maxTurns: env.tunables.workerMaxTurns,
+        maxBudgetUsd: env.workerBudgetUsd ?? env.maxBudgetUsd,
+        outputFormat: {
+          type: 'json_schema',
+          schema: WorkerOutputJsonSchema as unknown as Record<string, unknown>,
+        },
+        permissionMode: 'default',
+        settingSources: [],
+        persistSession: false,
+      },
+    });
+    const out = structuredOr(run.result, WorkerOutputSchema);
+    const error =
+      run.error ??
+      (run.result && run.result.subtype !== 'success'
+        ? `worker ended with ${run.result.subtype}`
+        : undefined);
+    const fallback = run.timedOut
+      ? `The research timed out after ${Math.round(env.tunables.workerTimeoutMs / 1000)}s.`
+      : run.aborted
+        ? 'The research was cancelled.'
+        : run.result?.subtype === 'success' && run.result.result
+          ? run.result.result
+          : `The research did not finish${error ? `: ${error}` : ''}.`;
+    return {
+      label: p.label.toUpperCase(),
+      question: p.question,
+      timedOut: run.timedOut,
+      ...(error ? { error } : {}),
+      summary: out?.summary ?? fallback,
+      tradeoffs: out?.tradeoffs ?? '',
+      assumptions: out?.assumptions ?? [],
+      openQuestions: out?.openQuestions ?? [],
+      sourcesConsulted: out?.sourcesConsulted ?? [],
+    };
+  } finally {
+    await p.repo.removeWorktree(name).catch(() => undefined);
+  }
+}
+
 export interface ExplorationOutcome {
+  explorationId: string;
+  mode: 'draft' | 'research';
+  documentPath: string;
+  topic: string;
   /** the sha every branch was forked from; pass it to open_proposal as branchBase */
   branchBase: Sha | null;
   workers: Array<ExplorationResult & { label: string }>;
+  /** research mode: one entry per question */
+  findings: ResearchResult[];
   /** theses whose worker could not be started or crashed outright */
   failures: Array<{ thesis: string; error: string }>;
   /** What the room said while the workers ran (PRD 6.5): read it before posting a Quorum card and open the proposal
    *  with stale: true if the topic was resolved or abandoned in the meantime. */
   chatSinceStart: Array<Record<string, unknown>>;
+  /** some worker timed out, was cancelled, failed or finished without a result: what follows is partial */
+  partial: boolean;
 }
 
+/** What start_exploration returns to the model at once, before any worker has done anything. */
+export interface ExplorationStarted {
+  explorationId: string;
+  mode: 'draft' | 'research';
+  /** branch names in thesis order (a, b, c ...); empty in research mode */
+  branches: string[];
+  /** the main sha every branch forks from; pass it to open_proposal as branchBase */
+  baseSha: Sha;
+  note: string;
+}
+
+export interface ExplorationHooks {
+  /** called once with the results when every worker has finished, timed out or failed */
+  onFinished: (outcome: ExplorationOutcome) => void;
+  /** receives the background run, so the runtime knows work is in flight (a room with work in flight is not idle) */
+  track?: (run: Promise<unknown>) => void;
+}
+
+/** Branch names are allocated by listing branches and then creating them: one allocation at a time per repository. */
+const allocationLocks = new WeakMap<object, Promise<unknown>>();
+function exclusively<T>(key: object, fn: () => Promise<T>): Promise<T> {
+  const run = (allocationLocks.get(key) ?? Promise.resolve()).then(fn, fn);
+  allocationLocks.set(
+    key,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
+/** What start_exploration tells the model about the workers it just started. */
+const NOTE_BACKGROUND =
+  'The workers run in the background. An [event:exploration_finished] with their results arrives when they finish or time out; other events keep arriving meanwhile.';
+
 /**
- * start_exploration: one worker per thesis, on branches <doc>/<topic>/a, b, c ... Runs them in parallel. All branches
- * fork from the same main sha (read once), so the proposal has a single, consistent base even if main moves meanwhile.
+ * start_exploration (PRD 6.4): reserves the branches, posts the "Exploring" card and starts one worker per thesis, then
+ * returns at once. The orchestrator is not blocked for the minutes the workers take, so a suggestion that arrives
+ * meanwhile is handled in seconds; the results come back as an exploration_finished event through `hooks.onFinished`.
+ *
+ * All branches fork from the same main sha (read once), so the proposal has a single, consistent base even if main moves
+ * meanwhile. Branch names are allocated atomically: the names are listed and the branches created under one lock, so two
+ * explorations of the same topic can never pick the same names. The workers run on the room's abort signal; when the
+ * results are delivered their worktrees are removed (the branches stay).
  */
-export async function runExploration(
+export async function startExploration(
   env: WorkerEnv,
   repo: RoomRepository,
   req: ExplorationRequest,
-): Promise<ExplorationOutcome> {
+  hooks: ExplorationHooks,
+): Promise<ExplorationStarted> {
+  const mode = req.mode ?? 'draft';
+  const state = await env.actions.getRoomState(env.roomId);
+  const doc = state.documents.find((d) => d.path === req.documentPath);
+  if (!doc)
+    throw new Error(
+      `no document with path ${req.documentPath}; known: ${state.documents.map((d) => d.path).join(', ') || '(none)'}`,
+    );
+  if (doc.status !== 'active') throw new Error(`${doc.path} is archived and cannot be explored`);
+
+  const explorationId = `expl_${randomBytes(6).toString('hex')}`;
   const docSlug = slugify(req.documentPath);
   const topic = slugify(req.topic);
-  const existing = new Set(await repo.listBranches());
-  let topicSlug = topic;
-  for (let n = 2; existing.has(proposalBranchName(docSlug, topicSlug, 'a')); n++)
-    topicSlug = `${topic}-${n}`;
+  const labels = req.theses.map((_, i) => String.fromCharCode('a'.charCodeAt(0) + i));
 
-  const baseSha = await repo.headSha('main');
-  if (!baseSha) throw new Error('main has no commits');
+  const reserved = await exclusively(repo, async () => {
+    const baseSha = await repo.headSha('main');
+    if (!baseSha) throw new Error('main has no commits');
+    if (mode === 'research') return { baseSha, branches: [] as Prepared[] };
+    const existing = new Set(await repo.listBranches());
+    let topicSlug = topic;
+    for (
+      let n = 2;
+      labels.some((l) => existing.has(proposalBranchName(docSlug, topicSlug, l)));
+      n++
+    )
+      topicSlug = `${topic}-${n}`;
+    const branches: Prepared[] = [];
+    try {
+      for (const [i, thesis] of req.theses.entries()) {
+        const label = labels[i]!;
+        const branch = proposalBranchName(docSlug, topicSlug, label);
+        const made = await repo.createBranch(branch, baseSha);
+        branches.push({ label, branch, thesis, ...made });
+      }
+    } catch (e) {
+      for (const b of branches) {
+        await repo.removeWorktree(b.branch).catch(() => undefined);
+        await repo.deleteBranch(b.branch).catch(() => undefined);
+      }
+      throw e;
+    }
+    return { baseSha, branches };
+  });
+  const { baseSha, branches } = reserved;
+
+  if (mode === 'draft') {
+    const title = req.announcement?.trim() || `Exploring ${req.topic} for ${doc.title}`;
+    try {
+      await env.actions.postChat(env.roomId, {
+        body: title,
+        card: {
+          type: 'exploration_started',
+          documentId: doc.id,
+          title,
+          theses: req.theses,
+        } satisfies Card,
+        inReplyTo: req.triggerMessageIds,
+      });
+    } catch (e) {
+      env.logger('warn', 'could not post the exploration card', { error: errMessage(e) });
+    }
+  }
+
   const [lastMessage] = await env.actions.readTranscript(env.roomId, { limit: 1 });
   const startMarker = lastMessage?.id ?? null;
   const recent = await env.actions.readTranscript(env.roomId, { limit: 15 });
@@ -352,54 +582,157 @@ export async function runExploration(
     .filter(Boolean)
     .join('\n\n');
 
-  const statusKey = `exploration:${topicSlug}`;
-  env.status?.busy(statusKey, `Exploring ${req.topic}`);
-  let settled: PromiseSettledResult<ExplorationResult & { label: string }>[];
-  try {
-    settled = await Promise.allSettled(
-      req.theses.map((thesis, i) => {
-        const label = String.fromCharCode('a'.charCodeAt(0) + i);
-        return runExplorationWorker(env, {
-          repo,
-          documentPath: req.documentPath,
-          branch: proposalBranchName(docSlug, topicSlug, label),
-          thesis,
-          context,
-          triggerMessageIds: req.triggerMessageIds,
-          fromRef: baseSha,
-        }).then((r) => ({ ...r, label: label.toUpperCase() }));
-      }),
-    );
-  } finally {
-    env.status?.done(statusKey);
-  }
-  const workers: ExplorationOutcome['workers'] = [];
-  const failures: ExplorationOutcome['failures'] = [];
-  settled.forEach((s, i) => {
-    if (s.status === 'fulfilled') {
-      workers.push(s.value);
-      return;
-    }
-    env.logger('error', 'exploration worker failed', {
-      thesis: req.theses[i],
-      error: errMessage(s.reason),
-    });
-    failures.push({ thesis: req.theses[i]!, error: errMessage(s.reason) });
-  });
-
-  let chatSinceStart: Array<Record<string, unknown>> = [];
-  if (startMarker) {
+  const statusKey = `exploration:${explorationId}`;
+  env.status?.busy(statusKey, `${mode === 'research' ? 'Researching' : 'Exploring'} ${req.topic}`);
+  const run = (async () => {
+    let outcome: ExplorationOutcome;
     try {
-      chatSinceStart = (
-        await env.actions.readTranscript(env.roomId, { sinceMessageId: startMarker, limit: 50 })
-      ).map(compactMessage);
+      outcome = await runWorkers();
     } catch (e) {
-      env.logger('warn', 'could not read the transcript after the exploration', {
+      env.logger('error', 'exploration failed', { explorationId, error: errMessage(e) });
+      outcome = {
+        explorationId,
+        mode,
+        documentPath: req.documentPath,
+        topic: req.topic,
+        branchBase: baseSha,
+        workers: [],
+        findings: [],
+        failures: [{ thesis: req.topic, error: errMessage(e) }],
+        chatSinceStart: [],
+        partial: true,
+      };
+    } finally {
+      env.status?.done(statusKey);
+    }
+    try {
+      hooks.onFinished(outcome);
+    } catch (e) {
+      env.logger('error', 'delivering the exploration results failed', {
+        explorationId,
         error: errMessage(e),
       });
     }
+    // the drafts are on their branches: the worktrees are no longer needed
+    for (const b of branches) await repo.removeWorktree(b.branch).catch(() => undefined);
+  })();
+  run.catch(() => undefined);
+  hooks.track?.(run);
+
+  async function runWorkers(): Promise<ExplorationOutcome> {
+    const failures: ExplorationOutcome['failures'] = [];
+    const workers: ExplorationOutcome['workers'] = [];
+    const findings: ResearchResult[] = [];
+    if (mode === 'research') {
+      const settled = await Promise.allSettled(
+        req.theses.map((question, i) =>
+          runResearchWorker(env, {
+            repo,
+            id: explorationId,
+            label: labels[i]!,
+            documentPath: req.documentPath,
+            question,
+            context,
+            baseSha,
+          }),
+        ),
+      );
+      settled.forEach((s, i) => {
+        if (s.status === 'fulfilled') findings.push(s.value);
+        else {
+          env.logger('error', 'research worker failed', {
+            question: req.theses[i],
+            error: errMessage(s.reason),
+          });
+          failures.push({ thesis: req.theses[i]!, error: errMessage(s.reason) });
+        }
+      });
+    } else {
+      const settled = await Promise.allSettled(
+        branches.map((b) =>
+          runExplorationWorker(env, {
+            repo,
+            documentPath: req.documentPath,
+            branch: b.branch,
+            thesis: b.thesis,
+            context,
+            triggerMessageIds: req.triggerMessageIds,
+            prepared: { worktreePath: b.worktreePath, baseSha: b.baseSha },
+          }).then((r) => ({ ...r, label: b.label.toUpperCase() })),
+        ),
+      );
+      settled.forEach((s, i) => {
+        if (s.status === 'fulfilled') workers.push(s.value);
+        else {
+          env.logger('error', 'exploration worker failed', {
+            thesis: req.theses[i],
+            error: errMessage(s.reason),
+          });
+          failures.push({ thesis: req.theses[i]!, error: errMessage(s.reason) });
+        }
+      });
+    }
+
+    let chatSinceStart: Array<Record<string, unknown>> = [];
+    if (startMarker) {
+      try {
+        chatSinceStart = (
+          await env.actions.readTranscript(env.roomId, { sinceMessageId: startMarker, limit: 50 })
+        ).map(compactMessage);
+      } catch (e) {
+        env.logger('warn', 'could not read the transcript after the exploration', {
+          error: errMessage(e),
+        });
+      }
+    }
+    const partial =
+      failures.length > 0 ||
+      workers.some((w) => w.timedOut || w.error !== undefined) ||
+      findings.some((f) => f.timedOut || f.error !== undefined);
+    return {
+      explorationId,
+      mode,
+      documentPath: req.documentPath,
+      topic: req.topic,
+      branchBase: baseSha,
+      workers,
+      findings,
+      failures,
+      chatSinceStart,
+      partial,
+    };
   }
-  return { branchBase: baseSha, workers, failures, chatSinceStart };
+
+  return {
+    explorationId,
+    mode,
+    branches: branches.map((b) => b.branch),
+    baseSha,
+    note: NOTE_BACKGROUND,
+  };
+}
+
+interface Prepared {
+  label: string;
+  branch: string;
+  thesis: string;
+  worktreePath: string;
+  baseSha: Sha;
+}
+
+/**
+ * Starts an exploration and waits for its results. The orchestrator never waits like this (see startExploration); this
+ * is for callers that want the whole outcome in one call.
+ */
+export async function runExploration(
+  env: WorkerEnv,
+  repo: RoomRepository,
+  req: ExplorationRequest,
+): Promise<ExplorationOutcome> {
+  let deliver!: (o: ExplorationOutcome) => void;
+  const done = new Promise<ExplorationOutcome>((resolve) => (deliver = resolve));
+  await startExploration(env, repo, req, { onFinished: deliver });
+  return done;
 }
 
 function truncate(s: string, n: number): string {
@@ -544,6 +877,7 @@ export async function runSemanticRevert(
           triggerMessageIds: input.change.triggerMessageIds,
           revertsSha: input.change.sha,
         },
+        files, // the main worktree is shared: only the reverted document is committed
       );
       if (!sha) throw new Error('semantic revert changed nothing');
       return sha;
@@ -601,7 +935,7 @@ export async function writeDigest(
       canUseTool: makeCanUseTool({ cwd: env.dataDir, allowedMcpTools: mcpNames, mcpOnly: true }),
       mcpServers: { quorum: createQuorumServer(tools) },
       maxTurns: 8,
-      maxBudgetUsd: env.maxBudgetUsd,
+      maxBudgetUsd: env.digestBudgetUsd ?? env.maxBudgetUsd,
       permissionMode: 'default',
       settingSources: [],
       persistSession: false,

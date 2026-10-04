@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { diffArrays } from 'diff';
 import type { RoomRepository } from '../../contracts/index.js';
+import { runGit } from '../../git/exec.js';
 
 /**
  * Helpers that compare a git worktree on disk with a ref, using only the RoomRepository contract and fs. They back the
@@ -91,4 +94,44 @@ export function paragraphChange(before: string, after: string): { removed: numbe
     else if (part.added) added += part.value.length;
   }
   return { removed, added };
+}
+
+export type TextMerge = { ok: true; text: string } | { ok: false; reason: string };
+
+/**
+ * Line-based three-way merge of one file's text (`git merge-file`): what `theirs` changed relative to `base` is applied
+ * on top of `ours`. Documents keep one paragraph per line (PRD 4.1), so edits to different paragraphs merge and edits
+ * to the same paragraph conflict. A conflict never produces text: the caller refuses and the model redoes its edit.
+ */
+export async function threeWayMerge(
+  base: string,
+  ours: string,
+  theirs: string,
+): Promise<TextMerge> {
+  if (ours === base) return { ok: true, text: theirs };
+  if (theirs === base || theirs === ours) return { ok: true, text: ours };
+  const dir = await mkdtemp(join(tmpdir(), 'quorum-merge-'));
+  try {
+    const [o, b, t] = ['ours', 'base', 'theirs'].map((n) => join(dir, n)) as [
+      string,
+      string,
+      string,
+    ];
+    await Promise.all([writeFile(o, ours), writeFile(b, base), writeFile(t, theirs)]);
+    const r = await runGit(
+      ['merge-file', '-p', '-L', 'main', '-L', 'base', '-L', 'edit', o, b, t],
+      {
+        cwd: dir,
+        allowFail: true,
+      },
+    );
+    if (r.code === 0) return { ok: true, text: r.stdout };
+    // the exit status is the number of conflicts (at most 127); anything else is a failure to merge at all
+    if (r.code > 0 && r.code < 128) return { ok: false, reason: `${r.code} conflicting change(s)` };
+    return { ok: false, reason: r.stderr.trim() || `git merge-file exited with ${r.code}` };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }

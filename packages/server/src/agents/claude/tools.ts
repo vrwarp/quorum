@@ -18,9 +18,17 @@ import type {
 } from '@quorum/shared';
 import { DEFAULTS } from '@quorum/shared';
 import type { RoomActions, RoomRepository } from '../../contracts/index.js';
-import { ORCHESTRATOR_ACTOR, errMessage, type Logger } from '../common.js';
+import {
+  ORCHESTRATOR_ACTOR,
+  describeRejectedIds,
+  errMessage,
+  isProposalId,
+  splitMessageIds,
+  type Logger,
+} from '../common.js';
 import { compactMessage, compactState } from './events.js';
-import { enforceScope, paragraphChange, restoreFiles } from './worktree.js';
+import type { Scratch } from './scratch.js';
+import { enforceScope, paragraphChange, threeWayMerge } from './worktree.js';
 
 export const QUORUM_SERVER_NAME = 'quorum';
 
@@ -39,6 +47,11 @@ export interface ExplorationRequest {
   theses: string[];
   context?: string;
   triggerMessageIds: string[];
+  /** 'draft' (default): one worker per thesis drafts the change on its own branch. 'research': one worker per question
+   *  reads and searches only and returns findings; no branch, nothing is edited. */
+  mode?: 'draft' | 'research';
+  /** chat message for the exploration card (default: "Exploring <topic> for <document>") */
+  announcement?: string;
 }
 
 export interface ToolContext {
@@ -46,7 +59,10 @@ export interface ToolContext {
   actions: RoomActions;
   repo: RoomRepository;
   logger: Logger;
-  /** spawns exploration workers; implemented by the runtime (see workers.ts runExploration) */
+  /** The orchestrator's private working copy of main (commit_main takes edits from it). Required for commit_main. */
+  scratch?: Scratch;
+  /** starts exploration workers in the background and returns at once (see workers.ts startExploration); their results
+   *  arrive later as an exploration_finished event */
   startExploration?: (req: ExplorationRequest) => Promise<unknown>;
   /** size rule: an immediate change may delete or rewrite at most this many existing paragraphs (default: shared DEFAULTS) */
   immediateRewriteLimit?: number;
@@ -211,7 +227,7 @@ export function orchestratorTools(ctx: ToolContext) {
 
   const commitMain = tool(
     'commit_main',
-    'Commit the edits you made in the main worktree through the write queue (formatter runs, trailers are added) and announce a Change card. Edit exactly one document before calling. The server checks the result: changes to other files are discarded, and a change that deletes or rewrites more existing paragraphs than the size rule allows is refused (and its edit discarded).',
+    'Commit the edit you made to one document in your working directory (a private copy of main) through the write queue: the server runs the formatter, adds the trailers and announces a Change card. Edit exactly one document before calling. Under the write queue the server checks your edit against main as it is now: if main changed since your turn began, your edit is merged with the newer text (or refused if the same lines changed, in which case you re-read and redo it); changes to other files are discarded; and a change that deletes or rewrites more existing paragraphs than the size rule allows is refused (and the edit discarded). Afterwards your working directory is reset to main.',
     {
       documentPath: z
         .string()
@@ -226,6 +242,8 @@ export function orchestratorTools(ctx: ToolContext) {
         .describe('author the commit as this participant (use when applying their suggestion)'),
     },
     guard(ctx, 'commit_main', async (a) => {
+      const scratch = ctx.scratch;
+      if (!scratch) throw new Error('this session has no working directory to commit from');
       const state = await ctx.actions.getRoomState(ctx.roomId);
       const doc = state.documents.find((d) => d.path === a.documentPath);
       if (!doc) throw new Error(`no document with path ${a.documentPath}`);
@@ -236,61 +254,110 @@ export function orchestratorTools(ctx: ToolContext) {
         if (!p) throw new Error(`unknown participant ${a.asUserId}`);
         actor = { kind: 'user', userId: p.userId, displayName: p.displayName };
       }
+      // ids the model supplies go into commit trailers: only well-formed ones
+      const triggers = splitMessageIds(a.triggerMessageIds);
+      const proposalId = isProposalId(a.proposalId) ? a.proposalId : null;
+      const notes: string[] = [];
+      if (triggers.rejected.length > 0)
+        notes.push(
+          `Ignored trigger ids that are not message ids: ${describeRejectedIds(triggers.rejected)}.`,
+        );
+      if (a.proposalId && !proposalId)
+        notes.push(`Ignored proposalId ${describeRejectedIds([a.proposalId])}: not a proposal id.`);
 
-      // Mechanical checks on the working copy before it is committed (PRD 4.1 scope, 6.3 size rule).
-      const dir = ctx.repo.mainWorktree;
+      // What the model made, in its own working directory. Nothing here touches main or needs the write queue.
       const limit = ctx.immediateRewriteLimit ?? DEFAULTS.immediateRewriteLimit;
-      const discarded = await enforceScope(ctx.repo, dir, 'main', [doc.path]);
-      const note =
-        discarded.length > 0
-          ? ` Changes to ${discarded.join(', ')} were discarded: a change touches exactly one document, so handle other documents as their own requests.`
-          : '';
-      const before = (await ctx.repo.readFile(doc.path, 'main')) ?? '';
-      const file = join(dir, doc.path);
+      const discarded = await enforceScope(ctx.repo, scratch.dir, scratch.base, [doc.path]);
+      if (discarded.length > 0)
+        notes.push(
+          `Changes to ${discarded.join(', ')} were discarded: a change touches exactly one document, so handle other documents as their own requests.`,
+        );
+      const tail = notes.length > 0 ? ` ${notes.join(' ')}` : '';
+      const base = (await ctx.repo.readFile(doc.path, scratch.base)) ?? '';
+      const file = join(scratch.dir, doc.path);
       if (!existsSync(file)) {
-        await restoreFiles(ctx.repo, dir, 'main', [doc.path]);
+        await scratch.reset();
         return textResult(
-          `${doc.path} was deleted from the worktree; documents are archived from the UI, never deleted. The file was restored.${note}`,
+          `${doc.path} was deleted from your working directory; documents are archived from the UI, never deleted. The file was restored.${tail}`,
           true,
         );
       }
-      const after = readFileSync(file, 'utf8');
-      if (after === before)
+      const edited = readFileSync(file, 'utf8');
+      if (edited === base)
         return textResult(
-          `Nothing to commit: ${doc.path} is unchanged in the main worktree. Make your edits first.${note}`,
+          `Nothing to commit: ${doc.path} is unchanged in your working directory. Make your edits first.${tail}`,
           true,
         );
-      const { removed } = paragraphChange(before, after);
-      if (removed > limit) {
-        await restoreFiles(ctx.repo, dir, 'main', [doc.path]);
-        return textResult(
-          `Refused: this change deletes or rewrites ${removed} existing paragraphs, and an immediate change may touch at most ${limit}. The edit was discarded and main is unchanged. Call start_exploration with one thesis describing the change, then open_proposal with kind "review".${note}`,
-          true,
-        );
-      }
 
-      const sha = await ctx.repo.withMainLock(() =>
-        ctx.repo.commitWorktree(ctx.repo.mainWorktree, a.subject, {
-          actor,
-          triggerMessageIds: a.triggerMessageIds,
-          proposalId: a.proposalId ?? null,
+      // Now against main as it is, under the write queue (PRD 4.3): the scope, size and merge decisions are made on the
+      // text that will actually be replaced, and nothing else can commit in between.
+      const outcome = await ctx.repo.withMainLock(async () => {
+        const mainSha = await ctx.repo.headSha('main');
+        const current = (await ctx.repo.readFile(doc.path, 'main')) ?? '';
+        let text = edited;
+        let merged = false;
+        if (mainSha !== scratch.base && current !== base) {
+          const m = await threeWayMerge(base, current, edited);
+          if (!m.ok) return { kind: 'conflict', reason: m.reason } as const;
+          text = m.text;
+          merged = true;
+        }
+        if (text === current) return { kind: 'already' } as const;
+        const { removed } = paragraphChange(current, text);
+        if (removed > limit) return { kind: 'too_big', removed } as const;
+        try {
+          const sha = await ctx.repo.commitToMain({ [doc.path]: text }, a.subject, {
+            actor,
+            triggerMessageIds: triggers.valid,
+            proposalId,
+          });
+          return { kind: 'committed', sha, merged } as const;
+        } catch (e) {
+          // the formatter can normalize the text into what main already has
+          if (/nothing to commit/i.test(errMessage(e))) return { kind: 'already' } as const;
+          throw e;
+        }
+      });
+      // Whatever happened, the working directory follows main again: a committed edit is part of it, a refused one is gone.
+      await scratch.reset().catch((e) =>
+        ctx.logger('warn', 'could not reset the orchestrator working directory', {
+          roomId: ctx.roomId,
+          error: errMessage(e),
         }),
       );
-      if (!sha)
-        return textResult(
-          `Nothing to commit: the main worktree is clean (a merge may have reset it). Make your edits again.${note}`,
-          true,
-        );
-      await ctx.actions.recordChange(ctx.roomId, {
-        sha,
-        documentId: doc.id,
-        actor,
-        summary: a.summary,
-        triggerMessageIds: a.triggerMessageIds,
-        proposalId: a.proposalId ?? null,
-        revertsSha: null,
-      });
-      return textResult(`committed ${sha}.${note}`);
+
+      switch (outcome.kind) {
+        case 'conflict':
+          return textResult(
+            `Refused: ${doc.path} changed on main while you were editing, in the same lines as your edit, and the two could not be merged (${outcome.reason}). Your edit was discarded and main is unchanged. Read ${doc.path} again, redo the edit on the current text, and call commit_main again.${tail}`,
+            true,
+          );
+        case 'already':
+          return textResult(
+            `Nothing to commit: ${doc.path} on main already has this text.${tail}`,
+            true,
+          );
+        case 'too_big':
+          return textResult(
+            `Refused: this change deletes or rewrites ${outcome.removed} existing paragraphs, and an immediate change may touch at most ${limit}. The edit was discarded and main is unchanged. Call start_exploration with one thesis describing the change; when its exploration_finished event arrives, open_proposal with kind "review".${tail}`,
+            true,
+          );
+        case 'committed': {
+          await ctx.actions.recordChange(ctx.roomId, {
+            sha: outcome.sha,
+            documentId: doc.id,
+            actor,
+            summary: a.summary,
+            triggerMessageIds: triggers.valid,
+            proposalId,
+            revertsSha: null,
+          });
+          const merge = outcome.merged
+            ? ' Main had changed since your turn began, so your edit was merged with the newer text.'
+            : '';
+          return textResult(`committed ${outcome.sha}.${merge}${tail}`);
+        }
+      }
     }),
   );
 
@@ -319,7 +386,7 @@ export function orchestratorTools(ctx: ToolContext) {
 
   const startExploration = tool(
     'start_exploration',
-    "Spawn one worker per thesis, each on its own new branch (options a, b, c...) forked from main. Blocks until all finish or time out, then returns each worker's branch, head sha, summary, tradeoffs, assumptions, open questions and sources, plus the base sha to use as branchBase.",
+    'Start workers in the background and return immediately; this does not wait for them. mode "draft" (default): one worker per thesis, each on its own new branch (options a, b, c...) forked from main, which also posts the "Exploring" card in chat. Returns {explorationId, branches, baseSha}: use baseSha as branchBase for open_proposal. mode "research": one worker per question that only reads and searches the web and returns findings; no branch is created and nothing is edited. When the workers finish or time out you receive an [event:exploration_finished] with each worker\'s branch, summary, tradeoffs, diff stats and what the room said meanwhile (chatSinceStart). Other events keep arriving while the workers run.',
     {
       documentPath: z.string(),
       topic: z.string().describe('short topic used in branch names, e.g. "storage engine"'),
@@ -327,13 +394,36 @@ export function orchestratorTools(ctx: ToolContext) {
         .array(z.string())
         .min(1)
         .max(5)
-        .describe('one thesis per worker; for a divergence, each position plus a synthesis'),
+        .describe(
+          'one thesis per worker; for a divergence, each position plus a synthesis (in research mode: the questions)',
+        ),
       context: z.string().optional().describe('background the workers need beyond the transcript'),
       triggerMessageIds: z.array(z.string()).default([]),
+      mode: z
+        .enum(['draft', 'research'])
+        .default('draft')
+        .describe(
+          'draft: edit the document on branches; research: findings only, for questions that need the web',
+        ),
+      announcement: z
+        .string()
+        .optional()
+        .describe(
+          'one-line chat message for the exploration card, e.g. "Exploring PostgreSQL vs ClickHouse for Architecture.md"',
+        ),
     },
     guard(ctx, 'start_exploration', async (a) => {
       if (!ctx.startExploration) throw new Error('explorations are not available');
-      return jsonResult(await ctx.startExploration(a));
+      const triggers = splitMessageIds(a.triggerMessageIds);
+      const started = await ctx.startExploration({ ...a, triggerMessageIds: triggers.valid });
+      return jsonResult(
+        triggers.rejected.length > 0
+          ? {
+              ...(started as object),
+              note: `Ignored trigger ids that are not message ids: ${describeRejectedIds(triggers.rejected)}.`,
+            }
+          : started,
+      );
     }),
   );
 
@@ -395,6 +485,8 @@ export function orchestratorTools(ctx: ToolContext) {
       const mainChangedSince = (
         await ctx.repo.changedFiles(base, 'main').catch(() => [] as string[])
       ).includes(doc.path);
+      // the trigger ids reach commit trailers when the proposal merges: only well-formed ones
+      const triggers = splitMessageIds(a.triggerMessageIds);
 
       const p = await ctx.actions.openProposal(ctx.roomId, {
         documentId: doc.id,
@@ -402,11 +494,16 @@ export function orchestratorTools(ctx: ToolContext) {
         title: a.title,
         branchBase: base,
         options: a.options,
-        triggerMessageIds: a.triggerMessageIds,
+        triggerMessageIds: triggers.valid,
         stale: a.stale,
       });
       return jsonResult({
         proposalId: p.id,
+        ...(triggers.rejected.length > 0
+          ? {
+              ignoredTriggerIds: `not message ids: ${describeRejectedIds(triggers.rejected)}`,
+            }
+          : {}),
         state: p.state,
         stale: p.stale,
         options: p.options.map((o) => ({ id: o.id, label: o.label, branch: o.branch })),
