@@ -9,6 +9,7 @@ import type { RoomService } from '../room/RoomService.js';
 import { RoomError, type Logger, type RoomErrorCode } from '../room/types.js';
 import { LoginLimitError, type ClaudeAuthService } from '../claudeauth/index.js';
 import { AuthError, createAuth } from './auth.js';
+import { clientAddress, originAllowed } from './net.js';
 
 export interface HttpOptions {
   service: Pick<
@@ -19,7 +20,8 @@ export interface HttpOptions {
     Storage,
     'users' | 'sessions' | 'rooms' | 'documents' | 'proposals' | 'changes' | 'usage' | 'messages'
   >;
-  config: Pick<ServerConfig, 'password' | 'clientDistDir'>;
+  config: Pick<ServerConfig, 'password' | 'clientDistDir'> &
+    Partial<Pick<ServerConfig, 'trustProxy' | 'allowedOrigins'>>;
   logger?: Logger;
   /** The server's Claude credential (web sign-in). When absent, `/api/claude/*` answers 503. */
   claudeAuth?: Pick<
@@ -29,12 +31,17 @@ export interface HttpOptions {
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
+/** the hash of the empty tree: what a root commit is compared against */
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+const LOGIN_FAILURES_PER_WINDOW = 10;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
 
 class HttpError extends Error {
   constructor(
     public readonly status: number,
     public readonly code: string,
     message: string,
+    public readonly headers: Record<string, string> = {},
   ) {
     super(message);
   }
@@ -93,6 +100,9 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     chunks.push(chunk as Buffer);
   }
   if (size === 0) return {};
+  // A form or text/plain post can be sent by any page in the browser; JSON cannot without a CORS preflight we never grant.
+  if (!/^application\/json\s*(;|$)/i.test(req.headers['content-type'] ?? ''))
+    throw new HttpError(415, 'unsupported_media_type', 'content-type must be application/json');
   try {
     const v = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');
@@ -109,13 +119,41 @@ class Throttle {
     private readonly limit: number,
     private readonly windowMs: number,
   ) {}
-  allow(key: string, now = Date.now()): boolean {
+  private recent(key: string, now: number): number[] {
     const recent = (this.hits.get(key) ?? []).filter((at) => now - at < this.windowMs);
-    const ok = recent.length < this.limit;
-    if (ok) recent.push(now);
     if (recent.length === 0) this.hits.delete(key);
     else this.hits.set(key, recent);
+    return recent;
+  }
+  /** Counts the attempt when it is allowed. */
+  allow(key: string, now = Date.now()): boolean {
+    const recent = this.recent(key, now);
+    const ok = recent.length < this.limit;
+    if (ok) {
+      recent.push(now);
+      this.hits.set(key, recent);
+    }
     return ok;
+  }
+  /** Whether the key is over its limit; counts nothing. */
+  blocked(key: string, now = Date.now()): boolean {
+    return this.recent(key, now).length >= this.limit;
+  }
+  /** Counts one hit (a failure) against the key. */
+  record(key: string, now = Date.now()): void {
+    // keys come from the network: forget the expired ones before the table can grow without bound
+    if (this.hits.size > 10_000) for (const k of [...this.hits.keys()]) this.recent(k, now);
+    const recent = this.recent(key, now);
+    recent.push(now);
+    this.hits.set(key, recent);
+  }
+  reset(key: string): void {
+    this.hits.delete(key);
+  }
+  /** Seconds until the oldest hit leaves the window (what Retry-After says). */
+  retryAfterSeconds(key: string, now = Date.now()): number {
+    const oldest = this.recent(key, now)[0];
+    return oldest === undefined ? 0 : Math.max(1, Math.ceil((oldest + this.windowMs - now) / 1000));
   }
 }
 
@@ -133,20 +171,42 @@ export function createHttpServer(opts: HttpOptions): Server {
   const distRoot = path.resolve(config.clientDistDir);
   const loginStartThrottle = new Throttle(5, 10 * 60_000);
   const loginCodeThrottle = new Throttle(20, 10 * 60_000);
+  /** wrong passwords per client address: without a limit the shared password can be guessed at network speed */
+  const loginFailures = new Throttle(LOGIN_FAILURES_PER_WINDOW, LOGIN_FAILURE_WINDOW_MS);
+  const trustProxy = config.trustProxy ?? false;
+  const allowedOrigins = config.allowedOrigins ?? [];
 
   async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
     const method = req.method ?? 'GET';
     const p = url.pathname.replace(/\/+$/, '') || '/';
     const secure = req.headers['x-forwarded-proto'] === 'https';
+    const ip = clientAddress(req, trustProxy);
+
+    // A state-changing request made by a page of another origin carries the visitor's cookie when the site is the same
+    // (another port on the host, a sibling subdomain). Browsers say where the page came from; believe them.
+    if (
+      method !== 'GET' &&
+      method !== 'HEAD' &&
+      !originAllowed(req.headers.origin, req.headers.host, allowedOrigins)
+    )
+      throw new HttpError(403, 'forbidden_origin', 'cross-origin requests are not accepted');
 
     if (method === 'GET' && p === '/api/health') {
       sendJson(res, 200, { ok: true });
       return true;
     }
     if (method === 'POST' && p === '/api/login') {
+      if (loginFailures.blocked(ip))
+        throw new HttpError(
+          429,
+          'rate_limited',
+          'Too many failed logins. Wait a few minutes and try again.',
+          { 'retry-after': String(loginFailures.retryAfterSeconds(ip)) },
+        );
       const body = await readJson(req);
       try {
         const { token, user } = auth.login(body.password, body.displayName);
+        loginFailures.reset(ip);
         sendJson(
           res,
           200,
@@ -154,7 +214,10 @@ export function createHttpServer(opts: HttpOptions): Server {
           { 'set-cookie': auth.sessionCookie(token, secure) },
         );
       } catch (err) {
-        if (err instanceof AuthError) throw new HttpError(err.status, err.code, err.message);
+        if (err instanceof AuthError) {
+          if (err.code === 'invalid_password') loginFailures.record(ip);
+          throw new HttpError(err.status, err.code, err.message);
+        }
         throw err;
       }
       return true;
@@ -172,10 +235,21 @@ export function createHttpServer(opts: HttpOptions): Server {
       if (!user) throw new HttpError(401, 'unauthorized', 'login required');
       return user;
     };
+    /** Quorum has no global owner; the first person who signed in is the admin of the server itself. */
+    const requireAdmin = (): User => {
+      const u = requireUser();
+      if (!u.admin)
+        throw new HttpError(
+          403,
+          'forbidden',
+          "only the server's admin (the first person who signed in) can manage the Claude sign-in",
+        );
+      return u;
+    };
 
     if (method === 'GET' && p === '/api/me') {
       const u = requireUser();
-      sendJson(res, 200, { userId: u.id, displayName: u.displayName });
+      sendJson(res, 200, { userId: u.id, displayName: u.displayName, isAdmin: u.admin });
       return true;
     }
     if (method === 'GET' && p === '/api/rooms') {
@@ -193,7 +267,7 @@ export function createHttpServer(opts: HttpOptions): Server {
     }
 
     if (p.startsWith('/api/claude/')) {
-      requireUser();
+      requireAdmin(); // signing the server in or out of Claude affects every room and every participant
       const claude = opts.claudeAuth;
       if (!claude)
         throw new HttpError(
@@ -201,7 +275,6 @@ export function createHttpServer(opts: HttpOptions): Server {
           'claude_auth_unavailable',
           'Claude sign-in is not available on this server',
         );
-      const ip = req.socket.remoteAddress ?? 'unknown';
 
       if (method === 'GET' && p === '/api/claude/status') {
         sendJson(res, 200, await claude.status());
@@ -345,16 +418,26 @@ export function createHttpServer(opts: HttpOptions): Server {
         const doc = storage.documents.get(change.documentId);
         if (!doc) throw new HttpError(404, 'not_found', 'document not found');
         const repo = await service.repo(roomId);
-        const parent = `${sha}~1`;
+        // The document may have been renamed since: its path is the one this commit touched, not today's.
+        const touched = await repo.show(sha).then(
+          (c) => c.files,
+          () => [] as string[], // a commit git does not know: the diff comes back empty, as it always did
+        );
+        const docPath = touched.includes(doc.path)
+          ? doc.path
+          : ((touched.length === 1 ? touched[0] : touched.find((f) => f.endsWith('.md'))) ??
+            doc.path);
+        // the real parent (the first one for a merge), resolved here; a root commit is compared with nothing
+        const parent = await repo.headSha(`${sha}^1`).catch(() => null);
         const [before, after, unified] = await Promise.all([
-          repo.readFile(doc.path, parent),
-          repo.readFile(doc.path, sha),
-          repo.diff(doc.path, parent, sha),
+          parent ? repo.readFile(docPath, parent) : Promise.resolve(null),
+          repo.readFile(docPath, sha),
+          repo.diff(docPath, parent ?? EMPTY_TREE, sha),
         ]);
         const out: DiffResponse = {
           documentId: doc.id,
-          path: doc.path,
-          baseSha: parent,
+          path: docPath,
+          baseSha: parent ?? sha,
           headSha: sha,
           before: before ?? '',
           after: after ?? '',
@@ -423,11 +506,13 @@ export function createHttpServer(opts: HttpOptions): Server {
         let status = 500;
         let code = 'internal';
         let message = 'internal error';
+        let headers: Record<string, string> = {};
         if (err instanceof HttpError)
-          ({ status, code, message } = {
+          ({ status, code, message, headers } = {
             status: err.status,
             code: err.code,
             message: err.message,
+            headers: err.headers,
           });
         else if (err instanceof RoomError)
           ({ status, code, message } = {
@@ -437,11 +522,12 @@ export function createHttpServer(opts: HttpOptions): Server {
           });
         else
           log('error', 'request failed', {
-            url: req.url,
+            // the path only: a token or other secret in the query string must not reach the log
+            path: req.url?.split('?')[0],
             err: String((err as Error)?.stack ?? err),
           });
         if (res.headersSent) return void res.destroy();
-        sendJson(res, status, { error: code, message });
+        sendJson(res, status, { error: code, message }, headers);
       }
     })();
   });

@@ -41,11 +41,12 @@ describe('verifyPassword / auth', () => {
     expect(auth.userFromRequest(req)).toBeNull();
   });
 
-  it('accepts the token from bearer, query or cookie', () => {
-    const mk = (headers: Record<string, string>, url = '/') =>
-      tokenFromRequest({ headers, url } as never);
+  it('accepts the token from bearer or cookie everywhere, and from the query string only where asked (the WebSocket)', () => {
+    const mk = (headers: Record<string, string>, url = '/', allowQuery = false) =>
+      tokenFromRequest({ headers, url } as never, { allowQuery });
     expect(mk({ authorization: 'Bearer abc' })).toBe('abc');
-    expect(mk({}, '/ws?roomId=r&token=qq')).toBe('qq');
+    expect(mk({}, '/ws?roomId=r&token=qq')).toBeNull(); // a token in a URL ends up in logs and history
+    expect(mk({}, '/ws?roomId=r&token=qq', true)).toBe('qq');
     expect(mk({ cookie: 'x=1; quorum_session=ck; y=2' })).toBe('ck');
     expect(mk({})).toBeNull();
   });
@@ -61,6 +62,7 @@ describe('verifyPassword / auth', () => {
     expect(c).toContain('quorum_session=tok');
     expect(c).toContain('HttpOnly');
     expect(c).toContain('SameSite=Lax');
+    expect(c).toContain(`Max-Age=${30 * 24 * 60 * 60}`); // the cookie and the stored session expire together
     expect(auth.sessionCookie('tok', true)).toContain('Secure');
   });
 });
@@ -85,6 +87,7 @@ describe('command validation', () => {
       { type: 'document.rename', documentId: 'd', title: 'T' },
       { type: 'document.archive', documentId: 'd' },
       { type: 'room.setRule', votingRule: 'majority' },
+      { type: 'room.archive' },
     ];
     for (const c of cmds)
       expect(parseClientCommand(JSON.stringify({ ...c, cid: 'c1' })).ok, c.type).toBe(true);
@@ -169,6 +172,7 @@ describe('http + websocket', () => {
     expect(await (await fetch(`http://${base}/api/health`)).json()).toEqual({ ok: true });
     const bad = await fetch(`http://${base}/api/login`, {
       method: 'POST',
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ password: 'x', displayName: 'A' }),
     });
     expect(bad.status).toBe(401);
@@ -178,7 +182,7 @@ describe('http + websocket', () => {
     expect(res.headers.get('set-cookie')).toMatch(/HttpOnly/);
     expect(
       await (await fetch(`http://${base}/api/me`, { headers: { cookie } })).json(),
-    ).toMatchObject({ displayName: 'Ann' });
+    ).toMatchObject({ displayName: 'Ann', isAdmin: true }); // the first user to log in is the admin
     expect(
       (await fetch(`http://${base}/api/me`, { headers: { authorization: `Bearer ${token}` } }))
         .status,
@@ -192,7 +196,7 @@ describe('http + websocket', () => {
     const { cookie } = await login();
     const created = await fetch(`http://${base}/api/rooms`, {
       method: 'POST',
-      headers: { cookie },
+      headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'R1' }),
     });
     expect(created.status).toBe(201);
@@ -208,7 +212,7 @@ describe('http + websocket', () => {
     ).toBe(404);
     const huge = await fetch(`http://${base}/api/rooms`, {
       method: 'POST',
-      headers: { cookie },
+      headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'x'.repeat(400_000) }),
     });
     expect(huge.status).toBe(413);
@@ -219,7 +223,10 @@ describe('http + websocket', () => {
     expect(await (await fetch(`http://${base}/rooms/room_abc`)).text()).toBe('<html>spa</html>');
     expect(await (await fetch(`http://${base}/assets/app.js`)).text()).toBe('console.log(1)');
     expect((await fetch(`http://${base}/assets/missing.js`)).status).toBe(404);
-    expect((await fetch(`http://${base}/../../etc/passwd`)).status).toBe(200); // normalized; falls back to index
+    // normalized by the client; falls back to the index, and never reads outside the client build
+    const up = await fetch(`http://${base}/../../etc/passwd`);
+    expect(up.status).toBe(200);
+    expect(await up.text()).toBe('<html>spa</html>');
   });
 
   function open(url: string): Promise<{ sock: WebSocket; events: ServerEvent[] }> {
@@ -242,7 +249,7 @@ describe('http + websocket', () => {
     const room = await (
       await fetch(`http://${base}/api/rooms`, {
         method: 'POST',
-        headers: { cookie },
+        headers: { cookie, 'content-type': 'application/json' },
         body: JSON.stringify({ name: 'R' }),
       })
     ).json();

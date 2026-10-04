@@ -10,12 +10,12 @@ import type {
   UsageRecord,
   Vote,
 } from '@quorum/shared';
-import type { Storage, User } from '../../contracts/index.js';
+import { SESSION_TTL_MS, type Storage, type User } from '../../contracts/index.js';
 
 /** Minimal in-memory Storage for RoomService tests. */
 export class MemoryStorage implements Storage {
   private _users = new Map<string, User>();
-  private _sessions = new Map<string, string>();
+  private _sessions = new Map<string, { userId: string; createdAt: number }>();
   private _rooms = new Map<string, Room>();
   private _participants: Participant[] = [];
   private _presence = new Map<string, PresenceEntry>();
@@ -30,7 +30,12 @@ export class MemoryStorage implements Storage {
 
   users = {
     create: (displayName: string): User => {
-      const u = { id: newId('user'), displayName, createdAt: this.clock().toISOString() };
+      const u: User = {
+        id: newId('user'),
+        displayName,
+        createdAt: this.clock().toISOString(),
+        admin: this._users.size === 0,
+      };
       this._users.set(u.id, u);
       return u;
     },
@@ -42,10 +47,18 @@ export class MemoryStorage implements Storage {
   sessions = {
     create: (userId: string) => {
       const token = `tok_${++this.seq}_${Math.random().toString(36).slice(2)}`;
-      this._sessions.set(token, userId);
+      this._sessions.set(token, { userId, createdAt: this.clock().getTime() });
       return { token, userId };
     },
-    resolve: (token: string) => this._sessions.get(token) ?? null,
+    resolve: (token: string) => {
+      const s = this._sessions.get(token);
+      if (!s) return null;
+      if (this.clock().getTime() - s.createdAt >= SESSION_TTL_MS) {
+        this._sessions.delete(token);
+        return null;
+      }
+      return s.userId;
+    },
     revoke: (token: string) => void this._sessions.delete(token),
   };
 

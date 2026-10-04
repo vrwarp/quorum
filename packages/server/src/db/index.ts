@@ -29,30 +29,32 @@ import {
   type Vote,
   type VotingRule,
 } from '@quorum/shared';
-import type {
-  ChangeRepo,
-  DocumentRepo,
-  MessageRepo,
-  ProposalRepo,
-  RoomRepo,
-  SessionRepo,
-  Storage,
-  UsageRepo,
-  User,
-  UserRepo,
+import {
+  SESSION_TTL_MS,
+  type ChangeRepo,
+  type DocumentRepo,
+  type MessageRepo,
+  type ProposalRepo,
+  type RoomRepo,
+  type SessionRepo,
+  type Storage,
+  type UsageRepo,
+  type User,
+  type UserRepo,
 } from '../contracts/storage.js';
 import { migrations } from './schema.js';
 
 type Row = Record<string, any>;
 
-const nowIso = () => new Date().toISOString();
 const json = (v: unknown) => JSON.stringify(v);
 
 /**
  * Open (creating if needed) the Quorum SQLite database at `filePath` and apply migrations.
- * `':memory:'` gives a private in-memory database (tests).
+ * `':memory:'` gives a private in-memory database (tests). `opts.now` replaces the clock used for session expiry.
  */
-export function openStorage(filePath: string): Storage {
+export function openStorage(filePath: string, opts: { now?: () => Date } = {}): Storage {
+  const clock = opts.now ?? (() => new Date());
+  const nowIso = () => clock().toISOString();
   if (filePath !== ':memory:') mkdirSync(dirname(filePath), { recursive: true });
   // Loaded here, not with a static import: Node emits the experimental warning while it links a static `node:sqlite`
   // import, which is before quietSqlite.js has run. A require at call time comes after it.
@@ -114,17 +116,20 @@ export function openStorage(filePath: string): Storage {
     id: r.id,
     displayName: r.displayName,
     createdAt: r.createdAt,
+    admin: r.admin === 1,
   });
   const users: UserRepo = {
     create(displayName) {
-      const user: User = { id: newId('user'), displayName, createdAt: nowIso() };
+      const id = newId('user');
+      // one statement, so "am I the first?" cannot race another insert: the first user ever created is the admin
       run(
-        'INSERT INTO users (id, displayName, createdAt) VALUES (?, ?, ?)',
-        user.id,
-        user.displayName,
-        user.createdAt,
+        `INSERT INTO users (id, displayName, createdAt, admin)
+         VALUES (?, ?, ?, (SELECT COUNT(*) = 0 FROM users))`,
+        id,
+        displayName,
+        nowIso(),
       );
-      return user;
+      return users.get(id)!;
     },
     get(userId) {
       const r = get('SELECT * FROM users WHERE id = ?', userId);
@@ -137,9 +142,13 @@ export function openStorage(filePath: string): Storage {
   };
 
   // ---- sessions ----
+  const sessionCutoff = () => new Date(clock().getTime() - SESSION_TTL_MS).toISOString();
+  const purgeSessions = () => run('DELETE FROM sessions WHERE createdAt <= ?', sessionCutoff());
+  purgeSessions();
   const sessions: SessionRepo = {
     create(userId) {
       const token = randomBytes(32).toString('hex');
+      purgeSessions();
       run(
         'INSERT INTO sessions (token, userId, createdAt) VALUES (?, ?, ?)',
         token,
@@ -149,8 +158,13 @@ export function openStorage(filePath: string): Storage {
       return { token, userId };
     },
     resolve(token) {
-      const r = get('SELECT userId FROM sessions WHERE token = ?', token);
-      return r ? (r.userId as UserId) : null;
+      const r = get('SELECT userId, createdAt FROM sessions WHERE token = ?', token);
+      if (!r) return null;
+      if ((r.createdAt as string) <= sessionCutoff()) {
+        run('DELETE FROM sessions WHERE token = ?', token);
+        return null;
+      }
+      return r.userId as UserId;
     },
     revoke(token) {
       run('DELETE FROM sessions WHERE token = ?', token);

@@ -21,11 +21,20 @@ export function logger(
   else console.log(line);
 }
 
+/** How long a merge in flight may keep running when the server is asked to stop (the merge driver takes minutes). */
+export const MERGE_DRAIN_MS = 25_000;
+/**
+ * A stop that has not finished by then exits anyway, a little inside the 30 s `stop_grace_period` compose gives the
+ * container: the drain above plus stopping the agents and closing sockets and database.
+ */
+const SHUTDOWN_LIMIT_MS = 28_000;
+
 export async function startServer(env: NodeJS.ProcessEnv = process.env) {
   const config = loadConfig(env);
+  for (const warning of config.warnings) logger('warn', warning);
   mkdirSync(config.dataDir, { recursive: true });
   const storage = openStorage(path.join(config.dataDir, 'quorum.sqlite'));
-  const git = createGitProvider(config.dataDir);
+  const git = createGitProvider(config.dataDir, { logger });
   const claudeAuth = new ClaudeAuthService({ config, logger });
   const service = new RoomService({ storage, git, tunables: config.tunables, logger });
   const runtime = createAgentRuntime(config.runtime, service, {
@@ -33,7 +42,8 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     tunables: config.tunables,
     logger,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
-    maxBudgetUsd: config.maxBudgetUsdPerRoom,
+    // the runtime's option keeps its name (maxBudgetUsd, the SDK's own); it caps each SDK session, not a room
+    maxBudgetUsd: config.maxBudgetUsdPerSession,
     // Claude credentials (used by the claude runtime; the fake runtime ignores them): the Agent SDK launches
     // config.claudeBinary with the sign-in service's environment (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN); the agent
     // is "unavailable" until a credential exists; a web sign-in or sign-out restarts or stops the room sessions.
@@ -43,10 +53,15 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     onCredentialsChanged: (listener) => claudeAuth.onChange(listener),
   });
   service.setRuntime(runtime);
-  await service.start?.();
+  await service.start();
 
   const server = createHttpServer({ service, storage, config, logger, claudeAuth });
-  const sockets = attachWebSocket(server, { service, storage, logger });
+  const sockets = attachWebSocket(server, {
+    service,
+    storage,
+    logger,
+    allowedOrigins: config.allowedOrigins,
+  });
 
   await new Promise<void>((resolve) => server.listen(config.port, resolve));
   logger('info', `quorum listening on http://localhost:${config.port} (runtime=${config.runtime})`);
@@ -56,6 +71,10 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
   const close = () =>
     (closing ??= (async () => {
       claudeAuth.cancelAll();
+      // A merge in flight gets its time first: stopping the agents aborts the merge driver mid-merge, which would leave
+      // the proposal to be reopened by the next start. No new merge begins from here on.
+      if (!(await service.drain(MERGE_DRAIN_MS)))
+        logger('warn', 'a merge was still running after the drain period; stopping the agents');
       await runtime.stopAll().catch(() => undefined);
       // The service first: once closed it ignores presence changes, so sockets that close one by one cannot "complete"
       // a vote among whoever happens to be left. Then the sockets, which record last-seen times while storage is open.
@@ -75,7 +94,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     setTimeout(() => {
       logger('warn', 'shutdown timed out; exiting');
       process.exit(1);
-    }, 10_000).unref();
+    }, SHUTDOWN_LIMIT_MS).unref();
     await close();
     process.exit(0);
   };

@@ -18,9 +18,19 @@ export interface ServerConfig {
   claudeConfigDir: string;
   /** The Claude Code executable the sign-in runs, so it is the same program the Agent SDK uses. */
   claudeBinary: string;
-  maxBudgetUsdPerRoom: number;
+  /**
+   * Spend cap handed to the Agent SDK as `maxBudgetUsd`. It applies to each SDK session separately (the orchestrator,
+   * every worker, every merge-driver run, every digest), not to a room as a whole: a room can spend several times it.
+   */
+  maxBudgetUsdPerSession: number;
+  /** `QUORUM_TRUST_PROXY=1`: take the client address from X-Forwarded-For (behind a reverse proxy that sets it) */
+  trustProxy: boolean;
+  /** `QUORUM_ALLOWED_ORIGINS`: origins besides the server's own host that may open a WebSocket */
+  allowedOrigins: string[];
   tunables: TunableOverrides;
   clientDistDir: string;
+  /** Things worth telling the operator at startup (deprecated settings in use); main.ts logs each as a warning. */
+  warnings: string[];
 }
 
 /** digestAbsenceMs -> QUORUM_DIGEST_ABSENCE_MS */
@@ -106,9 +116,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       : claudeOverride
     : findClaudeBinary();
 
-  const maxBudgetUsdPerRoom = env.QUORUM_MAX_BUDGET_USD_PER_ROOM
-    ? parseNumber('QUORUM_MAX_BUDGET_USD_PER_ROOM', env.QUORUM_MAX_BUDGET_USD_PER_ROOM)
-    : 20;
+  // The cap is per Agent SDK session (see ServerConfig); the old name suggested a per-room cap and is still read.
+  const warnings: string[] = [];
+  const oldBudget = env.QUORUM_MAX_BUDGET_USD_PER_ROOM;
+  const newBudget = env.QUORUM_MAX_BUDGET_USD_PER_SESSION;
+  if (oldBudget) {
+    warnings.push(
+      newBudget
+        ? 'QUORUM_MAX_BUDGET_USD_PER_ROOM is deprecated and ignored because QUORUM_MAX_BUDGET_USD_PER_SESSION is set'
+        : 'QUORUM_MAX_BUDGET_USD_PER_ROOM is deprecated: the cap applies to each agent session, not to a room; rename it to QUORUM_MAX_BUDGET_USD_PER_SESSION',
+    );
+  }
+  const maxBudgetUsdPerSession = newBudget
+    ? parseNumber('QUORUM_MAX_BUDGET_USD_PER_SESSION', newBudget)
+    : oldBudget
+      ? parseNumber('QUORUM_MAX_BUDGET_USD_PER_ROOM', oldBudget)
+      : 20;
+
+  const trustProxy = env.QUORUM_TRUST_PROXY === '1' || env.QUORUM_TRUST_PROXY === 'true';
+  const allowedOrigins = (env.QUORUM_ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
 
   const overrides: Record<string, number> = {};
   for (const key of Object.keys(DEFAULTS)) {
@@ -130,8 +159,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     claudeOauthToken,
     claudeConfigDir,
     claudeBinary,
-    maxBudgetUsdPerRoom,
+    maxBudgetUsdPerSession,
+    trustProxy,
+    allowedOrigins,
     tunables: overrides as TunableOverrides,
     clientDistDir,
+    warnings,
   };
 }

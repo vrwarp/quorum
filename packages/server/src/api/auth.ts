@@ -1,9 +1,9 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import type { Storage, User } from '../contracts/index.js';
+import { SESSION_TTL_MS, type Storage, type User } from '../contracts/index.js';
 
 export const SESSION_COOKIE = 'quorum_session';
-const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
+const SESSION_MAX_AGE_S = SESSION_TTL_MS / 1000;
 
 export class AuthError extends Error {
   constructor(
@@ -40,18 +40,26 @@ export function parseCookies(header: string | undefined): Record<string, string>
   return out;
 }
 
-/** Token sources, in order: Authorization Bearer, ?token=, cookie. */
-export function tokenFromRequest(req: IncomingMessage): string | null {
+/**
+ * Token sources, in order: Authorization Bearer, `?token=` (only with `allowQuery`: the WebSocket upgrade, where a
+ * browser cannot set headers; elsewhere a token in the URL would end up in logs and history), cookie.
+ */
+export function tokenFromRequest(
+  req: IncomingMessage,
+  opts: { allowQuery?: boolean } = {},
+): string | null {
   const auth = req.headers.authorization;
   if (auth) {
     const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
     if (m) return m[1]!.trim();
   }
-  try {
-    const t = new URL(req.url ?? '/', 'http://localhost').searchParams.get('token');
-    if (t) return t;
-  } catch {
-    /* ignore malformed url */
+  if (opts.allowQuery) {
+    try {
+      const t = new URL(req.url ?? '/', 'http://localhost').searchParams.get('token');
+      if (t) return t;
+    } catch {
+      /* ignore malformed url */
+    }
   }
   return parseCookies(req.headers.cookie)[SESSION_COOKIE] ?? null;
 }
@@ -59,7 +67,10 @@ export function tokenFromRequest(req: IncomingMessage): string | null {
 export interface Auth {
   /** throws AuthError on bad credentials */
   login(password: unknown, displayName: unknown): { token: string; user: User };
-  userFromRequest(req: IncomingMessage): { user: User; token: string } | null;
+  userFromRequest(
+    req: IncomingMessage,
+    opts?: { allowQueryToken?: boolean },
+  ): { user: User; token: string } | null;
   logout(token: string): void;
   sessionCookie(token: string, secure: boolean): string;
   clearCookie(secure: boolean): string;
@@ -90,8 +101,8 @@ export function createAuth(deps: {
       const { token } = storage.sessions.create(user.id);
       return { token, user };
     },
-    userFromRequest(req) {
-      const token = tokenFromRequest(req);
+    userFromRequest(req, opts) {
+      const token = tokenFromRequest(req, { allowQuery: opts?.allowQueryToken });
       if (!token) return null;
       const userId = storage.sessions.resolve(token);
       if (!userId) return null;

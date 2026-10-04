@@ -22,15 +22,20 @@ function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Content of the pre-commit hook: format staged markdown with prettier and re-stage it. */
+/**
+ * Content of the pre-commit hook: format staged markdown with prettier and re-stage it.
+ * File names go after `--` so that a document called `--plugin=x` or `-l` can never be read as an option, and git
+ * gets `safe.directory=*` like every other git call of the server (the hook is a separate process).
+ */
 export function preCommitHookScript(nodePath: string, prettierBin: string): string {
   return `#!/bin/sh
 # Installed by Quorum: normalizes staged markdown (prettier, proseWrap=preserve).
 NODE=${shQuote(nodePath)}
 PRETTIER=${shQuote(prettierBin)}
-git diff --cached --name-only --diff-filter=ACMR -z -- '*.md' |
-  xargs -0 -r "$NODE" "$PRETTIER" --no-config --no-editorconfig --prose-wrap preserve --write --log-level warn || exit 1
-git diff --cached --name-only --diff-filter=ACMR -z -- '*.md' | xargs -0 -r git add -- || exit 1
+git -c safe.directory='*' diff --cached --name-only --diff-filter=ACMR -z -- '*.md' |
+  xargs -0 -r "$NODE" "$PRETTIER" --no-config --no-editorconfig --prose-wrap preserve --write --log-level warn -- || exit 1
+git -c safe.directory='*' diff --cached --name-only --diff-filter=ACMR -z -- '*.md' |
+  xargs -0 -r git -c safe.directory='*' --literal-pathspecs add -- || exit 1
 exit 0
 `;
 }

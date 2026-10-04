@@ -99,8 +99,10 @@ export interface AgentRuntime {
   onReverted(roomId: RoomId, change: Change, revertSha: Sha, byUserId: UserId): void;
 
   /**
-   * Merge driver: RoomService has already run `beginMerge` and got a non-fast-forward outcome.
-   * The runtime must leave the worktree with a clean, marker-free result (or throw).
+   * Merge driver: RoomService has already run `beginMerge` and got a 'clean' or 'conflict' outcome (main moved since
+   * the branch point). A 'fast-forward' outcome means no reconciliation is needed and never reaches the driver.
+   * The runtime must leave the worktree with a clean, marker-free result (or throw); RoomService then commits it with
+   * `finishMerge`, restricted to the document's path, so edits to other files fail the merge.
    * Returns a summary of any semantic reconciliation performed.
    */
   runMergeDriver(

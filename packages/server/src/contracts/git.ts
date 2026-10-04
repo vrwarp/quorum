@@ -31,10 +31,19 @@ export interface BlameLine {
 }
 
 export interface MergeOutcome {
-  /** 'fast-forward' when main had not moved; 'clean' when git merged without conflicts (uncommitted,
-   *  left in the worktree for semantic review); 'conflict' when conflict markers are present */
+  /**
+   * Every merge is recorded as a merge commit (`git merge --no-ff --no-commit` in a detached worktree), so that
+   * `revert -m 1` of the resulting commit undoes the whole proposal and every proposal commit carries a Quorum-Proposal
+   * trailer. The status says how much reconciliation the caller owes:
+   *  - 'fast-forward': main has not moved since the branch point, so NO reconciliation is needed. The merge in the
+   *    worktree is clean and its tree equals the voted branch; the caller skips the merge driver and calls
+   *    `finishMerge` directly (the name is kept for compatibility; the history is no longer a fast-forward);
+   *  - 'clean': main moved and git merged without conflicts; the merge is uncommitted in the worktree for semantic review
+   *    by the merge driver;
+   *  - 'conflict': conflict markers are present (see `conflictedFiles`) and the merge driver must resolve them.
+   */
   status: 'fast-forward' | 'clean' | 'conflict';
-  /** worktree path holding the merge in progress (clean/conflict); null for fast-forward */
+  /** worktree path holding the merge in progress; set for all three statuses */
   worktreePath: string | null;
   /** files with conflicts */
   conflictedFiles: string[];
@@ -65,8 +74,19 @@ export interface RoomRepository {
     meta: CommitMeta,
   ): Promise<Sha>;
 
-  /** Commit whatever is currently modified in a worktree (used after an agent edited files directly). */
-  commitWorktree(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha | null>; // null if clean
+  /**
+   * Commit what is currently modified in a worktree (used after an agent edited files directly); null if clean.
+   * With `paths` (repo-relative file names) ONLY those paths are formatted, staged and committed: anything else that is
+   * dirty or staged in the worktree is left exactly as it is. Callers that edit the main worktree must pass `paths`
+   * and hold `withMainLock` across the edit and the commit (PRD §4.3). Without `paths` everything dirty is committed,
+   * which is right only for a worktree that belongs to one agent (a branch worktree).
+   */
+  commitWorktree(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+    paths?: string[],
+  ): Promise<Sha | null>;
 
   /** Create a branch from `fromRef` (default main) with its own worktree; returns the worktree path. */
   createBranch(branch: string, fromRef?: string): Promise<{ worktreePath: string; baseSha: Sha }>;
@@ -97,16 +117,31 @@ export interface RoomRepository {
   ): Promise<{ removed: number; added: number }>;
 
   /**
-   * Begin merging `branch` into main (call inside withMainLock). Fast-forwards when possible and
-   * returns status 'fast-forward' with main already advanced. Otherwise runs `git merge --no-commit`
-   * in a detached worktree and returns it for review; the caller finishes with `finishMerge`.
+   * Begin merging `branch` into main (call inside withMainLock): runs `git merge --no-ff --no-commit` in a detached
+   * worktree at main's head and returns it (see MergeOutcome.status for what the caller owes); the caller finishes with
+   * `finishMerge` or abandons with `abortMerge`. Main is never touched here. Throws when everything on the branch is
+   * already contained in main. `newMainSha` is always null (kept for compatibility: nothing is fast-forwarded any more).
    */
   beginMerge(branch: string): Promise<MergeOutcome & { newMainSha: Sha | null }>;
-  /** Commit the merge in the worktree (must have no conflict markers) and advance main to it. */
-  finishMerge(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha>;
+  /**
+   * Commit the merge in the worktree (must have no conflict markers) and advance main to it atomically: main's ref and
+   * its checkout move together (`merge --ff-only` in the main worktree, retried briefly on `index.lock`) or not at all.
+   * `opts.paths`, when given, are the only files the merge commit may change relative to main; anything else fails the
+   * merge before it is committed.
+   */
+  finishMerge(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+    opts?: { paths?: string[] },
+  ): Promise<Sha>;
   abortMerge(worktreePath: string): Promise<void>;
 
-  /** git revert on main (call inside withMainLock). Throws RevertConflictError when it conflicts. */
+  /**
+   * git revert on main (call inside withMainLock); a merge commit is reverted against its first parent. Throws
+   * RevertConflictError when it conflicts. Only the files the revert changes are committed, and a failed revert is
+   * aborted without discarding unrelated uncommitted edits in the main worktree.
+   */
   revert(sha: Sha, meta: CommitMeta): Promise<Sha>;
   tag(name: string, message: string, ref?: string): Promise<void>;
 

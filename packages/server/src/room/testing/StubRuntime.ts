@@ -11,6 +11,8 @@ export class StubRuntime implements AgentRuntime {
   proposalEvents: Event[] = [];
   reverted: Array<{ change: Change; revertSha: Sha; byUserId: UserId }> = [];
   started: string[] = [];
+  /** rooms whose session was stopped (stopRoom), in order */
+  stopped: string[] = [];
   digests: Array<{ userId: UserId; events: string[] }> = [];
   mergeDriverCalls: Array<{ proposal: Proposal; optionId: OptionId; worktreePath: string }> = [];
   /** set to make the runtime misbehave */
@@ -33,7 +35,9 @@ export class StubRuntime implements AgentRuntime {
     this.maybeThrow();
     this.started.push(roomId);
   }
-  async stopRoom() {}
+  async stopRoom(roomId: string) {
+    this.stopped.push(roomId);
+  }
   async stopAll() {}
   onChatMessage(_r: string, m: Message) {
     this.maybeThrow();

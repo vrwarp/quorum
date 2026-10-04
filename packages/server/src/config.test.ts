@@ -69,4 +69,43 @@ describe('loadConfig', () => {
     );
     expect(loadConfig({ ...base, QUORUM_CLAUDE_BINARY: 'claude' }).claudeBinary).toBe('claude'); // looked up on the PATH
   });
+  it('caps spend per agent session; the old per-room name is still read, with a warning', () => {
+    expect(loadConfig(base).maxBudgetUsdPerSession).toBe(20);
+    expect(loadConfig(base).warnings).toEqual([]);
+    expect(
+      loadConfig({ ...base, QUORUM_MAX_BUDGET_USD_PER_SESSION: '7.5' }).maxBudgetUsdPerSession,
+    ).toBe(7.5);
+
+    const old = loadConfig({ ...base, QUORUM_MAX_BUDGET_USD_PER_ROOM: '12' });
+    expect(old.maxBudgetUsdPerSession).toBe(12);
+    expect(old.warnings).toHaveLength(1);
+    expect(old.warnings[0]).toMatch(/QUORUM_MAX_BUDGET_USD_PER_ROOM is deprecated.*PER_SESSION/);
+
+    const both = loadConfig({
+      ...base,
+      QUORUM_MAX_BUDGET_USD_PER_ROOM: '12',
+      QUORUM_MAX_BUDGET_USD_PER_SESSION: '3',
+    });
+    expect(both.maxBudgetUsdPerSession).toBe(3); // the new name wins
+    expect(both.warnings[0]).toMatch(/ignored/);
+    expect(() => loadConfig({ ...base, QUORUM_MAX_BUDGET_USD_PER_SESSION: 'lots' })).toThrow(
+      /QUORUM_MAX_BUDGET_USD_PER_SESSION/,
+    );
+    expect(() => loadConfig({ ...base, QUORUM_MAX_BUDGET_USD_PER_ROOM: 'lots' })).toThrow(
+      /QUORUM_MAX_BUDGET_USD_PER_ROOM/,
+    );
+  });
+
+  it('trusts X-Forwarded-For only when told to, and lists the extra WebSocket origins', () => {
+    expect(loadConfig(base).trustProxy).toBe(false);
+    expect(loadConfig({ ...base, QUORUM_TRUST_PROXY: '1' }).trustProxy).toBe(true);
+    expect(loadConfig({ ...base, QUORUM_TRUST_PROXY: '0' }).trustProxy).toBe(false);
+    expect(loadConfig(base).allowedOrigins).toEqual([]);
+    expect(
+      loadConfig({
+        ...base,
+        QUORUM_ALLOWED_ORIGINS: ' https://quorum.example.com , app.example.com:8443,,',
+      }).allowedOrigins,
+    ).toEqual(['https://quorum.example.com', 'app.example.com:8443']);
+  });
 });

@@ -137,4 +137,10 @@ export const migrations: string[] = [
   );
   CREATE INDEX usage_room ON usage (roomId);
   `,
+  // 2: the first registered user is the admin (the one who may manage the server's Claude sign-in). Existing
+  // deployments promote their oldest user.
+  `
+  ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;
+  UPDATE users SET admin = 1 WHERE rowid = (SELECT MIN(rowid) FROM users);
+  `,
 ];

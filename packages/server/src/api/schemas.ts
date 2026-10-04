@@ -45,6 +45,7 @@ export const ClientCommandSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('document.archive'), cid, documentId: id }),
   z.object({ type: z.literal('room.setRule'), cid, votingRule: z.enum(['unanimous', 'majority']) }),
+  z.object({ type: z.literal('room.archive'), cid }),
 ]);
 
 // compile-time check: the schema output must be a valid ClientCommand

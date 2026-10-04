@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Anchor, Change, Message, Proposal } from '@quorum/shared';
 import { openStorage } from './index.js';
-import type { Storage } from '../contracts/storage.js';
+import { migrations } from './schema.js';
+import { SESSION_TTL_MS, type Storage } from '../contracts/storage.js';
 
 let s: Storage;
 beforeEach(() => {
@@ -57,6 +59,63 @@ describe('users and sessions', () => {
     s.sessions.revoke(a.token);
     expect(s.sessions.resolve(a.token)).toBeNull();
     expect(s.sessions.resolve(b.token)).toBe(u.id);
+  });
+
+  it('makes the first user ever created the admin, and nobody else', () => {
+    const first = s.users.create('Ann');
+    const second = s.users.create('Bob');
+    expect(first.admin).toBe(true);
+    expect(second.admin).toBe(false);
+    expect(s.users.get(first.id)!.admin).toBe(true);
+    expect(s.users.findByDisplayName('Bob')!.admin).toBe(false);
+  });
+
+  it('promotes the oldest user when it upgrades a database that predates the admin flag', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quorum-db-'));
+    try {
+      const file = join(dir, 'old.sqlite');
+      const { DatabaseSync } = createRequire(import.meta.url)(
+        'node:sqlite',
+      ) as typeof import('node:sqlite');
+      const old = new DatabaseSync(file);
+      old.exec(migrations[0]!);
+      old.exec('PRAGMA user_version = 1');
+      for (const [id, name] of [
+        ['user_a', 'Ann'],
+        ['user_b', 'Bob'],
+      ])
+        old
+          .prepare('INSERT INTO users (id, displayName, createdAt) VALUES (?, ?, ?)')
+          .run(id!, name!, '2026-01-01T00:00:00.000Z');
+      old.close();
+      const upgraded = openStorage(file);
+      expect(upgraded.users.get('user_a')!.admin).toBe(true);
+      expect(upgraded.users.get('user_b')!.admin).toBe(false);
+      expect(upgraded.users.create('Cy').admin).toBe(false);
+      upgraded.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('expires a session 30 days after it was created, and forgets it', () => {
+    const clock = { now: Date.parse('2026-01-01T00:00:00.000Z') };
+    const timed = openStorage(':memory:', { now: () => new Date(clock.now) });
+    try {
+      const u = timed.users.create('Ann');
+      const a = timed.sessions.create(u.id);
+      clock.now += 7 * 24 * 3600 * 1000;
+      const b = timed.sessions.create(u.id);
+      clock.now = Date.parse('2026-01-01T00:00:00.000Z') + SESSION_TTL_MS - 1;
+      expect(timed.sessions.resolve(a.token)).toBe(u.id);
+      clock.now += 1;
+      expect(timed.sessions.resolve(a.token)).toBeNull(); // 30 days old
+      expect(timed.sessions.resolve(b.token)).toBe(u.id); // a week younger
+      clock.now -= 10 * 24 * 3600 * 1000; // even if the clock went back, the session is gone for good
+      expect(timed.sessions.resolve(a.token)).toBeNull();
+    } finally {
+      timed.close();
+    }
   });
 });
 

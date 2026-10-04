@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -993,6 +993,376 @@ describe('documents and the API surface', () => {
     expect(await api<string>(app, null, `/rooms/${roomId}`)).toMatchObject({ status: 200 });
     expect((await api(app, null, '/settings')).status).toBe(200);
     expect((await api(app, null, '/assets/missing.js')).status).toBe(404);
-    expect((await api(app, null, '/%2e%2e/%2e%2e/etc/passwd')).status).not.toBe(500);
+    // a traversal attempt gets the client's index page (the SPA fallback), never a file from outside the client build
+    const traversal = await api<string>(app, null, '/%2e%2e/%2e%2e/etc/passwd');
+    expect(traversal.status).toBe(200);
+    expect(traversal.body).toContain('<div id="root">');
+    expect(traversal.body).not.toMatch(/root:.*:0:0:/);
+    const encoded = await api<string>(app, null, '/assets/..%2f..%2f..%2f..%2fetc%2fpasswd');
+    expect([400, 404]).toContain(encoded.status);
+    expect(String(encoded.body)).not.toMatch(/root:.*:0:0:/);
+  });
+});
+
+/**
+ * The write path to main, found wanting by the server core review and fixed: real git, real SQLite, real HTTP and
+ * WebSocket, the fake agent runtime. Each test is the scenario from the review, end to end.
+ */
+describe('the write path to main', () => {
+  const worker = { actor: { kind: 'agent', role: 'worker' } as const, triggerMessageIds: [] };
+  const repoOf = (app: App, roomId: string) => app.service.repo(roomId);
+
+  /** an open Quorum proposal for `doc` with one option: a branch of two commits, step one and step two */
+  async function twoStepProposal(app: App, roomId: string, docId: string) {
+    const repo = await repoOf(app, roomId);
+    const { worktreePath, baseSha } = await repo.createBranch('plan/two-steps/a');
+    writeFileSync(path.join(worktreePath, 'Plan.md'), '# Plan\n\nstep one\n');
+    await repo.commitWorktree(worktreePath, 'step 1', worker);
+    writeFileSync(path.join(worktreePath, 'Plan.md'), '# Plan\n\nstep one\n\nstep two\n');
+    await repo.commitWorktree(worktreePath, 'step 2', worker);
+    return app.service.openProposal(roomId, {
+      documentId: docId,
+      kind: 'quorum',
+      title: 'Two steps',
+      branchBase: baseSha,
+      options: [
+        { label: 'A', branch: 'plan/two-steps/a', summary: 'one, then two', tradeoffs: '' },
+      ],
+      triggerMessageIds: [],
+    });
+  }
+
+  it('F1: a proposal of several commits merges as one merge commit, and Revert takes all of it back', async () => {
+    const app = await boot();
+    const [alice, bob] = [await login(app, 'Alice'), await login(app, 'Bob')];
+    const roomId = await createRoom(app, alice);
+    const [a, b] = [await join(app, alice, roomId), await join(app, bob, roomId)];
+    const doc = await createDoc(a, 'Plan');
+    const proposal = await twoStepProposal(app, roomId, doc.id);
+
+    const fromVote = mark();
+    vote(a, proposal, 'A');
+    vote(b, proposal, 'A');
+    const merged = await a.proposal(
+      (p) => p.id === proposal.id && p.state === 'merged',
+      'merged',
+      fromVote,
+    );
+    expect(merged.reconciled).toBe(false); // main had not moved: no merge driver, the voted text exactly
+    const parents = git(app, roomId, 'rev-list', '--parents', '-n1', merged.mergeSha!).split(' ');
+    expect(parents).toHaveLength(3); // a merge commit, not the branch tip
+    expect(git(app, roomId, 'log', '-1', '--format=%B', merged.mergeSha!)).toContain(
+      `Quorum-Proposal: ${proposal.id}`,
+    );
+    expect(await docContent(app, alice, roomId, doc.id)).toBe('# Plan\n\nstep one\n\nstep two\n');
+    // the merged proposal no longer needs its option worktree; the branch stays as history (review F17)
+    await app.service.idle();
+    expect(
+      existsSync(path.join(app.dataDir, 'rooms', roomId, 'worktrees', 'plan__two-steps__a')),
+    ).toBe(false);
+    expect(git(app, roomId, 'branch', '--list', 'plan/two-steps/a')).toContain('plan/two-steps/a');
+    // the change's diff covers the whole proposal, against the real first parent
+    const diff = await api<{ unified: string; baseSha: string; before: string; after: string }>(
+      app,
+      alice,
+      `/api/rooms/${roomId}/changes/${merged.mergeSha}/diff`,
+    );
+    expect(diff.status).toBe(200);
+    expect(diff.body.baseSha).toBe(parents[1]);
+    expect(diff.body.unified).toContain('+step one');
+    expect(diff.body.unified).toContain('+step two');
+
+    const fromRevert = mark();
+    b.send({ type: 'revert.request', cid: 'rv', sha: merged.mergeSha });
+    await a.proposal((p) => p.id === proposal.id && p.state === 'reverted', 'reverted', fromRevert);
+    expect(await docContent(app, alice, roomId, doc.id)).toBe('# Plan\n'); // not "step one"
+    expect(b.errors()).toEqual([]);
+  });
+
+  it('F2: a merge that cannot update the main checkout fails whole, and later commits do not undo it', async () => {
+    const app = await boot();
+    const [alice, bob] = [await login(app, 'Alice'), await login(app, 'Bob')];
+    const roomId = await createRoom(app, alice);
+    const [a, b] = [await join(app, alice, roomId), await join(app, bob, roomId)];
+    const doc = await createDoc(a, 'Architecture');
+    const open = await diverge(a, b);
+    const mainBefore = git(app, roomId, 'rev-parse', 'main');
+    const textBefore = await docContent(app, alice, roomId, doc.id);
+
+    // the orchestrator's `git status` holds the main worktree's index lock for longer than the merge is willing to wait
+    const lock = path.join(
+      app.dataDir,
+      'rooms',
+      roomId,
+      'repo.git',
+      'worktrees',
+      'main',
+      'index.lock',
+    );
+    writeFileSync(lock, '');
+    try {
+      const fromFail = mark();
+      vote(a, open, 'C');
+      vote(b, open, 'C');
+      const reopened = await a.message(
+        (m) => m.kind === 'system' && m.body.includes('failed'),
+        'merge failure announced',
+        fromFail,
+      );
+      expect(reopened.body).toMatch(/could not advance main/);
+      await a.proposal((p) => p.id === open.id && p.state === 'open', 'reopened', fromFail);
+      // main did not move, its checkout agrees with it, and the half-made merge was cleaned away
+      expect(git(app, roomId, 'rev-parse', 'main')).toBe(mainBefore);
+      expect(git(app, roomId, 'worktree', 'list', '--porcelain')).not.toMatch(/worktrees\/merge-/);
+      expect(await docContent(app, alice, roomId, doc.id)).toBe(textBefore);
+    } finally {
+      rmSync(lock, { force: true });
+    }
+    expect(
+      execFileSync('git', ['status', '--porcelain'], {
+        cwd: path.join(app.dataDir, 'rooms', roomId, 'worktrees', 'main'),
+        encoding: 'utf8',
+      }),
+    ).toBe('');
+
+    // an unrelated change goes through; it must not bring back or take away anything
+    await createDoc(a, 'Other');
+    expect(await docContent(app, alice, roomId, doc.id)).toBe(textBefore);
+
+    // a fresh vote tries again, and now it works; the next unrelated change keeps the merged text
+    const fromRetry = mark();
+    vote(b, open, 'C');
+    await a.proposal(
+      (p) => p.id === open.id && p.state === 'merged',
+      'merged on the second try',
+      fromRetry,
+    );
+    const merged = await docContent(app, alice, roomId, doc.id);
+    expect(merged).toContain('## Decision: PostgreSQL with ClickHouse fallback');
+    await createDoc(a, 'More');
+    expect(await docContent(app, alice, roomId, doc.id)).toBe(merged);
+  }, 20_000);
+
+  describe('F4: a proposal a restart found in merging', () => {
+    it('is reopened when nothing reached main, and can then be voted through', async () => {
+      const first = await boot();
+      const [alice, bob] = [await login(first, 'Alice'), await login(first, 'Bob')];
+      const roomId = await createRoom(first, alice);
+      const [a, b] = [await join(first, alice, roomId), await join(first, bob, roomId)];
+      await createDoc(a, 'Architecture');
+      const open = await diverge(a, b);
+      // the process died while the merge was starting: the state says merging, main has nothing
+      first.storage.proposals.setState(open.id, 'merging');
+      await first.close();
+      apps.length = 0;
+
+      const second = await boot(first.dataDir);
+      const state = (await api<RoomState>(second, alice, `/api/rooms/${roomId}/state`)).body;
+      expect(state.proposals.find((p) => p.id === open.id)?.state).toBe('open');
+      expect(
+        state.recentMessages.some((m) => m.kind === 'system' && m.body.includes('interrupted')),
+      ).toBe(true);
+      const [a2, b2] = [await join(second, alice, roomId), await join(second, bob, roomId)];
+      const fromVote = mark();
+      vote(a2, open, 'C');
+      vote(b2, open, 'C');
+      await a2.proposal(
+        (p) => p.id === open.id && p.state === 'merged',
+        'merged after the restart',
+        fromVote,
+      );
+    });
+
+    it('is finished when its merge had reached main: the card, the Change and the milestone appear', async () => {
+      const first = await boot();
+      const [alice, bob] = [await login(first, 'Alice'), await login(first, 'Bob')];
+      const roomId = await createRoom(first, alice);
+      const [a, b] = [await join(first, alice, roomId), await join(first, bob, roomId)];
+      const doc = await createDoc(a, 'Architecture');
+      const open = await diverge(a, b);
+      const option = optionLabeled(open, 'B');
+      // the merge commit is on main (as finishMerge leaves it), but nothing was recorded: the process died right there
+      const repo = await repoOf(first, roomId);
+      const mergeSha = await repo.withMainLock(async () => {
+        const out = await repo.beginMerge(option.branch);
+        return repo.finishMerge(out.worktreePath!, 'Merge option B', {
+          actor: { kind: 'agent', role: 'merge' },
+          triggerMessageIds: [],
+          proposalId: open.id,
+        });
+      });
+      first.storage.proposals.setState(open.id, 'merging');
+      await first.close();
+      apps.length = 0;
+
+      const second = await boot(first.dataDir);
+      const after = (await api<RoomState>(second, alice, `/api/rooms/${roomId}/state`)).body;
+      expect(after.proposals.find((p) => p.id === open.id)).toMatchObject({
+        state: 'merged',
+        mergedOptionId: option.id,
+        mergeSha,
+      });
+      const messages = (
+        await api<Message[]>(second, alice, `/api/rooms/${roomId}/messages?limit=200`)
+      ).body;
+      expect(messages.some((m) => m.card?.type === 'merge' && m.card.sha === mergeSha)).toBe(true);
+      expect(git(second, roomId, 'tag', '-l')).toBe('milestone/1');
+      expect(await docContent(second, alice, roomId, doc.id)).toContain('Decision: ClickHouse');
+      // and it can be reverted like any other merge
+      const a2 = await join(second, alice, roomId);
+      const fromRevert = mark();
+      a2.send({ type: 'revert.request', cid: 'rv', sha: mergeSha });
+      await a2.proposal((p) => p.id === open.id && p.state === 'reverted', 'reverted', fromRevert);
+      expect(await docContent(second, alice, roomId, doc.id)).not.toContain('Decision:');
+    });
+
+    it('a merge in flight is given time when the server stops: the agents are stopped after it, not before', async () => {
+      const app = await boot();
+      const [alice, bob] = [await login(app, 'Alice'), await login(app, 'Bob')];
+      const roomId = await createRoom(app, alice);
+      const [a, b] = [await join(app, alice, roomId), await join(app, bob, roomId)];
+      await createDoc(a, 'Architecture');
+      const open = await diverge(a, b);
+      const fromMove = mark();
+      a.send({ type: 'chat.send', body: 'add a section on deployment' }); // main moves: the merge needs the driver
+      await a.message(isChange, 'change on main', fromMove);
+
+      // a slow merge driver, and a record of what the proposal looked like when the agents were stopped
+      const drive = app.runtime.runMergeDriver.bind(app.runtime);
+      let entered!: () => void;
+      const inDriver = new Promise<void>((r) => (entered = r));
+      app.runtime.runMergeDriver = async (...args) => {
+        entered();
+        await new Promise((r) => setTimeout(r, 700));
+        return drive(...args);
+      };
+      const stopAll = app.runtime.stopAll.bind(app.runtime);
+      let stateWhenAgentsStopped = '';
+      app.runtime.stopAll = async () => {
+        stateWhenAgentsStopped = app.storage.proposals.get(open.id)!.state;
+        return stopAll();
+      };
+      vote(a, open, 'C');
+      vote(b, open, 'C');
+      await inDriver;
+      await app.close();
+      apps.length = 0;
+      expect(stateWhenAgentsStopped).toBe('merged');
+      const second = await boot(app.dataDir);
+      expect(
+        (await api<RoomState>(second, alice, `/api/rooms/${roomId}/state`)).body.proposals.find(
+          (p) => p.id === open.id,
+        )?.state,
+      ).toBe('merged');
+    });
+  });
+
+  it("F3: the orchestrator's unsaved edit in the main worktree is not swept into someone else's change", async () => {
+    const app = await boot();
+    const alice = await login(app, 'Alice');
+    const roomId = await createRoom(app, alice);
+    const a = await join(app, alice, roomId);
+    const plan = await createDoc(a, 'Plan');
+    const mainWorktree = path.join(app.dataDir, 'rooms', roomId, 'worktrees', 'main');
+    writeFileSync(path.join(mainWorktree, 'Plan.md'), '# Plan\n\nhalf-typed by the orchestrator\n');
+
+    await createDoc(a, 'Other');
+    expect(git(app, roomId, 'show', '--name-only', '--format=%s', 'main')).toBe(
+      'Create Other.md\n\nOther.md',
+    );
+    // the edit is still there for the orchestrator to finish, and main has not got it
+    expect(
+      execFileSync('git', ['status', '--porcelain'], { cwd: mainWorktree, encoding: 'utf8' }),
+    ).toBe(' M Plan.md\n');
+    expect(await docContent(app, alice, roomId, plan.id)).toBe('# Plan\n');
+  });
+
+  it.each([['create first'], ['rename first']])(
+    'F9: creating a document while another is renamed to the same name leaves git and the database agreeing (%s)',
+    async (order) => {
+      const app = await boot();
+      const [alice, bob] = [await login(app, 'Alice'), await login(app, 'Bob')];
+      const roomId = await createRoom(app, alice);
+      const [a, b] = [await join(app, alice, roomId), await join(app, bob, roomId)];
+      const plan = await createDoc(a, 'Plan');
+      const create = () => a.send({ type: 'document.create', cid: 'create', title: 'Spec' });
+      const rename = () =>
+        b.send({ type: 'document.rename', cid: 'rename', documentId: plan.id, title: 'Spec' });
+      if (order === 'create first') {
+        create();
+        rename();
+      } else {
+        rename();
+        create();
+      }
+      await Promise.all([
+        a.waitFor(
+          (e) => e.type === 'document.created' && e.document.title === 'Spec',
+          'a hears Spec',
+        ),
+        b.waitFor(
+          (e) => e.type === 'document.created' && e.document.title === 'Spec',
+          'b hears Spec',
+        ),
+      ]);
+      const failed = await Promise.race([
+        a.waitFor((e) => e.type === 'error' && e.inReplyTo === 'create', 'create refused'),
+        b.waitFor((e) => e.type === 'error' && e.inReplyTo === 'rename', 'rename refused'),
+      ]);
+      expect(failed).toMatchObject({ type: 'error', code: 'conflict' });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const state = (await api<RoomState>(app, alice, `/api/rooms/${roomId}/state`)).body;
+      const paths = state.documents.map((d) => d.path).sort();
+      expect(paths).toHaveLength(new Set(paths).size);
+      expect(git(app, roomId, 'ls-tree', '--name-only', 'main').split('\n').sort()).toEqual(paths);
+      for (const d of state.documents) {
+        const content = await docContent(app, alice, roomId, d.id);
+        expect(content, d.path).toMatch(/^# (Plan|Spec)\n$/);
+      }
+      expect(
+        app.storage.documents.list(roomId, true).filter((d) => d.status === 'active'),
+      ).toHaveLength(state.documents.length);
+    },
+  );
+
+  it('a Change keeps its diff after the document is renamed: the path is the one the commit touched', async () => {
+    const app = await boot();
+    const alice = await login(app, 'Alice');
+    const roomId = await createRoom(app, alice);
+    const a = await join(app, alice, roomId);
+    const doc = await createDoc(a, 'Architecture');
+    const from = mark();
+    a.send({ type: 'chat.send', body: 'We should add a section on latency requirements' });
+    const change = await a.message(isChange, 'change card', from);
+    const sha = change.card?.type === 'change' ? change.card.change.sha : '';
+
+    const fromRename = mark();
+    a.send({ type: 'document.rename', documentId: doc.id, title: 'Design' });
+    await a.waitFor(
+      (e) => e.type === 'document.created' && e.document.path === 'Design.md',
+      'renamed',
+      fromRename,
+    );
+
+    const diff = await api<{
+      path: string;
+      baseSha: string;
+      headSha: string;
+      before: string;
+      after: string;
+      unified: string;
+    }>(app, alice, `/api/rooms/${roomId}/changes/${sha}/diff`);
+    expect(diff.status).toBe(200);
+    expect(diff.body.path).toBe('Architecture.md'); // as of that commit, not today's Design.md
+    expect(diff.body.headSha).toBe(sha);
+    expect(diff.body.baseSha).toBe(git(app, roomId, 'rev-parse', `${sha}^1`)); // a sha, never "<sha>~1"
+    expect(diff.body.baseSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(diff.body.before).not.toContain('Latency Requirements');
+    expect(diff.body.after).toContain('## Latency Requirements');
+    expect(diff.body.unified).toContain('+## Latency Requirements');
+    expect(
+      existsSync(path.join(app.dataDir, 'rooms', roomId, 'worktrees', 'main', 'Design.md')),
+    ).toBe(true);
   });
 });

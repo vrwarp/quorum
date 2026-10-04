@@ -49,12 +49,19 @@ function gitEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * Configuration given to every git invocation. `safe.directory=*` because the server sets GIT_CONFIG_NOSYSTEM, which
+ * makes an image-level `safe.directory` setting invisible: without it git refuses repositories whose owner is not the
+ * user running the server (a volume populated by another uid). It is honoured on the command line.
+ */
+export const GIT_BASE_CONFIG = ['-c', 'core.quotepath=false', '-c', 'safe.directory=*'];
+
 /** Run `git <args>` with execFile (no shell). */
 export function runGit(args: string[], opts: GitOptions): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     const child = execFile(
       'git',
-      ['-c', 'core.quotepath=false', ...args],
+      [...GIT_BASE_CONFIG, ...args],
       { cwd: opts.cwd, env: gitEnv(), maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' },
       (err, stdout, stderr) => {
         if (!err) return resolve({ stdout, stderr, code: 0 });

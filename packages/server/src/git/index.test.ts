@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { RevertConflictError, type CommitMeta, type RoomRepository } from '../contracts/git.js';
+import { runGit } from './exec.js';
 import { createGitProvider } from './index.js';
 
 let root: string;
@@ -159,26 +160,52 @@ describe('formatter', () => {
 });
 
 describe('branches and merging', () => {
-  it('creates a branch worktree, fast-forwards main', async () => {
+  it('creates a branch worktree; a branch main has not moved past still merges as a merge commit that Revert undoes whole', async () => {
     const base = await main(repo, { 'A.md': '# A\n\none\n' }, 'Add A');
     const { worktreePath, baseSha } = await repo.createBranch('a/topic/x');
     expect(baseSha).toBe(base);
     expect(worktreePath).toBe(join(root, 'rooms', 'room_test', 'worktrees', 'a__topic__x'));
     expect(await repo.listBranches()).toEqual(['a/topic/x', 'main']);
     writeFileSync(join(worktreePath, 'A.md'), '# A\n\none\n\ntwo\n');
-    const head = (await repo.commitWorktree(worktreePath, 'Branch edit', agent))!;
+    await repo.commitWorktree(worktreePath, 'Branch edit 1', agent);
+    writeFileSync(join(worktreePath, 'A.md'), '# A\n\none\n\ntwo\n\nthree\n');
+    const head = (await repo.commitWorktree(worktreePath, 'Branch edit 2', agent))!;
     expect(await repo.changedFiles(base, 'a/topic/x')).toEqual(['A.md']);
     expect(await repo.mergeBase('main', 'a/topic/x')).toBe(base);
 
+    // main has not moved: 'fast-forward' means no reconciliation is owed, not that history is a straight line
     const out = await repo.withMainLock(() => repo.beginMerge('a/topic/x'));
-    expect(out).toEqual({
-      status: 'fast-forward',
-      newMainSha: head,
-      worktreePath: null,
-      conflictedFiles: [],
-    });
-    expect(await repo.headSha('main')).toBe(head);
-    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\none\n\ntwo\n');
+    expect(out).toMatchObject({ status: 'fast-forward', newMainSha: null, conflictedFiles: [] });
+    expect(out.worktreePath).toMatch(/worktrees\/merge-a__topic__x-/);
+    expect(await repo.headSha('main')).toBe(base); // main is untouched until finishMerge
+    const sha = await repo.withMainLock(() =>
+      repo.finishMerge(out.worktreePath!, 'Merge x', agent, { paths: ['A.md'] }),
+    );
+    expect(await repo.headSha('main')).toBe(sha);
+    expect(existsSync(out.worktreePath!)).toBe(false);
+
+    // a real merge commit: old main first, the branch head second, and exactly the voted tree
+    expect(sh(repo.bareDir, 'rev-list', '--parents', '-n1', sha).trim().split(' ')).toEqual([
+      sha,
+      base,
+      head,
+    ]);
+    expect(sh(repo.bareDir, 'rev-parse', `${sha}^{tree}`)).toBe(
+      sh(repo.bareDir, 'rev-parse', 'a/topic/x^{tree}'),
+    );
+    expect((await repo.show(sha)).trailers.proposalId).toBe('prop_7');
+    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe(
+      '# A\n\none\n\ntwo\n\nthree\n',
+    );
+    expect(sh(repo.mainWorktree, 'status', '--porcelain').trim()).toBe('');
+
+    // Revert (first parent) takes back every commit of the branch, not just the last one
+    await repo.withMainLock(() => repo.revert(sha, user));
+    expect(await repo.readFile('A.md')).toBe('# A\n\none\n');
+
+    // what is already in main cannot be merged again (it would silently merge nothing)
+    await expect(repo.beginMerge('a/topic/x')).rejects.toThrow(/already contained in main/);
+    expect(sh(repo.bareDir, 'worktree', 'list')).not.toContain('merge-');
 
     await repo.removeWorktree('a/topic/x');
     expect(existsSync(worktreePath)).toBe(false);
@@ -362,5 +389,239 @@ describe('history queries', () => {
       'tag milestone/1',
     );
     expect(await repo.headSha('milestone/1')).toBe(c2);
+  });
+});
+
+/** write a base document and a branch that changes it; returns what a merge needs */
+async function branchWithEdit(r: RoomRepository, branch: string, text: string) {
+  const { worktreePath } = await r.createBranch(branch);
+  writeFileSync(join(worktreePath, 'A.md'), text);
+  const head = (await r.commitWorktree(worktreePath, `Edit on ${branch}`, agent))!;
+  return { worktreePath, head };
+}
+
+describe('advancing main (review F2)', () => {
+  it('a merge that cannot update the main checkout fails whole: the ref does not move, a later commit does not undo it', async () => {
+    const r = await createGitProvider(root, { lockRetries: 2, lockRetryDelayMs: 10 }).open(
+      'room_lock',
+    );
+    await main(r, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    const before = (await r.headSha())!;
+    await branchWithEdit(r, 'a/lk/x', '# A\n\nvoted\n');
+    const out = await r.withMainLock(() => r.beginMerge('a/lk/x'));
+
+    // `git status` run by the orchestrator holds the main worktree's index lock for a moment
+    const lock = join(r.bareDir, 'worktrees', 'main', 'index.lock');
+    writeFileSync(lock, '');
+    await expect(
+      r.withMainLock(() => r.finishMerge(out.worktreePath!, 'Merge lk', agent)),
+    ).rejects.toThrow(/could not advance main; merge not applied/);
+    expect(await r.headSha()).toBe(before); // ref and checkout still agree
+    expect(readFileSync(join(r.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nbase\n');
+    rmSync(lock);
+    expect(sh(r.mainWorktree, 'status', '--porcelain').trim()).toBe('');
+    await r.abortMerge(out.worktreePath!);
+
+    // the proposal is merged again (a new vote) and an unrelated commit afterwards keeps the merged text
+    const again = await r.withMainLock(() => r.beginMerge('a/lk/x'));
+    await r.withMainLock(() => r.finishMerge(again.worktreePath!, 'Merge lk', agent));
+    await main(r, { 'Other.md': '# Other\n' }, 'Create Other.md', user);
+    expect(await r.readFile('A.md')).toBe('# A\n\nvoted\n');
+  });
+
+  it('waits out an index.lock that goes away within a moment', async () => {
+    const r = await createGitProvider(root, { lockRetries: 6, lockRetryDelayMs: 40 }).open(
+      'room_wait',
+    );
+    await main(r, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    await branchWithEdit(r, 'a/wt/x', '# A\n\nvoted\n');
+    const out = await r.withMainLock(() => r.beginMerge('a/wt/x'));
+    const lock = join(r.bareDir, 'worktrees', 'main', 'index.lock');
+    writeFileSync(lock, '');
+    setTimeout(() => rmSync(lock, { force: true }), 100);
+    const sha = await r.withMainLock(() => r.finishMerge(out.worktreePath!, 'Merge wt', agent));
+    expect(await r.headSha()).toBe(sha);
+    expect(readFileSync(join(r.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nvoted\n');
+  });
+
+  it('refuses to merge over uncommitted edits to the same file, and keeps them', async () => {
+    await main(repo, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    const before = (await repo.headSha())!;
+    await branchWithEdit(repo, 'a/dirty/x', '# A\n\nvoted\n');
+    const out = await repo.withMainLock(() => repo.beginMerge('a/dirty/x'));
+    writeFileSync(join(repo.mainWorktree, 'A.md'), '# A\n\nbase\n\nhalf-typed edit\n');
+    await expect(
+      repo.withMainLock(() => repo.finishMerge(out.worktreePath!, 'Merge', agent)),
+    ).rejects.toThrow(/could not advance main/);
+    expect(await repo.headSha()).toBe(before);
+    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toContain('half-typed edit');
+  });
+
+  it('keeps unrelated uncommitted files when it does advance', async () => {
+    await main(repo, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    await branchWithEdit(repo, 'a/keep/x', '# A\n\nvoted\n');
+    writeFileSync(join(repo.mainWorktree, 'Scratch.md'), 'orchestrator notes\n');
+    const out = await repo.withMainLock(() => repo.beginMerge('a/keep/x'));
+    await repo.withMainLock(() => repo.finishMerge(out.worktreePath!, 'Merge', agent));
+    expect(readFileSync(join(repo.mainWorktree, 'Scratch.md'), 'utf8')).toBe(
+      'orchestrator notes\n',
+    );
+    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nvoted\n');
+  });
+
+  it('finishMerge refuses a merge that changes files outside the allowed paths', async () => {
+    await main(repo, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    const { worktreePath } = await repo.createBranch('a/scope/x');
+    writeFileSync(join(worktreePath, 'A.md'), '# A\n\nvoted\n');
+    writeFileSync(join(worktreePath, 'Secret.md'), 'another document\n');
+    await repo.commitWorktree(worktreePath, 'Edit two files', agent);
+    const out = await repo.withMainLock(() => repo.beginMerge('a/scope/x'));
+    await expect(
+      repo.withMainLock(() =>
+        repo.finishMerge(out.worktreePath!, 'Merge', agent, { paths: ['A.md'] }),
+      ),
+    ).rejects.toThrow(/Secret\.md, outside A\.md/);
+    await repo.abortMerge(out.worktreePath!);
+    expect(await repo.listFiles()).toEqual(['A.md']);
+  });
+});
+
+describe('never sweeping unrelated uncommitted files (review F3)', () => {
+  it('commitToMain commits only the files it wrote; a staged or dirty neighbour stays as it was', async () => {
+    await main(repo, { 'Plan.md': '# Plan\n', 'ab.md': '# ab\n' }, 'Add docs');
+    writeFileSync(join(repo.mainWorktree, 'Plan.md'), '# Plan\n\norchestrator half-done edit\n');
+    writeFileSync(join(repo.mainWorktree, 'Staged.md'), 'staged by someone\n');
+    sh(repo.mainWorktree, 'add', 'Staged.md');
+    writeFileSync(join(repo.mainWorktree, 'ab.md'), '# ab\n\ndirty\n');
+    const sha = await main(repo, { 'a*.md': '# star\n', 'Other.md': '# Other\n' }, 'Create two');
+    expect(
+      sh(repo.bareDir, 'show', '--name-only', '--format=', sha).trim().split('\n').sort(),
+    ).toEqual(['Other.md', 'a*.md']); // 'ab.md' is not matched by the glob in a literal name
+    expect(readFileSync(join(repo.mainWorktree, 'Plan.md'), 'utf8')).toContain('half-done edit');
+    expect(readFileSync(join(repo.mainWorktree, 'ab.md'), 'utf8')).toContain('dirty');
+    expect(sh(repo.mainWorktree, 'status', '--porcelain')).toContain('?? Staged.md');
+  });
+
+  it('commitWorktree with paths commits only those, formatted; without paths it commits everything', async () => {
+    await main(repo, { 'Plan.md': '# Plan\n' }, 'Add Plan');
+    writeFileSync(join(repo.mainWorktree, 'Plan.md'), '# Plan\n\n*edited*\n');
+    writeFileSync(join(repo.mainWorktree, 'Other.md'), '# Other\n\nnot mine\n');
+    const sha = (await repo.withMainLock(() =>
+      repo.commitWorktree(repo.mainWorktree, 'Edit Plan', agent, ['Plan.md']),
+    ))!;
+    expect(sh(repo.bareDir, 'show', '--name-only', '--format=', sha).trim()).toBe('Plan.md');
+    expect(await repo.readFile('Plan.md')).toBe('# Plan\n\n_edited_\n');
+    expect(sh(repo.mainWorktree, 'status', '--porcelain').trim()).toBe('?? Other.md');
+    expect(await repo.commitWorktree(repo.mainWorktree, 'nothing', agent, ['Plan.md'])).toBeNull();
+    expect(await repo.commitWorktree(repo.mainWorktree, 'nothing', agent, [])).toBeNull();
+    const all = (await repo.commitWorktree(repo.mainWorktree, 'Everything', agent))!;
+    expect(sh(repo.bareDir, 'show', '--name-only', '--format=', all).trim()).toBe('Other.md');
+    await expect(repo.commitWorktree(repo.mainWorktree, 'bad', agent, ['../x.md'])).rejects.toThrow(
+      /invalid path/,
+    );
+  });
+
+  it('a revert commits only what the reverted commit changed and leaves unrelated edits alone', async () => {
+    await main(repo, { 'Plan.md': '# Plan\n' }, 'Add Plan');
+    const notes = await main(repo, { 'Notes.md': '# Notes\n' }, 'notes');
+    writeFileSync(join(repo.mainWorktree, 'Plan.md'), '# Plan\n\norchestrator half-done edit\n');
+    sh(repo.mainWorktree, 'add', 'Plan.md'); // even staged by the orchestrator
+    const rev = await repo.withMainLock(() => repo.revert(notes, user));
+    expect(sh(repo.bareDir, 'show', '--name-only', '--format=', rev).trim()).toBe('Notes.md');
+    expect(readFileSync(join(repo.mainWorktree, 'Plan.md'), 'utf8')).toContain('half-done edit');
+    expect(await repo.readFile('Plan.md')).toBe('# Plan\n');
+  });
+
+  it('a revert that cannot run (the file is being edited) fails without destroying the edit', async () => {
+    await main(repo, { 'Plan.md': '# Plan\n' }, 'Add Plan');
+    const add = await main(repo, { 'Plan.md': '# Plan\n\nadded\n' }, 'add');
+    writeFileSync(join(repo.mainWorktree, 'Plan.md'), '# Plan\n\nadded\n\nin-progress paragraph\n');
+    await expect(repo.withMainLock(() => repo.revert(add, user))).rejects.toThrow(
+      /git revert failed/,
+    );
+    expect(readFileSync(join(repo.mainWorktree, 'Plan.md'), 'utf8')).toContain(
+      'in-progress paragraph',
+    );
+  });
+
+  it('a conflicting revert is aborted and unrelated uncommitted edits survive it', async () => {
+    await main(repo, { 'A.md': '# A\n\none\n', 'Plan.md': '# Plan\n' }, 'Add');
+    const first = await main(repo, { 'A.md': '# A\n\ntwo\n' }, 'one -> two');
+    await main(repo, { 'A.md': '# A\n\nthree\n' }, 'two -> three');
+    writeFileSync(join(repo.mainWorktree, 'Plan.md'), '# Plan\n\nhalf-done\n');
+    writeFileSync(join(repo.mainWorktree, 'Scratch.md'), 'scratch\n');
+    await expect(repo.withMainLock(() => repo.revert(first, user))).rejects.toBeInstanceOf(
+      RevertConflictError,
+    );
+    expect(readFileSync(join(repo.mainWorktree, 'Plan.md'), 'utf8')).toContain('half-done');
+    expect(readFileSync(join(repo.mainWorktree, 'Scratch.md'), 'utf8')).toBe('scratch\n');
+    expect(readFileSync(join(repo.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nthree\n');
+    expect(existsSync(join(repo.bareDir, 'worktrees', 'main', 'REVERT_HEAD'))).toBe(false);
+  });
+});
+
+describe('file names are never options (review F11) and git trusts the data directory', () => {
+  it('commits documents whose names look like command-line options through the real formatter hook', async () => {
+    const dashed = await main(
+      repo,
+      { '-l.md': '# L\n\nSome *text*\n', '--plugin=evil.md': '# E\n', '--check.md': '# C\n' },
+      'Create dashed names',
+      user,
+    );
+    expect((await repo.show(dashed)).files.sort()).toEqual([
+      '--check.md',
+      '--plugin=evil.md',
+      '-l.md',
+    ]);
+    expect(await repo.readFile('-l.md')).toBe('# L\n\nSome _text_\n');
+    // and plain git commits in a worktree take the same route through the hook
+    const { worktreePath } = await repo.createBranch('doc/dash/a');
+    writeFileSync(join(worktreePath, '-x.md'), '# X\n\n*y*\n');
+    sh(worktreePath, 'add', '--', '-x.md');
+    sh(worktreePath, 'commit', '-m', 'raw commit');
+    expect(await repo.readFile('-x.md', 'doc/dash/a')).toBe('# X\n\n_y_\n');
+  });
+
+  it('passes safe.directory=* to every git call, which the server needs because it ignores the system config', async () => {
+    const r = await runGit(['config', '--get-all', 'safe.directory'], { cwd: repo.bareDir });
+    expect(r.stdout.trim()).toBe('*');
+    expect(
+      readFileSync(join(sh(repo.bareDir, 'config', 'core.hooksPath').trim(), 'pre-commit'), 'utf8'),
+    ).toContain("safe.directory='*'");
+  });
+});
+
+describe('opening a repository after a crash (review F17)', () => {
+  it('removes stale merge worktrees and lock files and discards half-finished work in the main worktree', async () => {
+    await main(repo, { 'A.md': '# A\n\nbase\n' }, 'Add A');
+    const { worktreePath: keep } = await repo.createBranch('a/keep/x');
+    const stale = await repo.createDetachedWorktree('merge-a__old-abc123', 'main');
+    writeFileSync(join(repo.mainWorktree, 'A.md'), '# A\n\nhalf-done edit\n');
+    writeFileSync(join(repo.mainWorktree, 'Scratch.md'), 'scratch\n');
+    sh(repo.mainWorktree, 'add', 'Scratch.md');
+    const locks = [
+      join(repo.bareDir, 'worktrees', 'main', 'index.lock'),
+      join(repo.bareDir, 'refs', 'heads', 'main.lock'),
+      join(repo.bareDir, 'HEAD.lock'),
+    ];
+    for (const l of locks) writeFileSync(l, '');
+    // a merge that was in progress in the main worktree when the process died
+    mkdirSync(join(repo.bareDir, 'worktrees', 'main'), { recursive: true });
+    writeFileSync(
+      join(repo.bareDir, 'worktrees', 'main', 'REVERT_HEAD'),
+      `${await repo.headSha()}\n`,
+    );
+
+    const reopened = await createGitProvider(root).open('room_test'); // a new process: a new provider
+    expect(existsSync(stale)).toBe(false);
+    expect(sh(reopened.bareDir, 'worktree', 'list')).not.toContain('merge-');
+    for (const l of locks) expect(existsSync(l), l).toBe(false);
+    expect(existsSync(keep)).toBe(true); // option worktrees are not ours to remove at start
+    expect(sh(reopened.mainWorktree, 'status', '--porcelain').trim()).toBe('');
+    expect(readFileSync(join(reopened.mainWorktree, 'A.md'), 'utf8')).toBe('# A\n\nbase\n');
+    expect(existsSync(join(reopened.mainWorktree, 'Scratch.md'))).toBe(false);
+    // and it works: the next commit contains only itself
+    const sha = await main(reopened, { 'B.md': '# B\n' }, 'Add B');
+    expect(sh(reopened.bareDir, 'show', '--name-only', '--format=', sha).trim()).toBe('B.md');
   });
 });

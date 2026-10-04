@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { chmod, mkdir, readFile as fsReadFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync, type Dirent } from 'node:fs';
+import { chmod, mkdir, readdir, readFile as fsReadFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve, sep } from 'node:path';
 import { TRAILERS, type ActorRef, type Sha } from '@quorum/shared';
 import {
@@ -73,6 +73,19 @@ function worktreeDirName(name: string): string {
 
 const lines = (s: string) => s.split('\n').filter((l) => l.length > 0);
 const nulList = (s: string) => s.split('\0').filter((l) => l.length > 0);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export interface GitRepoOptions {
+  /** how often `finishMerge` retries advancing main when git reports an `index.lock` (default 6) */
+  lockRetries?: number;
+  /** base delay between those retries; attempt n waits n times this (default 100 ms) */
+  lockRetryDelayMs?: number;
+  logger?: (
+    level: 'debug' | 'info' | 'warn' | 'error',
+    msg: string,
+    meta?: Record<string, unknown>,
+  ) => void;
+}
 
 export class GitRoomRepository implements RoomRepository {
   readonly roomId: string;
@@ -84,9 +97,20 @@ export class GitRoomRepository implements RoomRepository {
   private readonly format: MarkdownFormatter;
   private lockTail: Promise<unknown> = Promise.resolve();
   private initPromise: Promise<void> | null = null;
+  private readonly lockRetries: number;
+  private readonly lockRetryDelayMs: number;
+  private readonly logger: NonNullable<GitRepoOptions['logger']>;
 
-  constructor(rootDir: string, roomId: string, formatter?: MarkdownFormatter) {
+  constructor(
+    rootDir: string,
+    roomId: string,
+    formatter?: MarkdownFormatter,
+    opts: GitRepoOptions = {},
+  ) {
     if (!SAFE_NAME.test(roomId)) throw new Error(`invalid room id: ${JSON.stringify(roomId)}`);
+    this.lockRetries = opts.lockRetries ?? 6;
+    this.lockRetryDelayMs = opts.lockRetryDelayMs ?? 100;
+    this.logger = opts.logger ?? (() => undefined);
     this.roomId = roomId;
     this.roomDir = resolve(rootDir, 'rooms', roomId);
     this.bareDir = join(this.roomDir, 'repo.git');
@@ -153,6 +177,8 @@ export class GitRoomRepository implements RoomRepository {
     if (!existsSync(join(this.bareDir, 'HEAD'))) {
       await this.git(['init', '--bare', '--initial-branch=main', this.bareDir], this.roomDir);
     }
+    // Nothing of ours is running yet, so any lock file is the remains of a crash.
+    await this.removeStaleLocks();
 
     // hook + repo-level config (rewritten every time so a moved node_modules heals itself)
     await mkdir(this.hooksDir, { recursive: true });
@@ -194,6 +220,62 @@ export class GitRoomRepository implements RoomRepository {
       await rm(this.mainWorktree, { recursive: true, force: true });
       await this.git(['worktree', 'add', this.mainWorktree, 'main']);
     }
+    await this.discardLeftovers();
+  }
+
+  /** Remove `*.lock` files a crashed git process left in the repository (HEAD, refs, per-worktree index and HEAD). */
+  private async removeStaleLocks(): Promise<void> {
+    const found: string[] = [];
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      let entries: Dirent[];
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) {
+          if (depth < 6) await walk(p, depth + 1);
+        } else if (e.name.endsWith('.lock')) found.push(p);
+      }
+    };
+    for (const name of ['HEAD.lock', 'packed-refs.lock', 'config.lock', 'shallow.lock'])
+      if (existsSync(join(this.bareDir, name))) found.push(join(this.bareDir, name));
+    await walk(join(this.bareDir, 'refs'), 0);
+    await walk(join(this.bareDir, 'worktrees'), 0);
+    for (const p of found) {
+      this.logger('warn', 'removing a stale git lock file', { room: this.roomId, path: p });
+      await rm(p, { force: true });
+    }
+  }
+
+  /**
+   * A crash can leave a merge worktree behind and half-finished work in the main worktree (an edit, a revert, a merge).
+   * The next commit would sweep that up, so it is discarded now: nothing is running that could still own it.
+   */
+  private async discardLeftovers(): Promise<void> {
+    let names: string[] = [];
+    try {
+      names = await readdir(this.worktreesDir);
+    } catch {
+      /* no worktrees directory yet */
+    }
+    for (const name of names) {
+      if (!name.startsWith('merge-')) continue;
+      this.logger('warn', 'removing a stale merge worktree', { room: this.roomId, worktree: name });
+      await this.removeDir(join(this.worktreesDir, name));
+    }
+    const dirty = (await this.gitTry(['status', '--porcelain'], this.mainWorktree)).stdout.trim();
+    if (dirty) {
+      this.logger('warn', 'discarding uncommitted changes left in the main worktree', {
+        room: this.roomId,
+        status: dirty.split('\n').slice(0, 10),
+      });
+    }
+    // also ends a merge or revert the crash interrupted, whether or not it left changes behind
+    await this.gitTry(['reset', '--hard', '--quiet', 'HEAD'], this.mainWorktree);
+    await this.gitTry(['clean', '-fdq'], this.mainWorktree);
   }
 
   // ---- commits ----
@@ -210,6 +292,29 @@ export class GitRoomRepository implements RoomRepository {
 
   private async hasStaged(cwd: string): Promise<boolean> {
     return (await this.gitTry(['diff', '--cached', '--quiet'], cwd)).code !== 0;
+  }
+
+  /**
+   * Stage exactly `paths` in `cwd` (new, modified and deleted files alike) and unstage everything else, so a commit
+   * made right after contains those files only. Other dirty files keep their changes in the working tree, untouched.
+   * Paths are literal file names: no globs, no pathspec magic.
+   */
+  private async stagePaths(cwd: string, paths: string[]): Promise<void> {
+    if (paths.length > 0) {
+      const tracked = new Set(
+        nulList(await this.out(['--literal-pathspecs', 'ls-files', '-z', '--', ...paths], cwd)),
+      );
+      // `git add` refuses a pathspec that matches nothing (deleting a file that is already gone)
+      const known = paths.filter((p) => tracked.has(p) || existsSync(join(cwd, p)));
+      if (known.length > 0)
+        await this.git(['--literal-pathspecs', 'add', '-A', '--', ...known], cwd);
+    }
+    const wanted = new Set(paths);
+    const extra = nulList(
+      await this.out(['diff', '--cached', '--name-only', '-z', '--no-renames'], cwd),
+    ).filter((f) => !wanted.has(f));
+    if (extra.length > 0)
+      await this.git(['--literal-pathspecs', 'reset', '-q', '--', ...extra], cwd);
   }
 
   /** Commit the index in `cwd` with trailers; returns the new HEAD sha. */
@@ -256,8 +361,10 @@ export class GitRoomRepository implements RoomRepository {
     subject: string,
     meta: CommitMeta,
   ): Promise<Sha> {
+    const paths: string[] = [];
     for (const [rawPath, content] of Object.entries(files)) {
       const path = safePath(rawPath);
+      paths.push(path);
       const abs = join(this.mainWorktree, path);
       if (content === null) {
         await rm(abs, { force: true });
@@ -266,7 +373,8 @@ export class GitRoomRepository implements RoomRepository {
       await mkdir(dirname(abs), { recursive: true });
       await writeFile(abs, path.endsWith('.md') ? await this.format(content) : content, 'utf8');
     }
-    await this.git(['add', '-A'], this.mainWorktree);
+    // only the files this call wrote: the orchestrator's unrelated uncommitted edits never ride along
+    await this.stagePaths(this.mainWorktree, paths);
     if (!(await this.hasStaged(this.mainWorktree))) throw new Error('nothing to commit');
     return this.commit(this.mainWorktree, subject, meta);
   }
@@ -275,11 +383,19 @@ export class GitRoomRepository implements RoomRepository {
     worktreePath: string,
     subject: string,
     meta: CommitMeta,
+    paths?: string[],
   ): Promise<Sha | null> {
     const cwd = resolve(worktreePath);
     if (cwd !== this.mainWorktree) this.assertWorktree(cwd);
-    await this.formatDirtyMarkdown(cwd);
-    await this.git(['add', '-A'], cwd);
+    if (paths) {
+      const only = [...new Set(paths.map(safePath))];
+      if (only.length === 0) return null;
+      await this.formatMarkdownFiles(cwd, only);
+      await this.stagePaths(cwd, only);
+    } else {
+      await this.formatDirtyMarkdown(cwd);
+      await this.git(['add', '-A'], cwd);
+    }
     if (!(await this.hasStaged(cwd))) return null;
     return this.commit(cwd, subject, meta);
   }
@@ -500,49 +616,67 @@ export class GitRoomRepository implements RoomRepository {
     return nulList(await this.out(['diff', '--name-only', '-z', '--diff-filter=U'], cwd));
   }
 
-  private async fastForwardMain(newSha: Sha, oldSha: Sha): Promise<void> {
-    await this.git(['update-ref', 'refs/heads/main', newSha, oldSha]);
-    await this.git(['reset', '--hard'], this.mainWorktree);
+  /**
+   * Move `refs/heads/main` and the main worktree from `oldSha` to its descendant `newSha`, together or not at all:
+   * `merge --ff-only` in the main worktree updates the checkout first and the ref only when that worked (a ref that
+   * moved without its checkout would make the next commit silently undo the merge). A concurrent git process holding
+   * `index.lock` (the orchestrator running `git status`, say) is waited out for a moment. Unrelated uncommitted edits
+   * survive; edits to files the merge changes make it fail.
+   */
+  private async advanceMain(newSha: Sha, oldSha: Sha): Promise<void> {
+    const head = (await this.out(['rev-parse', 'HEAD'], this.mainWorktree)).trim();
+    if (head !== oldSha) {
+      throw new Error(
+        `main moved while merging; merge not applied (main is at ${head.slice(0, 8)}, expected ${oldSha.slice(0, 8)})`,
+      );
+    }
+    let failure = '';
+    for (let attempt = 0; attempt <= this.lockRetries; attempt++) {
+      const r = await this.gitTry(['merge', '--ff-only', '--quiet', newSha], this.mainWorktree);
+      if (r.code === 0) return;
+      failure = (r.stderr.trim() || r.stdout.trim()).split('\n').slice(0, 3).join(' ');
+      if (!/index\.lock/.test(failure + r.stderr) || attempt === this.lockRetries) break;
+      await sleep(this.lockRetryDelayMs * (attempt + 1));
+    }
+    // git only moves the ref after the checkout worked; make sure of it anyway, a diverged pair is the worst outcome
+    if ((await this.headSha('main')) === newSha)
+      await this.gitTry(['update-ref', 'refs/heads/main', oldSha, newSha]);
+    throw new Error(`could not advance main; merge not applied: ${failure}`);
+  }
+
+  private async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    return (await this.gitTry(['merge-base', '--is-ancestor', ancestor, descendant])).code === 0;
   }
 
   async beginMerge(branch: string): Promise<MergeOutcome & { newMainSha: Sha | null }> {
     assertBranch(branch);
     const branchSha = await this.revParse(`refs/heads/${branch}`);
     const mainSha = await this.revParse('refs/heads/main');
-    const isAncestor = async (a: string, b: string) =>
-      (await this.gitTry(['merge-base', '--is-ancestor', a, b])).code === 0;
-
-    if (await isAncestor(mainSha, branchSha)) {
-      if (branchSha !== mainSha) await this.fastForwardMain(branchSha, mainSha);
-      return {
-        status: 'fast-forward',
-        newMainSha: branchSha,
-        worktreePath: null,
-        conflictedFiles: [],
-      };
-    }
-    if (await isAncestor(branchSha, mainSha)) {
-      // everything on the branch is already in main
-      return {
-        status: 'fast-forward',
-        newMainSha: mainSha,
-        worktreePath: null,
-        conflictedFiles: [],
-      };
-    }
+    if (await this.isAncestor(branchSha, mainSha))
+      throw new Error(`branch ${branch} is already contained in main; there is nothing to merge`);
+    // When main has not moved since the branch point the merge needs no reconciliation, but it is still a real merge
+    // commit: Revert (`-m 1`) then undoes the whole branch, not just its last commit.
+    const noReconciliation = (await this.mergeBase(mainSha, branchSha)) === mainSha;
 
     const name = `merge-${worktreeDirName(branch)}-${randomBytes(3).toString('hex')}`;
     const worktreePath = await this.createDetachedWorktree(name, mainSha);
-    const r = await this.gitTry(['merge', '--no-commit', '--no-ff', branchSha], worktreePath);
-    const conflicted = await this.conflictedFiles(worktreePath);
-    if (conflicted.length > 0) {
-      return { status: 'conflict', newMainSha: null, worktreePath, conflictedFiles: conflicted };
-    }
-    if (r.code !== 0) {
+    try {
+      const r = await this.gitTry(['merge', '--no-commit', '--no-ff', branchSha], worktreePath);
+      const conflicted = await this.conflictedFiles(worktreePath);
+      if (conflicted.length > 0) {
+        return { status: 'conflict', newMainSha: null, worktreePath, conflictedFiles: conflicted };
+      }
+      if (r.code !== 0) throw new Error(`git merge failed: ${r.stderr.trim() || r.stdout.trim()}`);
+    } catch (err) {
       await this.removeDir(worktreePath);
-      throw new Error(`git merge failed: ${r.stderr.trim() || r.stdout.trim()}`);
+      throw err;
     }
-    return { status: 'clean', newMainSha: null, worktreePath, conflictedFiles: [] };
+    return {
+      status: noReconciliation ? 'fast-forward' : 'clean',
+      newMainSha: null,
+      worktreePath,
+      conflictedFiles: [],
+    };
   }
 
   private async removeDir(path: string): Promise<void> {
@@ -551,7 +685,12 @@ export class GitRoomRepository implements RoomRepository {
     await this.git(['worktree', 'prune']);
   }
 
-  async finishMerge(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha> {
+  async finishMerge(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+    opts?: { paths?: string[] },
+  ): Promise<Sha> {
     const cwd = this.assertWorktree(worktreePath);
     // files the merge left unmerged may have been resolved in the working tree without `git add`
     const unmerged = await this.conflictedFiles(cwd);
@@ -566,15 +705,22 @@ export class GitRoomRepository implements RoomRepository {
 
     const oldMain = (await this.out(['rev-parse', 'HEAD'], cwd)).trim();
     await this.formatDirtyMarkdown(cwd);
-    await this.git(['add', '-A'], cwd);
+    // tracked files only: what git merged plus what the merge driver edited or resolved; stray new files stay out
+    await this.git(['add', '-u'], cwd);
     if ((await this.conflictedFiles(cwd)).length > 0)
       throw new Error('merge still has unresolved conflicts');
-    const sha = await this.commit(cwd, subject, meta);
-    try {
-      await this.fastForwardMain(sha, oldMain);
-    } catch (err) {
-      throw new Error(`main moved while merging; merge not applied: ${(err as Error).message}`);
+    if (opts?.paths) {
+      const allowed = new Set(opts.paths.map(safePath));
+      const stray = nulList(
+        await this.out(['diff', '--cached', '--name-only', '-z', '--no-renames', 'HEAD'], cwd),
+      ).filter((f) => !allowed.has(f));
+      if (stray.length > 0)
+        throw new Error(
+          `the merge changes ${stray.join(', ')}, outside ${[...allowed].join(', ')}; merge not applied`,
+        );
     }
+    const sha = await this.commit(cwd, subject, meta);
+    await this.advanceMain(sha, oldMain);
     await this.removeDir(cwd);
     return sha;
   }
@@ -591,31 +737,39 @@ export class GitRoomRepository implements RoomRepository {
     const target = await this.revParse(sha);
     const parents =
       (await this.out(['rev-list', '--parents', '-n', '1', target])).trim().split(/\s+/).length - 1;
+    if (parents === 0) throw new Error(`cannot revert the root commit ${target}`);
+    // The revert changes exactly what the commit changed against its first parent; nothing else is committed.
+    const intended = nulList(
+      await this.out(['diff', '--name-only', '-z', '--no-renames', `${target}^1`, target]),
+    );
     const args = ['revert', '--no-commit'];
     if (parents > 1) args.push('-m', '1');
     args.push(target);
     const r = await this.gitTry(args, this.mainWorktree);
     if (r.code !== 0) {
       const conflicted = await this.conflictedFiles(this.mainWorktree);
+      // `--abort` undoes the revert and keeps unrelated uncommitted edits (a hard reset would destroy them)
       await this.gitTry(['revert', '--abort'], this.mainWorktree);
-      await this.gitTry(['reset', '--hard', 'HEAD'], this.mainWorktree);
       if (conflicted.length > 0) throw new RevertConflictError(target, conflicted);
       throw new Error(`git revert failed: ${r.stderr.trim() || r.stdout.trim()}`);
     }
-    await this.formatDirtyMarkdown(this.mainWorktree);
-    await this.git(['add', '-A'], this.mainWorktree);
-    if (!(await this.hasStaged(this.mainWorktree))) {
+    try {
+      await this.formatMarkdownFiles(this.mainWorktree, intended);
+      await this.stagePaths(this.mainWorktree, intended);
+      if (!(await this.hasStaged(this.mainWorktree)))
+        throw new Error(`revert of ${target} produced no changes`);
+      const original = await this.show(target);
+      return await this.commit(
+        this.mainWorktree,
+        `Revert "${original.subject}"`,
+        meta,
+        `This reverts commit ${target}.`,
+        { reverts: target },
+      );
+    } catch (err) {
       await this.gitTry(['revert', '--abort'], this.mainWorktree);
-      throw new Error(`revert of ${target} produced no changes`);
+      throw err;
     }
-    const original = await this.show(target);
-    return this.commit(
-      this.mainWorktree,
-      `Revert "${original.subject}"`,
-      meta,
-      `This reverts commit ${target}.`,
-      { reverts: target },
-    );
   }
 
   async tag(name: string, message: string, ref = 'main'): Promise<void> {

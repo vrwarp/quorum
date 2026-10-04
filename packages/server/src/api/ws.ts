@@ -1,11 +1,12 @@
 import type { Server } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { ServerEvent } from '@quorum/shared';
+import type { ClientCommand, ServerEvent } from '@quorum/shared';
 import type { Storage } from '../contracts/index.js';
 import type { Hub, Logger } from '../room/types.js';
 import { RoomError } from '../room/types.js';
 import { createAuth } from './auth.js';
+import { originAllowed } from './net.js';
 import { parseClientCommand } from './schemas.js';
 
 export interface WsOptions {
@@ -13,6 +14,8 @@ export interface WsOptions {
   storage: Pick<Storage, 'users' | 'sessions' | 'rooms'>;
   logger?: Logger;
   pingIntervalMs?: number;
+  /** Origins (beyond the server's own host) whose pages may open a socket: `QUORUM_ALLOWED_ORIGINS` */
+  allowedOrigins?: readonly string[];
 }
 
 export interface WsHandle {
@@ -23,6 +26,17 @@ export interface WsHandle {
    */
   close(graceMs?: number): Promise<void>;
 }
+
+/**
+ * Commands that wait for the main write lock, which a merge holds for as long as the merge driver runs (minutes). They
+ * run outside the socket's command queue, so the sender's chat, votes and suggestions are not frozen behind them.
+ */
+const LOCK_TAKING: ReadonlySet<ClientCommand['type']> = new Set([
+  'revert.request',
+  'document.create',
+  'document.rename',
+  'document.archive',
+]);
 
 function reject(socket: Duplex, status: number, text: string): void {
   socket.write(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -36,6 +50,8 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
   const auth = createAuth({ storage, config: { password: null } });
   const alive = new WeakMap<WebSocket, boolean>();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024 });
+  /** lock-taking commands still running: shutdown waits a moment for them before the database closes */
+  const inflight = new Set<Promise<void>>();
 
   server.on('upgrade', (req, socket, head) => {
     let url: URL;
@@ -45,10 +61,26 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
       return reject(socket, 400, 'Bad Request');
     }
     if (url.pathname !== '/ws') return reject(socket, 404, 'Not Found');
-    const session = auth.userFromRequest(req);
+    // A page on another origin must not be able to open a socket with the visitor's cookie.
+    if (!originAllowed(req.headers.origin, req.headers.host, opts.allowedOrigins))
+      return reject(socket, 403, 'Forbidden');
+    // the token may also come in the query string here: a browser cannot set headers on a WebSocket
+    const session = auth.userFromRequest(req, { allowQueryToken: true });
     if (!session) return reject(socket, 401, 'Unauthorized');
     const roomId = url.searchParams.get('roomId');
-    if (!roomId || !storage.rooms.get(roomId)) return reject(socket, 404, 'Not Found');
+    const room = roomId ? storage.rooms.get(roomId) : null;
+    if (!roomId || !room) return reject(socket, 404, 'Not Found');
+    if (room.archivedAt) {
+      // Accepted and then told why: a browser cannot read the status of a refused upgrade, only that it failed.
+      return wss.handleUpgrade(req, socket, head, (ws) => {
+        sendEvent(ws, {
+          type: 'error',
+          code: 'room_archived',
+          message: 'This room is archived and can no longer be joined.',
+        });
+        ws.close(1008, 'room archived');
+      });
+    }
     wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws, roomId, session.user.id));
   });
 
@@ -80,7 +112,21 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
         ws.close(1011, 'connect failed');
       });
 
-    // commands are processed in order per socket
+    /** Run one command; whatever goes wrong is reported to the sender under the command's `cid`. */
+    const run = async (cmd: ClientCommand, cid: string | undefined): Promise<void> => {
+      try {
+        await service.handle(roomId, userId, cmd);
+      } catch (err) {
+        if (!(err instanceof RoomError))
+          log('error', 'command failed', {
+            type: cmd.type,
+            err: String((err as Error)?.stack ?? err),
+          });
+        sendEvent(ws, errorEvent(err, cid));
+      }
+    };
+
+    // commands are processed in order per socket, except the ones that may wait for the main write lock
     let queue: Promise<void> = ready;
     ws.on('message', (data, isBinary) => {
       if (isBinary)
@@ -98,18 +144,16 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
           ...(parsed.cid ? { inReplyTo: parsed.cid } : {}),
         });
       }
+      if (LOCK_TAKING.has(parsed.cmd.type)) {
+        const job: Promise<void> = ready
+          .then(() => (closed ? undefined : run(parsed.cmd, parsed.cid)))
+          .finally(() => inflight.delete(job));
+        inflight.add(job);
+        return;
+      }
       queue = queue.then(async () => {
         if (closed) return;
-        try {
-          await service.handle(roomId, userId, parsed.cmd);
-        } catch (err) {
-          if (!(err instanceof RoomError))
-            log('error', 'command failed', {
-              type: parsed.cmd.type,
-              err: String((err as Error)?.stack ?? err),
-            });
-          sendEvent(ws, errorEvent(err, parsed.cid));
-        }
+        await run(parsed.cmd, parsed.cid);
       });
     });
 
@@ -157,6 +201,15 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
       const force = setTimeout(() => sockets.forEach((ws) => ws.terminate()), graceMs);
       await Promise.all(closed);
       clearTimeout(force);
+      // a revert or document change still waiting for the main lock gets a moment to finish before storage closes
+      if (inflight.size > 0) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          Promise.allSettled([...inflight]),
+          new Promise((resolve) => (timer = setTimeout(resolve, 5_000))),
+        ]);
+        clearTimeout(timer);
+      }
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     },
   };

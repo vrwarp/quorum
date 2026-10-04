@@ -11,6 +11,8 @@ import {
 interface FakeCommit {
   sha: string;
   parent: string | null;
+  /** second parent of a merge commit */
+  mergeParent?: string | null;
   files: Record<string, string>;
   subject: string;
   meta: CommitMeta | null;
@@ -29,6 +31,10 @@ export class FakeRepository implements RoomRepository {
   private chain: Promise<unknown> = Promise.resolve();
   private pendingMerge: { branch: string; worktree: string } | null = null;
   aborted: string[] = [];
+  /** branches whose worktrees were removed (removeWorktree), in order */
+  removedWorktrees: string[] = [];
+  /** paths passed to finishMerge's `opts.paths`, in order */
+  finishMergePaths: Array<string[] | undefined> = [];
 
   constructor(readonly roomId: string) {}
 
@@ -37,15 +43,16 @@ export class FakeRepository implements RoomRepository {
     files: Record<string, string>,
     subject: string,
     meta: CommitMeta | null,
+    mergeParent: string | null = null,
   ): string {
     const sha = `c${String(++this.seq).padStart(6, '0')}`;
-    this.commits.set(sha, { sha, parent, files, subject, meta });
+    this.commits.set(sha, { sha, parent, mergeParent, files, subject, meta });
     return sha;
   }
   private resolve(ref: string): string | null {
     if (this.refs.has(ref)) return this.refs.get(ref)!;
     if (this.commits.has(ref)) return ref;
-    const m = /^(.*)~1$/.exec(ref);
+    const m = /^(.*?)(?:~1|\^1?)$/.exec(ref);
     if (m) {
       const base = this.resolve(m[1]!);
       return base ? (this.commits.get(base)?.parent ?? null) : null;
@@ -58,9 +65,14 @@ export class FakeRepository implements RoomRepository {
   }
   private ancestors(sha: string | null): Set<string> {
     const out = new Set<string>();
-    while (sha) {
-      out.add(sha);
-      sha = this.commits.get(sha)?.parent ?? null;
+    const todo = sha ? [sha] : [];
+    while (todo.length > 0) {
+      const next = todo.pop()!;
+      if (out.has(next)) continue;
+      out.add(next);
+      const c = this.commits.get(next);
+      if (c?.parent) todo.push(c.parent);
+      if (c?.mergeParent) todo.push(c.mergeParent);
     }
     return out;
   }
@@ -130,7 +142,9 @@ export class FakeRepository implements RoomRepository {
     this.refs.set(branch, base);
     return { worktreePath: `/fake/wt/${branch}`, baseSha: base };
   }
-  async removeWorktree() {}
+  async removeWorktree(branch: string) {
+    this.removedWorktrees.push(branch);
+  }
   async listBranches() {
     return [...this.refs.keys()];
   }
@@ -185,10 +199,14 @@ export class FakeRepository implements RoomRepository {
     return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((k) => a[k] !== b[k]).sort();
   }
   async mergeBase(a: string, b: string) {
-    const anc = this.ancestors(this.resolve(a));
-    let sha = this.resolve(b);
-    while (sha && !anc.has(sha)) sha = this.commits.get(sha)!.parent;
-    return sha!;
+    // like git: the best common ancestor, i.e. a common ancestor that is not an ancestor of another one
+    const ancA = this.ancestors(this.resolve(a));
+    const ancB = this.ancestors(this.resolve(b));
+    const common = [...ancA].filter((x) => ancB.has(x));
+    const best = common.filter((x) => !common.some((y) => y !== x && this.ancestors(y).has(x)));
+    if (best.length === 0) throw new Error('no common ancestor');
+    // prefer the most recently created when criss-cross merges leave several
+    return best.sort().at(-1)!;
   }
   async rewrittenLineCount() {
     return { removed: 0, added: 0 };
@@ -198,20 +216,25 @@ export class FakeRepository implements RoomRepository {
     this.assertLocked();
     const main = this.refs.get('main')!;
     const head = this.resolve(branch)!;
-    if (this.ancestors(head).has(main)) {
-      this.refs.set('main', head);
-      return { status: 'fast-forward', worktreePath: null, conflictedFiles: [], newMainSha: head };
-    }
+    if (this.ancestors(main).has(head))
+      throw new Error(`branch ${branch} is already contained in main; there is nothing to merge`);
+    // like the real repository: always a merge in a worktree; 'fast-forward' = main has not moved, no reconciliation
     this.pendingMerge = { branch, worktree: `/fake/merge/${branch}` };
     return {
-      status: 'clean',
+      status: this.ancestors(head).has(main) ? 'fast-forward' : 'clean',
       worktreePath: this.pendingMerge.worktree,
       conflictedFiles: [],
       newMainSha: null,
     };
   }
-  async finishMerge(worktreePath: string, subject: string, meta: CommitMeta) {
+  async finishMerge(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+    opts?: { paths?: string[] },
+  ) {
     this.assertLocked();
+    this.finishMergePaths.push(opts?.paths);
     if (!this.pendingMerge || this.pendingMerge.worktree !== worktreePath)
       throw new Error('no merge in progress');
     const main = this.refs.get('main')!;
@@ -221,10 +244,14 @@ export class FakeRepository implements RoomRepository {
     const next = { ...this.commits.get(main)!.files };
     for (const k of new Set([...Object.keys(baseFiles), ...Object.keys(branchFiles)])) {
       if (baseFiles[k] === branchFiles[k]) continue;
+      if (opts?.paths && !opts.paths.includes(k))
+        throw new Error(
+          `the merge changes ${k}, outside ${opts.paths.join(', ')}; merge not applied`,
+        );
       if (branchFiles[k] === undefined) delete next[k];
       else next[k] = branchFiles[k]!;
     }
-    const sha = this.newCommit(main, next, subject, meta);
+    const sha = this.newCommit(main, next, subject, meta, this.resolve(this.pendingMerge.branch));
     this.refs.set('main', sha);
     this.pendingMerge = null;
     return sha;

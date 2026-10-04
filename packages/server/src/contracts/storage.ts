@@ -42,7 +42,12 @@ export interface User {
   id: UserId;
   displayName: string;
   createdAt: string;
+  /** true for the first registered user only: the one who may manage the server's Claude sign-in */
+  admin: boolean;
 }
+
+/** Login sessions expire this long after they were created (the cookie's Max-Age is the same). */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface UserRepo {
   create(displayName: string): User;
@@ -53,6 +58,7 @@ export interface UserRepo {
 export interface SessionRepo {
   /** auth tokens -> user */
   create(userId: UserId): { token: string; userId: UserId };
+  /** null for an unknown token and for one older than SESSION_TTL_MS (which is also forgotten) */
   resolve(token: string): UserId | null;
   revoke(token: string): void;
 }
