@@ -299,6 +299,7 @@ export class RoomService implements RoomActions, Hub {
       proposals: [...live, ...closed],
       recentMessages,
       agentStatus: this.agentStatus.get(roomId)?.status ?? 'idle',
+      agentDetail: this.agentStatus.get(roomId)?.detail ?? null,
     };
   }
 
@@ -329,6 +330,17 @@ export class RoomService implements RoomActions, Hub {
     this.broadcast(roomId, { type: 'room.updated', room: this.requireRoom(roomId) });
     this.systemMessage(roomId, `${this.actorName(userId)} changed the voting rule to ${rule}.`);
     this.evaluateAll(roomId);
+  }
+
+  /** Owner-only. Archives the room; connected clients get room.updated with archivedAt set. */
+  async archiveRoom(roomId: RoomId, userId: UserId): Promise<void> {
+    const room = this.requireRoom(roomId);
+    if (room.ownerId !== userId)
+      throw new RoomError('forbidden', 'only the room owner can archive the room');
+    if (room.archivedAt) return;
+    this.storage.rooms.archive(roomId);
+    this.systemMessage(roomId, `${this.actorName(userId)} archived the room.`);
+    this.broadcast(roomId, { type: 'room.updated', room: this.requireRoom(roomId) });
   }
 
   private actorName(userId: UserId): string {
@@ -592,6 +604,8 @@ export class RoomService implements RoomActions, Hub {
         return this.archiveDocument(roomId, userId, cmd.documentId);
       case 'room.setRule':
         return this.setVotingRule(roomId, userId, cmd.votingRule);
+      case 'room.archive':
+        return this.archiveRoom(roomId, userId);
       default: {
         const never: never = cmd;
         throw new RoomError('invalid', `unknown command ${(never as { type?: string })?.type}`);

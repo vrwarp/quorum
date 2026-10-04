@@ -44,7 +44,8 @@ export type ClientCommand =
   | { type: 'document.create'; cid?: string; title: string }
   | { type: 'document.rename'; cid?: string; documentId: DocumentId; title: string }
   | { type: 'document.archive'; cid?: string; documentId: DocumentId }
-  | { type: 'room.setRule'; cid?: string; votingRule: VotingRule };
+  | { type: 'room.setRule'; cid?: string; votingRule: VotingRule }
+  | { type: 'room.archive'; cid?: string };
 
 /**
  * HTTP API (JSON). Auth: POST /api/login sets an httpOnly cookie `quorum_session`; the same token is

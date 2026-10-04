@@ -71,6 +71,7 @@ function snapshot(over: Partial<RoomState> = {}): RoomState {
     proposals: [],
     recentMessages: [msg('m1', 1), msg('m2', 2)],
     agentStatus: 'idle',
+    agentDetail: null,
     ...over,
   };
 }

@@ -66,4 +66,6 @@ export interface RoomState {
   proposals: Proposal[];
   recentMessages: Message[];
   agentStatus: 'idle' | 'thinking' | 'unavailable';
+  /** human-readable reason for the current agent status (e.g. "Sign in to Claude in Settings") */
+  agentDetail: string | null;
 }

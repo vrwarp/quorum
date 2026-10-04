@@ -134,6 +134,7 @@ export function createStubActions(opts: StubOptions): StubActions {
         proposals,
         recentMessages: messages.slice(-200),
         agentStatus: 'idle',
+        agentDetail: null,
       };
     },
     async getDocument(_room, documentId) {
