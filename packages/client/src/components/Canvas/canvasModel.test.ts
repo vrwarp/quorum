@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { textHash } from '@quorum/shared';
 import type { Message } from '@quorum/shared';
 import {
+  definitionsOf,
   hashLines,
   locateAnchor,
   makeAnchor,
@@ -48,9 +49,69 @@ describe('splitLines', () => {
     ]);
   });
 
-  it('keeps fenced code verbatim, blank lines inside it dropped as elsewhere', () => {
-    const lines = splitLines(['text', '```js', 'const a = 1;', '```', 'after'].join('\n'));
-    expect(lines.map((l) => l.raw)).toEqual([false, true, true, true, false]);
+  it('keeps a fenced code block whole, blank lines inside it included', () => {
+    const lines = splitLines(
+      ['text', '```mermaid', 'graph TD', '', '  A --> B', '```', 'after'].join('\n'),
+    );
+    expect(lines.map((l) => [l.line, l.endLine, l.kind])).toEqual([
+      [1, 1, 'text'],
+      [2, 6, 'code'],
+      [7, 7, 'text'],
+    ]);
+    expect(lines[1]!.text).toBe('```mermaid\ngraph TD\n\n  A --> B\n```');
+  });
+
+  it('runs an unclosed fence to the end of the document', () => {
+    expect(splitLines('a\n~~~\ncode\n').map((l) => [l.line, l.endLine, l.kind])).toEqual([
+      [1, 1, 'text'],
+      [2, 4, 'code'],
+    ]);
+  });
+
+  it('keeps a table whole, header to last row', () => {
+    const doc = [
+      'Running the game takes 15 people.',
+      '',
+      '| Role | Count |',
+      '| ---- | :---: |',
+      '| **GM** | 1 |',
+      '| Guests | 10-12 |',
+      'After the table.',
+    ].join('\n');
+    expect(splitLines(doc).map((l) => [l.line, l.endLine, l.kind])).toEqual([
+      [1, 1, 'text'],
+      [3, 6, 'table'],
+      [7, 7, 'text'],
+    ]);
+  });
+
+  it('does not take a line with a pipe for a table without the delimiter row', () => {
+    expect(splitLines('a | b\nc | d').map((l) => l.kind)).toEqual(['text', 'text']);
+  });
+
+  it('marks link reference definitions and collects them for the other blocks', () => {
+    const doc = [
+      '![Map][image1]',
+      '',
+      '[image1]: data:image/png;base64,iVBORw0KGgo=',
+      '[^1]: a footnote',
+    ].join('\n');
+    const lines = splitLines(doc);
+    expect(lines.map((l) => l.kind)).toEqual(['text', 'definition', 'text']);
+    expect(definitionsOf(lines)).toBe('[image1]: data:image/png;base64,iVBORw0KGgo=');
+  });
+});
+
+describe('makeAnchor of a multi-line block', () => {
+  it('spans the block and carries its exact text', () => {
+    const doc = '| a | b |\n| - | - |\n| 1 | 2 |';
+    const [table] = splitLines(doc);
+    expect(makeAnchor('doc_1', 'sha1', table!)).toMatchObject({
+      startLine: 1,
+      endLine: 3,
+      text: doc,
+      textHash: textHash(doc),
+    });
   });
 });
 

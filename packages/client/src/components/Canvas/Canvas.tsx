@@ -7,6 +7,7 @@ import { DocTabs } from './DocTabs';
 import { Block } from './Block';
 import { Editor } from './Editor';
 import {
+  definitionsOf,
   hashLines,
   locateAnchor,
   makeAnchor,
@@ -89,6 +90,7 @@ export function Canvas(props: {
   const content = here ? here.content : null;
   const lines = useMemo(() => (content === null ? [] : splitLines(content)), [content]);
   const hashes = useMemo(() => hashLines(lines), [lines]);
+  const definitions = useMemo(() => definitionsOf(lines), [lines]);
 
   const shownSha = here?.sha ?? doc?.headSha ?? null;
   const pendingLines = useMemo(
@@ -252,8 +254,10 @@ export function Canvas(props: {
             <Block
               key={l.line}
               line={l.line}
+              endLine={l.endLine}
               text={l.text}
-              raw={l.raw}
+              kind={l.kind}
+              definitions={definitions}
               readOnly={readOnly}
               pending={pendingLines.has(l.line)}
               editor={active && where?.line === l.line ? editor : null}
