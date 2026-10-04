@@ -1,5 +1,5 @@
 import type { ActorRef, Document, Message } from '@quorum/shared';
-import { DEFAULTS } from '@quorum/shared';
+import { DEFAULTS, MODELS } from '@quorum/shared';
 import type { AgentRuntimeOptions } from '../contracts/index.js';
 
 export type Logger = NonNullable<AgentRuntimeOptions['logger']>;
@@ -54,4 +54,52 @@ export function shortSha(sha: string): string {
 /** True when text contains git conflict markers (start or end marker on a line of its own). */
 export function hasConflictMarkers(text: string): boolean {
   return /^<{7}(?:\s|$)/m.test(text) || /^>{7}(?:\s|$)/m.test(text);
+}
+
+/** Agent status detail shown to the room while the server has no usable Claude credential. */
+export const SIGN_IN_DETAIL = 'Sign in to Claude in Settings';
+
+/** USD per million tokens (PRD section 9). Cache writes are billed at 1.25x the input price. */
+export interface Price {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export const SONNET_PRICE: Price = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 };
+export const OPUS_PRICE: Price = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 };
+
+/** List price for a model id, or null when the model is not one of the tiers in the PRD. */
+export function priceFor(model: string): Price | null {
+  if (model === MODELS.orchestrator || model.startsWith('claude-opus')) return OPUS_PRICE;
+  if (model === MODELS.listener || model.startsWith('claude-sonnet')) return SONNET_PRICE;
+  return null;
+}
+
+/** Estimated cost from token counts; 0 for models without a known price. Used when the SDK reports no cost. */
+export function estimateCostUsd(
+  model: string,
+  t: { input: number; output: number; cacheRead: number; cacheWrite: number },
+): number {
+  const p = priceFor(model);
+  if (!p) return 0;
+  return (
+    (t.input * p.input +
+      t.output * p.output +
+      t.cacheRead * p.cacheRead +
+      t.cacheWrite * p.cacheWrite) /
+    1_000_000
+  );
+}
+
+/**
+ * Plain-text digest built from the notable events alone. Used when the digest writer cannot run (no Claude
+ * credential) or fails, so a returning participant still learns what happened.
+ */
+export function fallbackDigest(events: string[]): string {
+  const lines = ['While you were away:'];
+  if (events.length === 0) lines.push('- Nothing notable was recorded.');
+  for (const e of events) lines.push(`- ${e}`);
+  return lines.join('\n');
 }

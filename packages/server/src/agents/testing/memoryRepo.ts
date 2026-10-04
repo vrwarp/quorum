@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTwoFilesPatch, diffArrays } from 'diff';
 import type { Sha } from '@quorum/shared';
-import type { BlameLine, CommitInfo, CommitMeta, MergeOutcome, RoomRepository } from '../../contracts/index.js';
+import type {
+  BlameLine,
+  CommitInfo,
+  CommitMeta,
+  MergeOutcome,
+  RoomRepository,
+} from '../../contracts/index.js';
 
 interface StoredCommit {
   sha: Sha;
@@ -16,7 +22,7 @@ interface StoredCommit {
 /**
  * Minimal in-memory RoomRepository for agent unit tests. Branch worktrees are real temp directories so code
  * that edits files with fs and calls commitWorktree behaves like it does against the git implementation.
- * Flat repositories only (files at the root). Merge/revert operations are intentionally unsupported.
+ * Flat repositories only (files at the root). Merge/revert operations are intentionally unsupported; mergeBase is.
  */
 export class MemoryRepo implements RoomRepository {
   readonly roomId: string;
@@ -76,10 +82,21 @@ export class MemoryRepo implements RoomRepository {
     return sha ? (this.commits.get(sha) ?? null) : null;
   }
 
-  private addCommit(parent: Sha | null, files: Record<string, string>, subject: string, meta: CommitMeta): StoredCommit {
-    const sha = createHash('sha1').update(`${++this.counter}:${subject}:${JSON.stringify(files)}`).digest('hex');
+  private addCommit(
+    parent: Sha | null,
+    files: Record<string, string>,
+    subject: string,
+    meta: CommitMeta,
+  ): StoredCommit {
+    const sha = createHash('sha1')
+      .update(`${++this.counter}:${subject}:${JSON.stringify(files)}`)
+      .digest('hex');
     const actor =
-      meta.actor.kind === 'user' ? `user:${meta.actor.userId}` : meta.actor.role === 'worker' ? 'agent:worker' : `agent:${meta.actor.role}`;
+      meta.actor.kind === 'user'
+        ? `user:${meta.actor.userId}`
+        : meta.actor.role === 'worker'
+          ? 'agent:worker'
+          : `agent:${meta.actor.role}`;
     const prev = parent ? this.commits.get(parent) : null;
     const touched = new Set<string>([...Object.keys(files), ...Object.keys(prev?.files ?? {})]);
     const changed = [...touched].filter((f) => (files[f] ?? null) !== (prev?.files[f] ?? null));
@@ -132,7 +149,11 @@ export class MemoryRepo implements RoomRepository {
     return Object.keys(this.commitAt(ref)?.files ?? {}).sort();
   }
 
-  async commitToMain(files: Record<string, string | null>, subject: string, meta: CommitMeta): Promise<Sha> {
+  async commitToMain(
+    files: Record<string, string | null>,
+    subject: string,
+    meta: CommitMeta,
+  ): Promise<Sha> {
     const head = this.commitAt('main')!;
     const next = { ...head.files };
     for (const [f, content] of Object.entries(files)) {
@@ -146,7 +167,11 @@ export class MemoryRepo implements RoomRepository {
     return c.sha;
   }
 
-  async commitWorktree(worktreePath: string, subject: string, meta: CommitMeta): Promise<Sha | null> {
+  async commitWorktree(
+    worktreePath: string,
+    subject: string,
+    meta: CommitMeta,
+  ): Promise<Sha | null> {
     const branch = [...this.worktrees.entries()].find(([, dir]) => dir === worktreePath)?.[0];
     if (!branch) throw new Error(`unknown worktree ${worktreePath}`);
     const head = this.commitAt(branch)!;
@@ -157,7 +182,10 @@ export class MemoryRepo implements RoomRepository {
     return c.sha;
   }
 
-  async createBranch(branch: string, fromRef = 'main'): Promise<{ worktreePath: string; baseSha: Sha }> {
+  async createBranch(
+    branch: string,
+    fromRef = 'main',
+  ): Promise<{ worktreePath: string; baseSha: Sha }> {
     if (this.refs.has(branch)) throw new Error(`branch exists: ${branch}`);
     const base = this.commitAt(fromRef);
     if (!base) throw new Error(`unknown ref ${fromRef}`);
@@ -194,7 +222,8 @@ export class MemoryRepo implements RoomRepository {
     const out: CommitInfo[] = [];
     for (const c of chain) {
       const parent = c.parent ? this.commits.get(c.parent) : null;
-      if (path === null || (c.files[path] ?? null) !== (parent?.files[path] ?? null)) out.push(c.info);
+      if (path === null || (c.files[path] ?? null) !== (parent?.files[path] ?? null))
+        out.push(c.info);
       if (out.length >= limit) break;
     }
     return out;
@@ -206,9 +235,16 @@ export class MemoryRepo implements RoomRepository {
     return c.info;
   }
 
-  async logLines(path: string, startLine: number, endLine: number, ref = 'main', ): Promise<CommitInfo[]> {
+  async logLines(
+    path: string,
+    startLine: number,
+    endLine: number,
+    ref = 'main',
+  ): Promise<CommitInfo[]> {
     const blame = await this.blame(path, ref);
-    const shas = new Set(blame.filter((b) => b.line >= startLine && b.line <= endLine).map((b) => b.sha));
+    const shas = new Set(
+      blame.filter((b) => b.line >= startLine && b.line <= endLine).map((b) => b.sha),
+    );
     const all = await this.log(path, ref);
     const hit = all.filter((c) => shas.has(c.sha));
     return hit.length > 0 ? hit : all;
@@ -256,12 +292,22 @@ export class MemoryRepo implements RoomRepository {
     return [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((f) => a[f] !== b[f]).sort();
   }
 
-  async mergeBase(): Promise<Sha> {
-    throw new Error('MemoryRepo: mergeBase not supported');
+  async mergeBase(refA: string, refB: string): Promise<Sha> {
+    const ancestorsOfA = new Set(this.chain(refA).map((c) => c.sha));
+    const hit = this.chain(refB).find((c) => ancestorsOfA.has(c.sha));
+    if (!hit) throw new Error(`no merge base for ${refA} and ${refB}`);
+    return hit.sha;
   }
 
-  async rewrittenLineCount(path: string, fromRef: string, toRef: string): Promise<{ removed: number; added: number }> {
-    const parts = diffArrays(splitLines((await this.readFile(path, fromRef)) ?? ''), splitLines((await this.readFile(path, toRef)) ?? ''));
+  async rewrittenLineCount(
+    path: string,
+    fromRef: string,
+    toRef: string,
+  ): Promise<{ removed: number; added: number }> {
+    const parts = diffArrays(
+      splitLines((await this.readFile(path, fromRef)) ?? ''),
+      splitLines((await this.readFile(path, toRef)) ?? ''),
+    );
     let removed = 0;
     let added = 0;
     for (const p of parts) {

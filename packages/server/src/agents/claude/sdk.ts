@@ -1,6 +1,13 @@
-import type { Options, SDKMessage, SDKResultMessage, SDKUserMessage, query } from '@anthropic-ai/claude-agent-sdk';
+import type {
+  Options,
+  SDKMessage,
+  SDKResultMessage,
+  SDKUserMessage,
+  query,
+} from '@anthropic-ai/claude-agent-sdk';
 import type { RoomId, UsageRecord } from '@quorum/shared';
 import type { RoomActions } from '../../contracts/index.js';
+import { estimateCostUsd } from '../common.js';
 
 /** The Agent SDK `query` function; injected so tests never spawn a process. */
 export type QueryFn = typeof query;
@@ -10,9 +17,28 @@ export function userMessage(text: string): SDKUserMessage {
   return { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null };
 }
 
-/** Environment for the Claude Code subprocess: inherit, plus the API key when one was configured. */
-export function sdkEnv(apiKey?: string): Options['env'] | undefined {
-  return apiKey ? { ...process.env, ANTHROPIC_API_KEY: apiKey } : undefined;
+/** How the Claude Code subprocess is launched and authenticated. Applied to every `query()` the runtime makes. */
+export interface ClaudeProcessConfig {
+  /** Claude Code executable the SDK spawns (pathToClaudeCodeExecutable); omit to use the SDK's bundled binary. */
+  binary?: string;
+  /** Extra environment variables (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN). Read at each query() so a new login applies at once. */
+  env?: () => Record<string, string>;
+  /** ANTHROPIC_API_KEY handed to the subprocess when it is not already in the server's environment. */
+  apiKey?: string;
+}
+
+/**
+ * `Options.env` REPLACES the subprocess environment, so the server's own environment is spread in first (PATH, HOME,
+ * and an ambient ANTHROPIC_API_KEY), then the configured API key, then the credential environment from the sign-in
+ * service.
+ */
+export function sdkProcessOptions(
+  cfg?: ClaudeProcessConfig,
+): Pick<Options, 'env' | 'pathToClaudeCodeExecutable'> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  if (cfg?.apiKey) env.ANTHROPIC_API_KEY = cfg.apiKey;
+  Object.assign(env, cfg?.env?.() ?? {});
+  return { env, ...(cfg?.binary ? { pathToClaudeCodeExecutable: cfg.binary } : {}) };
 }
 
 /** Single-consumer async queue used as streaming input. */
@@ -52,23 +78,70 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   }
 }
 
+type RecordShape = Omit<UsageRecord, 'roomId' | 'role' | 'at'>;
+
+interface UsageEntry {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
+}
+
 /**
  * Result messages carry totals that are cumulative for the query() call (and per-model). This turns them
  * into per-result deltas so usage is recorded once.
  */
 export class UsageTracker {
-  private seen = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }>();
+  private seen = new Map<
+    string,
+    { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+  >();
 
-  deltas(result: SDKResultMessage): Array<Omit<UsageRecord, 'roomId' | 'role' | 'at'> & { sessionId: string }> {
-    const out: Array<Omit<UsageRecord, 'roomId' | 'role' | 'at'> & { sessionId: string }> = [];
-    for (const [model, u] of Object.entries(result.modelUsage ?? {})) {
-      const prev = this.seen.get(model) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  /**
+   * `fallbackModel` covers results that carry no per-model breakdown (crash or older producers): the main-loop totals
+   * in `usage` and `total_cost_usd` are then recorded against the model the session was asked to run.
+   */
+  deltas(result: SDKResultMessage, fallbackModel?: string): RecordShape[] {
+    const out: RecordShape[] = [];
+    const entries: Array<[string, UsageEntry]> = Object.entries(result.modelUsage ?? {}).map(
+      ([model, u]) => [
+        model,
+        {
+          inputTokens: u.inputTokens ?? 0,
+          outputTokens: u.outputTokens ?? 0,
+          cacheReadInputTokens: u.cacheReadInputTokens ?? 0,
+          cacheCreationInputTokens: u.cacheCreationInputTokens ?? 0,
+          costUSD: u.costUSD ?? 0,
+        },
+      ],
+    );
+    if (entries.length === 0 && fallbackModel && result.usage) {
+      entries.push([
+        fallbackModel,
+        {
+          inputTokens: result.usage.input_tokens ?? 0,
+          outputTokens: result.usage.output_tokens ?? 0,
+          cacheReadInputTokens: result.usage.cache_read_input_tokens ?? 0,
+          cacheCreationInputTokens: result.usage.cache_creation_input_tokens ?? 0,
+          costUSD: result.total_cost_usd ?? 0,
+        },
+      ]);
+    }
+    for (const [model, u] of entries) {
+      const prev = this.seen.get(model) ?? {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+      };
       const cur = {
-        input: u.inputTokens ?? 0,
-        output: u.outputTokens ?? 0,
-        cacheRead: u.cacheReadInputTokens ?? 0,
-        cacheWrite: u.cacheCreationInputTokens ?? 0,
-        cost: u.costUSD ?? 0,
+        input: u.inputTokens,
+        output: u.outputTokens,
+        cacheRead: u.cacheReadInputTokens,
+        cacheWrite: u.cacheCreationInputTokens,
+        cost: u.costUSD,
       };
       this.seen.set(model, cur);
       const d = {
@@ -98,14 +171,88 @@ export async function recordResultUsage(
   role: UsageRecord['role'],
   result: SDKResultMessage,
   tracker: UsageTracker = new UsageTracker(),
+  fallbackModel?: string,
 ): Promise<void> {
-  for (const d of tracker.deltas(result)) {
-    await actions.recordUsage({ roomId, role, at: new Date().toISOString(), ...d }).catch(() => undefined);
+  for (const d of tracker.deltas(result, fallbackModel)) {
+    await actions
+      .recordUsage({ roomId, role, at: new Date().toISOString(), ...d })
+      .catch(() => undefined);
+  }
+}
+
+/**
+ * Token usage read off the assistant messages of a session. A timed-out or cancelled one-shot never produces a result
+ * message, but it still spent tokens; this is what gets recorded for it (cost estimated from list prices).
+ */
+export class AssistantUsage {
+  private readonly byMessage = new Map<
+    string,
+    { model: string; input: number; output: number; cacheRead: number; cacheWrite: number }
+  >();
+  private sessionId: string | null = null;
+
+  observe(msg: SDKMessage): void {
+    if (msg.type !== 'assistant') return;
+    const m = msg.message;
+    const u = m?.usage;
+    if (!u) return;
+    this.sessionId ??= msg.session_id;
+    // one API response can arrive as several assistant messages sharing an id: keep the latest totals for each id
+    this.byMessage.set(m.id ?? `anon-${this.byMessage.size}`, {
+      model: m.model ?? 'unknown',
+      input: u.input_tokens ?? 0,
+      output: u.output_tokens ?? 0,
+      cacheRead: u.cache_read_input_tokens ?? 0,
+      cacheWrite: u.cache_creation_input_tokens ?? 0,
+    });
+  }
+
+  get empty(): boolean {
+    return this.byMessage.size === 0;
+  }
+
+  records(): RecordShape[] {
+    const byModel = new Map<
+      string,
+      { input: number; output: number; cacheRead: number; cacheWrite: number }
+    >();
+    for (const u of this.byMessage.values()) {
+      const t = byModel.get(u.model) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      t.input += u.input;
+      t.output += u.output;
+      t.cacheRead += u.cacheRead;
+      t.cacheWrite += u.cacheWrite;
+      byModel.set(u.model, t);
+    }
+    return [...byModel.entries()].map(([model, t]) => ({
+      sessionId: this.sessionId ?? 'unknown',
+      model,
+      inputTokens: t.input + t.cacheWrite,
+      outputTokens: t.output,
+      cacheReadTokens: t.cacheRead,
+      costUsd: estimateCostUsd(model, t),
+    }));
+  }
+}
+
+export async function recordAssistantUsage(
+  actions: RoomActions,
+  roomId: RoomId,
+  role: UsageRecord['role'],
+  usage: AssistantUsage,
+): Promise<void> {
+  for (const d of usage.records()) {
+    await actions
+      .recordUsage({ roomId, role, at: new Date().toISOString(), ...d })
+      .catch(() => undefined);
   }
 }
 
 /** Iterate a query to completion and return its (last) result message. */
-export async function drainQuery(q: AsyncIterable<SDKMessage>, onMessage?: (m: SDKMessage) => void): Promise<SDKResultMessage | null> {
+export async function drainQuery(
+  q: AsyncIterable<SDKMessage>,
+  onMessage?: (m: SDKMessage) => void,
+): Promise<SDKResultMessage | null> {
   let result: SDKResultMessage | null = null;
   for await (const msg of q) {
     onMessage?.(msg);

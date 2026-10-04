@@ -1,4 +1,14 @@
-import { newId, type Card, type Change, type Document, type Message, type Participant, type Proposal, type RoomState, type UsageRecord } from '@quorum/shared';
+import {
+  newId,
+  type Card,
+  type Change,
+  type Document,
+  type Message,
+  type Participant,
+  type Proposal,
+  type RoomState,
+  type UsageRecord,
+} from '@quorum/shared';
 import type { RoomActions, RoomRepository } from '../../contracts/index.js';
 
 export interface StubOptions {
@@ -82,7 +92,12 @@ export function createStubActions(opts: StubOptions): StubActions {
     },
     async sendPrivate(_room, userId, input) {
       calls.push('sendPrivate');
-      const m = mk({ author: { kind: 'agent', role: 'digest' }, body: input.body, card: input.card ?? null, privateTo: userId });
+      const m = mk({
+        author: { kind: 'agent', role: 'digest' },
+        body: input.body,
+        card: input.card ?? null,
+        privateTo: userId,
+      });
       messages.push(m);
       return m;
     },
@@ -109,7 +124,12 @@ export function createStubActions(opts: StubOptions): StubActions {
           archivedAt: null,
         },
         participants,
-        presence: participants.map((p) => ({ userId: p.userId, displayName: p.displayName, connected: true, lastSeenAt: new Date().toISOString() })),
+        presence: participants.map((p) => ({
+          userId: p.userId,
+          displayName: p.displayName,
+          connected: true,
+          lastSeenAt: new Date().toISOString(),
+        })),
         documents: documents.map((d) => ({ ...d, headSha })),
         proposals,
         recentMessages: messages.slice(-200),
@@ -122,7 +142,12 @@ export function createStubActions(opts: StubOptions): StubActions {
     },
     async recordChange(_room, change) {
       calls.push('recordChange');
-      const full: Change = { ...change, roomId, createdAt: new Date().toISOString(), revertedBySha: null };
+      const full: Change = {
+        ...change,
+        roomId,
+        createdAt: new Date().toISOString(),
+        revertedBySha: null,
+      };
       changes.push(full);
       return full;
     },

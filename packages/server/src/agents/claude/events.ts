@@ -3,7 +3,7 @@ import { authorName } from '../common.js';
 
 /** Everything the orchestrator hears about arrives as one of these, rendered as one user turn. */
 export type OrchestratorEvent =
-  | { type: 'intent'; intent: Intent; messages: Message[] }
+  | { type: 'intent'; intent: Intent; messages: Message[]; openProposals?: Proposal[] }
   | { type: 'suggestion'; message: Message }
   | { type: 'ask'; message: Message }
   | { type: 'proposal_event'; event: ProposalEventInput }
@@ -45,20 +45,50 @@ export function compactProposal(p: Proposal): Record<string, unknown> {
     windowClosesAt: p.windowClosesAt,
     mergedOptionId: p.mergedOptionId,
     mergeSha: p.mergeSha,
-    options: p.options.map((o) => ({ id: o.id, label: o.label, branch: o.branch, summary: o.summary })),
-    votes: p.votes.map((v) => ({ userId: v.userId, decision: v.decision, optionId: v.optionId, castAt: v.castAt })),
+    options: p.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      branch: o.branch,
+      summary: o.summary,
+    })),
+    votes: p.votes.map((v) => ({
+      userId: v.userId,
+      decision: v.decision,
+      optionId: v.optionId,
+      castAt: v.castAt,
+    })),
   };
 }
 
 export function compactState(s: RoomState, recent = 20): Record<string, unknown> {
   return {
-    room: { id: s.room.id, name: s.room.name, ownerId: s.room.ownerId, votingRule: s.room.votingRule },
-    participants: s.participants.map((p) => ({ userId: p.userId, displayName: p.displayName, role: p.role })),
-    presence: s.presence.map((p) => ({ userId: p.userId, connected: p.connected, lastSeenAt: p.lastSeenAt })),
-    documents: s.documents.map((d) => ({ id: d.id, path: d.path, title: d.title, status: d.status, headSha: d.headSha })),
+    room: {
+      id: s.room.id,
+      name: s.room.name,
+      ownerId: s.room.ownerId,
+      votingRule: s.room.votingRule,
+    },
+    participants: s.participants.map((p) => ({
+      userId: p.userId,
+      displayName: p.displayName,
+      role: p.role,
+    })),
+    presence: s.presence.map((p) => ({
+      userId: p.userId,
+      connected: p.connected,
+      lastSeenAt: p.lastSeenAt,
+    })),
+    documents: s.documents.map((d) => ({
+      id: d.id,
+      path: d.path,
+      title: d.title,
+      status: d.status,
+      headSha: d.headSha,
+    })),
     proposals: s.proposals.map(compactProposal),
     agentStatus: s.agentStatus,
-    recentMessages: s.recentMessages.slice(-recent).map(compactMessage),
+    // slice(-0) would return everything, so an explicit 0 must mean none
+    recentMessages: recent > 0 ? s.recentMessages.slice(-recent).map(compactMessage) : [],
   };
 }
 
@@ -86,6 +116,10 @@ export function eventPayload(e: OrchestratorEvent): Record<string, unknown> {
       return {
         intent: e.intent,
         messages: e.messages.map(compactMessage),
+        // lets the orchestrator judge expiry on every listener cycle (PRD 7.4) without an extra turn
+        ...(e.openProposals && e.openProposals.length > 0
+          ? { openProposals: e.openProposals.map(compactProposal) }
+          : {}),
       };
     case 'suggestion': {
       const card = e.message.card;
@@ -110,8 +144,12 @@ export function eventPayload(e: OrchestratorEvent): Record<string, unknown> {
     }
     case 'proposal_event': {
       const ev = e.event;
-      const base: Record<string, unknown> = { event: ev.type, proposal: compactProposal(ev.proposal) };
-      if (ev.type === 'merged') Object.assign(base, { optionId: ev.optionId, sha: ev.sha, reconciled: ev.reconciled });
+      const base: Record<string, unknown> = {
+        event: ev.type,
+        proposal: compactProposal(ev.proposal),
+      };
+      if (ev.type === 'merged')
+        Object.assign(base, { optionId: ev.optionId, sha: ev.sha, reconciled: ev.reconciled });
       if (ev.type === 'rejected') base.byUserId = ev.byUserId;
       if (ev.type === 'merge_failed') base.reason = ev.reason;
       return base;

@@ -1,18 +1,57 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import type { Change, Message, MessageId, OptionId, Proposal, RoomId, Sha, UserId } from '@quorum/shared';
-import type { AgentRuntime, AgentRuntimeOptions, RoomActions, RoomRepository } from '../../contracts/index.js';
-import { errMessage, noopLogger, resolveTunables, type Logger, type Tunables } from '../common.js';
-import { Listener, type ListenerClient } from './listener.js';
+import type {
+  Change,
+  Message,
+  MessageId,
+  OptionId,
+  Proposal,
+  RoomId,
+  Sha,
+  UserId,
+} from '@quorum/shared';
+import type {
+  AgentRuntime,
+  AgentRuntimeOptions,
+  RoomActions,
+  RoomRepository,
+} from '../../contracts/index.js';
+import {
+  SIGN_IN_DETAIL,
+  errMessage,
+  fallbackDigest,
+  noopLogger,
+  resolveTunables,
+  type Logger,
+  type Tunables,
+} from '../common.js';
+import { StatusBoard } from '../status.js';
+import { Listener, type ListenerBatch, type ListenerClient } from './listener.js';
 import { Orchestrator } from './orchestrator.js';
-import type { QueryFn } from './sdk.js';
-import { runExploration, runMergeDriver, runSemanticRevert, writeDigest, type WorkerEnv } from './workers.js';
+import { createSdkListenerClient } from './sdkListener.js';
+import type { ClaudeProcessConfig, QueryFn } from './sdk.js';
 import type { ExplorationRequest } from './tools.js';
+import {
+  runExploration,
+  runMergeDriver,
+  runSemanticRevert,
+  writeDigest,
+  type WorkerEnv,
+} from './workers.js';
 
 export interface ClaudeRuntimeOptions extends AgentRuntimeOptions {
+  /** API key for the listener's Messages API calls and for the Claude Code subprocess */
   anthropicApiKey?: string;
   /** per-session spending cap handed to the Agent SDK (maxBudgetUsd) */
   maxBudgetUsd?: number;
+  /** Claude Code executable the Agent SDK spawns (`pathToClaudeCodeExecutable`); omit for the SDK's bundled binary */
+  claudeBinary?: string;
+  /** Credential environment added to every Claude Code subprocess (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN). Read at each query(). */
+  claudeEnv?: () => Record<string, string>;
+  /** Whether a Claude credential is usable. While false the agent is unavailable and does no model work. Omit to assume it is. */
+  claudeAvailable?: () => Promise<boolean>;
+  /** Subscribe to sign-in / sign-out. The runtime calls its listener with no arguments; a returned function unsubscribes. */
+  onCredentialsChanged?: (listener: () => void) => void | (() => unknown);
 }
 
 export interface ClaudeRuntimeDeps {
@@ -29,65 +68,205 @@ interface RoomRuntime {
   abort: AbortController;
 }
 
+/** Status details are shown to everyone in the room: keep them to one short line. */
+function statusDetail(text: string): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > 160 ? `${oneLine.slice(0, 159)}…` : oneLine;
+}
+
 export class ClaudeRuntime implements AgentRuntime {
+  /** live sessions (listener + orchestrator) per room; only exist while a credential is available */
   private readonly rooms = new Map<RoomId, Promise<RoomRuntime>>();
+  /** rooms the server asked us to run; sessions are (re)started for these when credentials appear */
+  private readonly active = new Set<RoomId>();
+  /** per-room FIFO of work, so events keep their order across async credential checks and session starts */
+  private readonly queues = new Map<RoomId, Promise<void>>();
+  private readonly boards = new Map<RoomId, StatusBoard>();
   private readonly log: Logger;
   private readonly tunables: Tunables;
-  private readonly createClient: (apiKey?: string) => ListenerClient;
   private readonly queryFn: QueryFn;
+  private readonly claude: ClaudeProcessConfig;
   private listenerClient: ListenerClient | null = null;
-  private readonly unhealthy = new Set<RoomId>();
+  private lastAvailable: boolean | null = null;
+  private unsubscribe: (() => unknown) | null = null;
+  private closed = false;
 
   constructor(
     private readonly actions: RoomActions,
     private readonly options: ClaudeRuntimeOptions,
-    deps: ClaudeRuntimeDeps = {},
+    private readonly deps: ClaudeRuntimeDeps = {},
   ) {
     this.log = options.logger ?? noopLogger;
     this.tunables = resolveTunables(options);
-    this.createClient = deps.createClient ?? ((apiKey) => new Anthropic({ apiKey }) as unknown as ListenerClient);
     this.queryFn = deps.queryFn ?? query;
+    const claudeEnv = options.claudeEnv;
+    this.claude = {
+      binary: options.claudeBinary,
+      apiKey: options.anthropicApiKey,
+      env: claudeEnv
+        ? () => {
+            try {
+              return claudeEnv();
+            } catch (e) {
+              this.log('warn', 'claudeEnv failed; using the server environment alone', {
+                error: errMessage(e),
+              });
+              return {};
+            }
+          }
+        : undefined,
+    };
+    if (options.onCredentialsChanged) {
+      const off = options.onCredentialsChanged(() => this.credentialsChanged());
+      this.unsubscribe = typeof off === 'function' ? off : null;
+    }
+  }
+
+  // --- credentials ------------------------------------------------------------------------
+
+  /** True when a Claude credential is usable. A failing probe keeps the last known answer (initially: available). */
+  private async isAvailable(): Promise<boolean> {
+    const check = this.options.claudeAvailable;
+    if (!check) return true;
+    try {
+      this.lastAvailable = await check();
+    } catch (e) {
+      this.log('warn', 'claudeAvailable failed; keeping the last known answer', {
+        error: errMessage(e),
+      });
+    }
+    return this.lastAvailable ?? true;
+  }
+
+  /**
+   * Sign-in or sign-out happened. With a credential: restart every active room's sessions so the new login applies
+   * (and the status returns to idle). Without one: stop the sessions and show "unavailable". Runs on each room's queue,
+   * so events that arrive meanwhile are handled by the state this leaves behind, in order.
+   */
+  private credentialsChanged(): void {
+    if (this.closed) return;
+    for (const roomId of [...this.active]) {
+      void this.enqueue(roomId, 'credentials change', async () => {
+        const available = await this.isAvailable();
+        await this.teardown(roomId);
+        if (this.closed || !this.active.has(roomId)) return;
+        const board = this.board(roomId);
+        if (!available) {
+          this.log('info', 'claude credentials gone; agent unavailable', { roomId });
+          board.reset({ key: 'credentials', detail: SIGN_IN_DETAIL });
+          return;
+        }
+        this.log('info', 'claude credentials available; starting agent sessions', { roomId });
+        board.reset();
+        await this.room(roomId);
+      });
+    }
+  }
+
+  /** The room's sessions, or null (and status "unavailable") when there is no credential. */
+  private async sessions(roomId: RoomId): Promise<RoomRuntime | null> {
+    if (this.closed) return null;
+    this.active.add(roomId);
+    if (!(await this.isAvailable())) {
+      this.board(roomId).fail('credentials', SIGN_IN_DETAIL);
+      return null;
+    }
+    this.board(roomId).recover('credentials');
+    return this.room(roomId);
   }
 
   // --- lifecycle --------------------------------------------------------------------------
 
-  startRoom(roomId: RoomId): Promise<void> {
-    return this.room(roomId).then(
-      () => undefined,
-      (e) => this.log('error', 'startRoom failed', { roomId, error: errMessage(e) }),
-    );
+  async startRoom(roomId: RoomId): Promise<void> {
+    this.active.add(roomId);
+    await this.enqueue(roomId, 'startRoom', async () => {
+      await this.sessions(roomId);
+    });
   }
 
   async stopRoom(roomId: RoomId): Promise<void> {
+    this.active.delete(roomId);
+    await this.teardown(roomId);
+    this.boards.get(roomId)?.reset();
+  }
+
+  async stopAll(): Promise<void> {
+    this.closed = true;
+    try {
+      this.unsubscribe?.();
+    } catch {
+      /* ignore */
+    }
+    this.unsubscribe = null;
+    await Promise.all(
+      [...new Set([...this.rooms.keys(), ...this.active])].map((id) => this.stopRoom(id)),
+    );
+  }
+
+  /** Stops the room's sessions; the room stays active. */
+  private async teardown(roomId: RoomId): Promise<void> {
     const p = this.rooms.get(roomId);
-    if (!p) return;
     this.rooms.delete(roomId);
+    if (!p) return;
     try {
       const r = await p;
       r.listener.stop();
       r.abort.abort();
       await r.orchestrator.stop();
     } catch (e) {
-      this.log('warn', 'stopRoom failed', { roomId, error: errMessage(e) });
+      this.log('warn', 'stopping room sessions failed', { roomId, error: errMessage(e) });
     }
   }
 
-  async stopAll(): Promise<void> {
-    await Promise.all([...this.rooms.keys()].map((id) => this.stopRoom(id)));
+  private board(roomId: RoomId): StatusBoard {
+    let b = this.boards.get(roomId);
+    if (!b) {
+      b = new StatusBoard(roomId, this.actions, this.log);
+      this.boards.set(roomId, b);
+    }
+    return b;
+  }
+
+  private enqueue(roomId: RoomId, what: string, task: () => Promise<void>): Promise<void> {
+    const prev = this.queues.get(roomId) ?? Promise.resolve();
+    const next = prev
+      .then(task)
+      .catch((e) => this.log('error', `${what} failed`, { roomId, error: errMessage(e) }));
+    this.queues.set(roomId, next);
+    return next;
   }
 
   private room(roomId: RoomId): Promise<RoomRuntime> {
     let p = this.rooms.get(roomId);
     if (!p) {
-      p = this.createRoom(roomId);
-      this.rooms.set(roomId, p);
-      p.catch(() => this.rooms.delete(roomId));
+      const created = this.createRoom(roomId);
+      p = created;
+      this.rooms.set(roomId, created);
+      created.catch(() => {
+        if (this.rooms.get(roomId) === created) this.rooms.delete(roomId);
+      });
     }
     return p;
   }
 
+  /**
+   * The listener talks to the Messages API when there is an API key (explicit prompt-cache breakpoints, no process per
+   * call). Without one (a Claude login or a long-lived token) only the Claude Code subprocess can authenticate, so the
+   * listener runs through the Agent SDK instead.
+   */
   private client(): ListenerClient {
-    return (this.listenerClient ??= this.createClient(this.options.anthropicApiKey));
+    if (this.listenerClient) return this.listenerClient;
+    const apiKey = this.options.anthropicApiKey || process.env.ANTHROPIC_API_KEY || undefined;
+    if (this.deps.createClient) this.listenerClient = this.deps.createClient(apiKey);
+    else if (apiKey) this.listenerClient = new Anthropic({ apiKey }) as unknown as ListenerClient;
+    else
+      this.listenerClient = createSdkListenerClient({
+        queryFn: this.queryFn,
+        process: () => this.claude,
+        cwd: this.options.dataDir,
+        logger: this.log,
+      });
+    return this.listenerClient;
   }
 
   private workerEnv(roomId: RoomId, signal?: AbortSignal): WorkerEnv {
@@ -98,15 +277,17 @@ export class ClaudeRuntime implements AgentRuntime {
       logger: this.log,
       tunables: this.tunables,
       dataDir: this.options.dataDir,
-      apiKey: this.options.anthropicApiKey,
+      claude: this.claude,
       maxBudgetUsd: this.options.maxBudgetUsd,
       signal,
+      status: this.board(roomId),
     };
   }
 
   private async createRoom(roomId: RoomId): Promise<RoomRuntime> {
     const repo = await this.actions.repo(roomId);
     const abort = new AbortController();
+    const board = this.board(roomId);
     const orchestrator = new Orchestrator({
       roomId,
       actions: this.actions,
@@ -114,9 +295,11 @@ export class ClaudeRuntime implements AgentRuntime {
       queryFn: this.queryFn,
       tunables: this.tunables,
       logger: this.log,
-      apiKey: this.options.anthropicApiKey,
+      claude: this.claude,
       maxBudgetUsd: this.options.maxBudgetUsd,
-      startExploration: (req: ExplorationRequest) => runExploration(this.workerEnv(roomId, abort.signal), repo, req),
+      status: board,
+      startExploration: (req: ExplorationRequest) =>
+        runExploration(this.workerEnv(roomId, abort.signal), repo, req),
     });
     const listener = new Listener({
       roomId,
@@ -124,70 +307,144 @@ export class ClaudeRuntime implements AgentRuntime {
       client: this.client(),
       tunables: this.options.tunables,
       logger: this.log,
-      onIntents: ({ intents, messages }) => {
-        for (const intent of intents) {
-          const referenced = messages.filter((m) => intent.messageIds.includes(m.id));
-          orchestrator.send({ type: 'intent', intent, messages: referenced.length > 0 ? referenced : messages });
-        }
-      },
+      onIntents: (batch) => this.forwardIntents(roomId, orchestrator, batch),
       onHealth: (ok, detail) => {
-        if (!ok && !this.unhealthy.has(roomId)) {
-          this.unhealthy.add(roomId);
-          void this.actions.setAgentStatus(roomId, 'unavailable', detail ?? 'The listener is failing').catch(() => undefined);
-        } else if (ok && this.unhealthy.delete(roomId)) {
-          void this.actions.setAgentStatus(roomId, 'idle', null).catch(() => undefined);
-        }
+        if (ok) board.recover('listener');
+        else board.fail('listener', statusDetail(detail ?? 'The listener is failing'));
       },
     });
     orchestrator.start();
     return { repo, listener, orchestrator, abort };
   }
 
-  /** Run `fn` against the room's runtime; never throws. */
-  private withRoom(roomId: RoomId, what: string, fn: (r: RoomRuntime) => void): void {
-    this.room(roomId).then(fn).catch((e) => this.log('error', `${what} failed`, { roomId, error: errMessage(e) }));
+  /**
+   * Hands listener intents to the orchestrator. Each intent carries the messages it names, resolved across the whole
+   * classified slice (a divergence points at an earlier message), and the proposals that are open right now, so the
+   * orchestrator can also judge expiry on every listener cycle (PRD 7.4).
+   */
+  private forwardIntents(roomId: RoomId, orchestrator: Orchestrator, batch: ListenerBatch): void {
+    const byId = new Map(batch.context.map((m) => [m.id, m]));
+    void (async () => {
+      let openProposals: Proposal[] = [];
+      try {
+        openProposals = (await this.actions.getRoomState(roomId)).proposals.filter(
+          (p) => p.state === 'open',
+        );
+      } catch (e) {
+        this.log('warn', 'could not read open proposals for an intent', {
+          roomId,
+          error: errMessage(e),
+        });
+      }
+      for (const intent of batch.intents) {
+        const referenced = intent.messageIds
+          .map((id) => byId.get(id))
+          .filter((m): m is Message => m !== undefined);
+        orchestrator.send({
+          type: 'intent',
+          intent,
+          messages: referenced.length > 0 ? referenced : batch.messages,
+          openProposals,
+        });
+      }
+    })().catch((e) =>
+      this.log('error', 'forwarding intents failed', { roomId, error: errMessage(e) }),
+    );
+  }
+
+  /** Runs `fn` against the room's sessions in arrival order. Never throws; without a credential the event is dropped. */
+  private dispatch(roomId: RoomId, what: string, fn: (r: RoomRuntime) => void): void {
+    this.active.add(roomId);
+    void this.enqueue(roomId, what, async () => {
+      const r = await this.sessions(roomId);
+      if (!r) {
+        this.log(
+          'info',
+          `dropping ${what}: ${this.closed ? 'the runtime is stopped' : SIGN_IN_DETAIL}`,
+          { roomId },
+        );
+        return;
+      }
+      fn(r);
+    });
   }
 
   // --- AgentRuntime: events ---------------------------------------------------------------
 
   onChatMessage(roomId: RoomId, message: Message): void {
-    if (message.author.kind !== 'user') return;
-    this.withRoom(roomId, 'onChatMessage', (r) => r.listener.push(message));
+    if (message?.author?.kind !== 'user') return;
+    this.dispatch(roomId, 'onChatMessage', (r) => r.listener.push(message));
   }
 
   onSuggestion(roomId: RoomId, message: Message): void {
-    this.withRoom(roomId, 'onSuggestion', (r) => r.orchestrator.send({ type: 'suggestion', message }));
+    this.dispatch(roomId, 'onSuggestion', (r) =>
+      r.orchestrator.send({ type: 'suggestion', message }),
+    );
   }
 
   onAsk(roomId: RoomId, message: Message): void {
-    this.withRoom(roomId, 'onAsk', (r) => r.orchestrator.send({ type: 'ask', message }));
+    this.dispatch(roomId, 'onAsk', (r) => r.orchestrator.send({ type: 'ask', message }));
   }
 
   onProposalEvent(roomId: RoomId, event: Parameters<AgentRuntime['onProposalEvent']>[1]): void {
-    this.withRoom(roomId, 'onProposalEvent', (r) => r.orchestrator.send({ type: 'proposal_event', event }));
+    this.dispatch(roomId, 'onProposalEvent', (r) =>
+      r.orchestrator.send({ type: 'proposal_event', event }),
+    );
   }
 
   onReverted(roomId: RoomId, change: Change, revertSha: Sha, byUserId: UserId): void {
-    this.withRoom(roomId, 'onReverted', (r) => r.orchestrator.send({ type: 'revert', change, revertSha, byUserId }));
+    this.dispatch(roomId, 'onReverted', (r) =>
+      r.orchestrator.send({ type: 'revert', change, revertSha, byUserId }),
+    );
   }
 
   // --- one-shot sessions ------------------------------------------------------------------
 
+  /** Without a credential these throw "Sign in to Claude in Settings": the merge stays open / the revert is refused with that reason. */
   async runMergeDriver(
     roomId: RoomId,
-    input: { proposal: Proposal; optionId: OptionId; worktreePath: string; conflictedFiles: string[]; documentPath: string },
+    input: {
+      proposal: Proposal;
+      optionId: OptionId;
+      worktreePath: string;
+      conflictedFiles: string[];
+      documentPath: string;
+    },
   ): Promise<{ reconciled: boolean; summary: string }> {
-    const r = await this.room(roomId);
+    const r = await this.sessions(roomId);
+    if (!r) throw new Error(SIGN_IN_DETAIL);
     return runMergeDriver(this.workerEnv(roomId, r.abort.signal), input);
   }
 
-  async runSemanticRevert(roomId: RoomId, input: { change: Change; byUserId: UserId }): Promise<Sha> {
-    const r = await this.room(roomId);
+  async runSemanticRevert(
+    roomId: RoomId,
+    input: { change: Change; byUserId: UserId },
+  ): Promise<Sha> {
+    const r = await this.sessions(roomId);
+    if (!r) throw new Error(SIGN_IN_DETAIL);
     return runSemanticRevert(this.workerEnv(roomId, r.abort.signal), r.repo, input);
   }
 
-  async writeDigest(roomId: RoomId, input: { userId: UserId; sinceMessageId: MessageId | null; events: string[] }): Promise<string> {
-    const r = await this.room(roomId);
-    return writeDigest(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+  /**
+   * The digest writer when Claude is available; a plain-text digest of the events when it is not, or when the writer
+   * fails or returns nothing. A returning participant always learns what happened.
+   */
+  async writeDigest(
+    roomId: RoomId,
+    input: { userId: UserId; sinceMessageId: MessageId | null; events: string[] },
+  ): Promise<string> {
+    try {
+      const r = await this.sessions(roomId);
+      if (!r) return fallbackDigest(input.events);
+      const text = await writeDigest(this.workerEnv(roomId, r.abort.signal), r.repo, input);
+      if (text) return text;
+      this.log('warn', 'digest writer returned nothing; using the plain digest', { roomId });
+    } catch (e) {
+      this.log('warn', 'digest writer failed; using the plain digest', {
+        roomId,
+        error: errMessage(e),
+      });
+    }
+    return fallbackDigest(input.events);
   }
 }

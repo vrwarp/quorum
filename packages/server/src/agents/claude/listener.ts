@@ -1,8 +1,27 @@
 import type Anthropic from '@anthropic-ai/sdk';
-import { DEFAULTS, EFFORT, IntentBatchJsonSchema, IntentBatchSchema, MODELS, newId, type Intent, type Message, type RoomId, type RoomState } from '@quorum/shared';
+import {
+  DEFAULTS,
+  EFFORT,
+  IntentBatchJsonSchema,
+  IntentSchema,
+  MODELS,
+  newId,
+  type Intent,
+  type Message,
+  type RoomId,
+  type RoomState,
+} from '@quorum/shared';
 import type { RoomActions } from '../../contracts/index.js';
 import { LISTENER_SYSTEM } from '../prompts.js';
-import { activeDocs, authorName, errMessage, noopLogger, type Logger, type Tunables } from '../common.js';
+import {
+  activeDocs,
+  authorName,
+  errMessage,
+  estimateCostUsd,
+  noopLogger,
+  type Logger,
+  type Tunables,
+} from '../common.js';
 
 /** The slice of the Anthropic client the listener uses; tests inject a mock. */
 export interface ListenerClient {
@@ -15,6 +34,9 @@ export interface ListenerBatch {
   intents: Intent[];
   /** the messages that were new in this classification */
   messages: Message[];
+  /** the whole transcript slice the model saw (already-classified context plus the new messages), so an intent that
+   *  references an earlier message, as a divergence does, can be resolved to it */
+  context: Message[];
 }
 
 export interface ListenerDeps {
@@ -32,9 +54,9 @@ export interface ListenerDeps {
 /** Messages of already-classified context kept when the checkpoint is re-anchored. */
 const CHECKPOINT_KEEP = 5;
 const MAX_TOKENS = 4096;
-
-/** USD per million tokens for the listener model (PRD section 9); cache writes assumed at 1.25x input. */
-const PRICE = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 };
+/** After a failed classification the pending messages are retried on their own: 10 s, doubling, capped at 5 min. */
+const RETRY_BASE_MS = 10_000;
+const RETRY_MAX_MS = 5 * 60_000;
 
 export function formatTranscriptLine(m: Message): string {
   const flat = m.body.replace(/\s*\n\s*/g, ' ').trim();
@@ -57,6 +79,12 @@ export function documentOutline(content: string, maxHeadings = 40): string {
   return out.join('\n');
 }
 
+/** The model is asked for bare JSON; tolerate a markdown fence around it. */
+function unfence(text: string): string {
+  const m = /^\s*```(?:json)?\s*\n([\s\S]*?)\n\s*```\s*$/i.exec(text);
+  return (m ? m[1]! : text).trim();
+}
+
 export class Listener {
   private readonly log: Logger;
   private readonly t: Tunables;
@@ -66,11 +94,13 @@ export class Listener {
   private classifiedCount = 0;
   private debounceTimer: NodeJS.Timeout | null = null;
   private maxWaitTimer: NodeJS.Timeout | null = null;
+  private retryTimer: NodeJS.Timeout | null = null;
   private running: Promise<void> | null = null;
   private rerun = false;
   private stopped = false;
   private lastContext: string | null = null;
   private checkpoints = 0;
+  private failures = 0;
 
   constructor(private readonly deps: ListenerDeps) {
     this.log = deps.logger ?? noopLogger;
@@ -105,6 +135,7 @@ export class Listener {
     return this.window.length - this.classifiedCount;
   }
 
+  /** How many times the transcript checkpoint was re-anchored (old classified messages dropped). */
   get checkpointCount(): number {
     return this.checkpoints;
   }
@@ -112,13 +143,26 @@ export class Listener {
   private clearTimers(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.maxWaitTimer) clearTimeout(this.maxWaitTimer);
+    if (this.retryTimer) clearTimeout(this.retryTimer);
     this.debounceTimer = null;
     this.maxWaitTimer = null;
+    this.retryTimer = null;
   }
 
   private fire(): void {
     this.clearTimers();
-    void this.run();
+    // run() only rejects if a callback throws; never let that become an unhandled rejection
+    this.run().catch((e) =>
+      this.log('error', 'listener run failed', { roomId: this.deps.roomId, error: errMessage(e) }),
+    );
+  }
+
+  /** A failed classification leaves its messages pending; without a retry they would wait for the next chat message. */
+  private scheduleRetry(): void {
+    if (this.stopped || this.retryTimer || this.pendingCount === 0) return;
+    const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(this.failures - 1, 10));
+    this.retryTimer = setTimeout(() => this.fire(), delay);
+    this.retryTimer.unref?.();
   }
 
   private run(): Promise<void> {
@@ -128,10 +172,12 @@ export class Listener {
     }
     this.running = (async () => {
       try {
+        let ok = true;
         do {
           this.rerun = false;
-          if (!this.stopped && this.pendingCount > 0) await this.classify();
-        } while (this.rerun && !this.stopped);
+          if (!this.stopped && this.pendingCount > 0) ok = await this.classify();
+          // a failed pass is not repeated back to back; the retry timer takes over
+        } while (this.rerun && ok && !this.stopped);
       } finally {
         this.running = null;
         // messages that arrived mid-flight already armed their own timers via push()
@@ -146,9 +192,13 @@ export class Listener {
     const docBlocks: string[] = [];
     for (const d of docs) {
       const content = await repo.readFile(d.path).catch(() => null);
-      docBlocks.push(`### ${d.path} (${d.title})\n${content === null ? '(missing)' : documentOutline(content)}`);
+      docBlocks.push(
+        `### ${d.path} (${d.title})\n${content === null ? '(missing)' : documentOutline(content)}`,
+      );
     }
-    const open = state.proposals.filter((p) => p.state === 'open' || p.state === 'merging' || p.state === 'drafting');
+    const open = state.proposals.filter(
+      (p) => p.state === 'open' || p.state === 'merging' || p.state === 'drafting',
+    );
     return [
       '# Room',
       `Name: ${state.room.name}`,
@@ -160,20 +210,29 @@ export class Listener {
       docBlocks.length > 0 ? docBlocks.join('\n\n') : '(no documents yet)',
       '',
       '# Open proposals',
-      open.length > 0 ? open.map((p) => `- ${p.title} [${p.kind}, ${p.state}] on ${p.documentId}: ${p.options.map((o) => o.branch).join(', ')}`).join('\n') : '(none)',
+      open.length > 0
+        ? open
+            .map(
+              (p) =>
+                `- ${p.title} [${p.kind}, ${p.state}] on ${p.documentId}: ${p.options.map((o) => o.branch).join(', ')}`,
+            )
+            .join('\n')
+        : '(none)',
     ].join('\n');
   }
 
-  /** Drop old transcript but keep unclassified messages and a little context. */
+  /** Drop old transcript but keep unclassified messages and a little context. Returns how many were dropped. */
   private reanchor(): number {
     const dropped = Math.max(0, this.classifiedCount - CHECKPOINT_KEEP);
+    if (dropped === 0) return 0;
     this.window = this.window.slice(dropped);
     this.classifiedCount -= dropped;
     this.checkpoints++;
     return dropped;
   }
 
-  private async classify(): Promise<void> {
+  /** Returns false when the classification could not be completed (messages stay pending for a retry). */
+  private async classify(): Promise<boolean> {
     const { actions, roomId, client } = this.deps;
     let upTo = this.window.length; // messages arriving during the call stay pending for the next one
     let context: string;
@@ -182,22 +241,34 @@ export class Listener {
       context = await this.buildContext(state);
     } catch (e) {
       this.log('warn', 'listener could not read room context', { roomId, error: errMessage(e) });
+      this.failures++;
       this.deps.onHealth?.(false, errMessage(e));
-      return;
+      this.scheduleRetry();
+      return false;
     }
+    if (this.stopped) return true;
     // The prefix is cached; a changed outline or a full window re-anchors the transcript checkpoint.
-    if ((this.lastContext !== null && this.lastContext !== context) || this.window.length >= this.t.listenerCheckpointMessages) {
+    if (
+      (this.lastContext !== null && this.lastContext !== context) ||
+      this.window.length >= this.t.listenerCheckpointMessages
+    ) {
       upTo -= this.reanchor();
     }
     this.lastContext = context;
 
     const slice = this.window.slice(0, upTo);
     const newMessages = slice.slice(this.classifiedCount);
-    if (newMessages.length === 0) return;
+    if (newMessages.length === 0) return true;
 
     const lastClassified = this.classifiedCount > 0 ? slice[this.classifiedCount - 1]! : null;
-    const content: Anthropic.TextBlockParam[] = slice.map((m) => ({ type: 'text', text: formatTranscriptLine(m) }));
-    content[content.length - 1] = { ...content[content.length - 1]!, cache_control: { type: 'ephemeral' } };
+    const content: Anthropic.TextBlockParam[] = slice.map((m) => ({
+      type: 'text',
+      text: formatTranscriptLine(m),
+    }));
+    content[content.length - 1] = {
+      ...content[content.length - 1]!,
+      cache_control: { type: 'ephemeral' },
+    };
     content.push({
       type: 'text',
       text: lastClassified
@@ -211,7 +282,13 @@ export class Listener {
         model: MODELS.listener,
         max_tokens: MAX_TOKENS,
         thinking: { type: 'adaptive' },
-        output_config: { effort: EFFORT.listener, format: { type: 'json_schema', schema: IntentBatchJsonSchema as unknown as Record<string, unknown> } },
+        output_config: {
+          effort: EFFORT.listener,
+          format: {
+            type: 'json_schema',
+            schema: IntentBatchJsonSchema as unknown as Record<string, unknown>,
+          },
+        },
         system: [
           { type: 'text', text: LISTENER_SYSTEM, cache_control: { type: 'ephemeral' } },
           { type: 'text', text: context, cache_control: { type: 'ephemeral' } },
@@ -219,46 +296,90 @@ export class Listener {
         messages: [{ role: 'user', content }],
       });
     } catch (e) {
-      // leave the messages unclassified: the next push (or flush) retries them
+      // leave the messages unclassified: a retry (or the next push) classifies them
       this.log('warn', 'listener request failed', { roomId, error: errMessage(e) });
+      this.failures++;
       this.deps.onHealth?.(false, errMessage(e));
-      return;
+      this.scheduleRetry();
+      return false;
     }
 
     await this.recordUsage(response);
-    this.classifiedCount = slice.length;
+    this.failures = 0;
     this.deps.onHealth?.(true);
+    if (this.stopped) return true;
+    this.classifiedCount = slice.length;
 
-    const intents = this.parse(response);
+    const intents = this.parse(
+      response,
+      new Set(slice.map((m) => m.id)),
+      newMessages.map((m) => m.id),
+    );
     const threshold = this.t.listenerConfidenceThreshold;
     const forward = intents.filter((i) => i.type !== 'none' && i.confidence >= threshold);
-    this.log('debug', 'listener classified', { roomId, messages: newMessages.length, intents: intents.length, forwarded: forward.length });
+    this.log('debug', 'listener classified', {
+      roomId,
+      messages: newMessages.length,
+      intents: intents.length,
+      forwarded: forward.length,
+    });
     if (forward.length > 0) {
       try {
-        this.deps.onIntents({ intents: forward, messages: newMessages });
+        this.deps.onIntents({ intents: forward, messages: newMessages, context: slice });
       } catch (e) {
         this.log('error', 'listener onIntents threw', { roomId, error: errMessage(e) });
       }
     }
+    return true;
   }
 
-  private parse(response: Anthropic.Message): Intent[] {
+  /**
+   * Validates intents one by one, so a single malformed entry does not discard the others. Message ids the model made
+   * up are dropped (they would end up in commit trailers); an intent left with none refers to the new messages.
+   */
+  private parse(response: Anthropic.Message, known: Set<string>, fallbackIds: string[]): Intent[] {
     if (response.stop_reason === 'refusal' || response.stop_reason === 'max_tokens') {
-      this.log('warn', 'listener response unusable', { roomId: this.deps.roomId, stop: response.stop_reason });
+      this.log('warn', 'listener response unusable', {
+        roomId: this.deps.roomId,
+        stop: response.stop_reason,
+      });
       return [];
     }
     const text = response.content
       .filter((b): b is Anthropic.TextBlock => b.type === 'text')
       .map((b) => b.text)
       .join('');
+    let raw: unknown;
     try {
-      const parsed = IntentBatchSchema.safeParse(JSON.parse(text));
-      if (parsed.success) return parsed.data.intents;
-      this.log('warn', 'listener output failed schema validation', { roomId: this.deps.roomId, issues: parsed.error.issues.length });
+      raw = (JSON.parse(unfence(text)) as { intents?: unknown } | null)?.intents;
     } catch (e) {
-      this.log('warn', 'listener output was not JSON', { roomId: this.deps.roomId, error: errMessage(e) });
+      this.log('warn', 'listener output was not JSON', {
+        roomId: this.deps.roomId,
+        error: errMessage(e),
+      });
+      return [];
     }
-    return [];
+    if (!Array.isArray(raw)) {
+      this.log('warn', 'listener output has no intents array', { roomId: this.deps.roomId });
+      return [];
+    }
+    const out: Intent[] = [];
+    let invalid = 0;
+    for (const item of raw) {
+      const parsed = IntentSchema.safeParse(item);
+      if (!parsed.success) {
+        invalid++;
+        continue;
+      }
+      const ids = parsed.data.messageIds.filter((id) => known.has(id));
+      out.push({ ...parsed.data, messageIds: ids.length > 0 ? ids : fallbackIds });
+    }
+    if (invalid > 0)
+      this.log('warn', 'listener dropped intents that failed schema validation', {
+        roomId: this.deps.roomId,
+        invalid,
+      });
+    return out;
   }
 
   private async recordUsage(response: Anthropic.Message): Promise<void> {
@@ -266,7 +387,12 @@ export class Listener {
     if (!u) return;
     const cacheRead = u.cache_read_input_tokens ?? 0;
     const cacheWrite = u.cache_creation_input_tokens ?? 0;
-    const costUsd = (u.input_tokens * PRICE.input + u.output_tokens * PRICE.output + cacheRead * PRICE.cacheRead + cacheWrite * PRICE.cacheWrite) / 1_000_000;
+    const costUsd = estimateCostUsd(MODELS.listener, {
+      input: u.input_tokens,
+      output: u.output_tokens,
+      cacheRead,
+      cacheWrite,
+    });
     await this.deps.actions
       .recordUsage({
         roomId: this.deps.roomId,
