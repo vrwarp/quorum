@@ -1,0 +1,29 @@
+{
+  "name": "quorum",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": ["packages/*", "e2e"],
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "build": "npm run build -w @quorum/shared && npm run build -w @quorum/server && npm run build -w @quorum/client",
+    "typecheck": "tsc -b packages/shared packages/server packages/client e2e",
+    "test": "vitest run",
+    "test:e2e": "playwright test -c e2e/playwright.config.ts",
+    "dev:server": "npm run dev -w @quorum/server",
+    "dev:client": "npm run dev -w @quorum/client",
+    "start": "node packages/server/dist/main.js",
+    "docker:build": "docker build -t quorum .",
+    "format": "prettier --write \"packages/**/*.{ts,tsx,css,json}\" \"e2e/**/*.ts\"",
+    "format:check": "prettier --check \"packages/**/*.{ts,tsx,css,json}\" \"e2e/**/*.ts\"",
+    "validate": "npm run typecheck && npm run format:check && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.10.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^5.0.3"
+  }
+}

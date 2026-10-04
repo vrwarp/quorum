@@ -1,0 +1,108 @@
+name: Publish Docker image
+
+# Builds the image for a commit on main and pushes it to Docker Hub. It runs only
+# after the CI workflow has passed on that commit, so a merge that breaks a test
+# is never published. A manual run rebuilds the current main (for example to pick
+# up a base image fix) and can add an extra tag.
+#
+# Setup (repository Settings -> Secrets and variables -> Actions):
+#   secret   DOCKERHUB_TOKEN     an access token from https://app.docker.com/settings/personal-access-tokens
+#   variable DOCKERHUB_USERNAME  only if the Docker Hub account is not named after the GitHub owner
+#   variable DOCKERHUB_IMAGE     only to publish under another repository name than <username>/quorum
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: Additional tag to apply (for example v0.1.0)
+        required: false
+        default: ''
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME || github.repository_owner }}
+  IMAGE: docker.io/${{ vars.DOCKERHUB_IMAGE || format('{0}/quorum', vars.DOCKERHUB_USERNAME || github.repository_owner) }}
+
+jobs:
+  publish:
+    name: Build and push
+    # workflow_run fires for failed CI runs too; only a green run publishes.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check the Docker Hub credentials are set
+        env:
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::DOCKERHUB_TOKEN is not set. Create an access token at" \
+                 "https://app.docker.com/settings/personal-access-tokens and add it under" \
+                 "Settings -> Secrets and variables -> Actions. Set the DOCKERHUB_USERNAME" \
+                 "variable too if the Docker Hub account is not '${{ github.repository_owner }}'."
+            exit 1
+          fi
+
+      # Build exactly the commit CI tested, not whatever main points at now.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve the commit being published
+        id: commit
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The Claude Code binary ships per platform, so arm64 is built rather than assumed.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=sha-${{ steps.commit.outputs.short }}
+            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
+          labels: |
+            org.opencontainers.image.title=Quorum
+            org.opencontainers.image.description=Multiplayer deliberation room where an autonomous agent maintains markdown documents in git.
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published to Docker Hub"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo "Run it with: QUORUM_IMAGE=${IMAGE}:latest docker compose pull && docker compose up -d"
+          } >> "$GITHUB_STEP_SUMMARY"

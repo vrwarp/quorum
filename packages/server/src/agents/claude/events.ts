@@ -1,0 +1,266 @@
+import type { Change, Intent, Message, Proposal, RoomState, Sha, UserId } from '@quorum/shared';
+import { authorName } from '../common.js';
+import type { ExplorationOutcome } from './workers.js';
+
+/** Everything the orchestrator hears about arrives as one of these, rendered as one user turn. */
+export type OrchestratorEvent =
+  | { type: 'intent'; intent: Intent; messages: Message[]; openProposals?: Proposal[] }
+  /** `notApplied`: why the server did not apply the suggestion itself (changed text, too large, ...) */
+  | { type: 'suggestion'; message: Message; notApplied?: string }
+  /** the server applied an exact-match suggestion itself (commit `sha` on `documentPath`); nothing is left to apply */
+  | {
+      type: 'suggestion_applied';
+      message: Message;
+      sha: Sha;
+      documentPath: string;
+      /** the commit landed but the Change card or the suggestion card could not be updated */
+      bookkeepingFailed?: string;
+    }
+  | { type: 'ask'; message: Message }
+  /** the workers of a start_exploration call finished (or timed out); this is when the orchestrator opens the proposal */
+  | { type: 'exploration_finished'; outcome: ExplorationOutcome }
+  | { type: 'proposal_event'; event: ProposalEventInput }
+  | { type: 'revert'; change: Change; revertSha: Sha; byUserId: UserId }
+  | { type: 'expiry_check'; proposals: Proposal[]; now: string };
+
+export type ProposalEventInput =
+  | { type: 'merged'; proposal: Proposal; optionId: string; sha: Sha; reconciled: boolean }
+  | { type: 'rejected'; proposal: Proposal; byUserId: UserId }
+  | { type: 'expired' | 'superseded' | 'abandoned'; proposal: Proposal }
+  | { type: 'merge_failed'; proposal: Proposal; reason: string };
+
+export function compactMessage(m: Message): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    id: m.id,
+    from: authorName(m),
+    at: m.createdAt,
+    body: m.body,
+  };
+  if (m.author.kind === 'user') out.userId = m.author.userId;
+  if (m.kind !== 'text') out.kind = m.kind;
+  if (m.card) out.card = m.card.type;
+  if (m.anchor) out.anchor = m.anchor;
+  if (m.inReplyTo.length > 0) out.inReplyTo = m.inReplyTo;
+  return out;
+}
+
+export function compactProposal(p: Proposal): Record<string, unknown> {
+  return {
+    id: p.id,
+    title: p.title,
+    kind: p.kind,
+    state: p.state,
+    documentId: p.documentId,
+    stale: p.stale,
+    reconciled: p.reconciled,
+    branchBase: p.branchBase,
+    openedAt: p.openedAt,
+    windowClosesAt: p.windowClosesAt,
+    mergedOptionId: p.mergedOptionId,
+    mergeSha: p.mergeSha,
+    options: p.options.map((o) => ({
+      id: o.id,
+      label: o.label,
+      branch: o.branch,
+      summary: o.summary,
+    })),
+    votes: p.votes.map((v) => ({
+      userId: v.userId,
+      decision: v.decision,
+      optionId: v.optionId,
+      castAt: v.castAt,
+    })),
+  };
+}
+
+export function compactState(s: RoomState, recent = 20): Record<string, unknown> {
+  return {
+    room: {
+      id: s.room.id,
+      name: s.room.name,
+      ownerId: s.room.ownerId,
+      votingRule: s.room.votingRule,
+    },
+    participants: s.participants.map((p) => ({
+      userId: p.userId,
+      displayName: p.displayName,
+      role: p.role,
+    })),
+    presence: s.presence.map((p) => ({
+      userId: p.userId,
+      connected: p.connected,
+      lastSeenAt: p.lastSeenAt,
+    })),
+    documents: s.documents.map((d) => ({
+      id: d.id,
+      path: d.path,
+      title: d.title,
+      status: d.status,
+      headSha: d.headSha,
+    })),
+    proposals: s.proposals.map(compactProposal),
+    agentStatus: s.agentStatus,
+    // slice(-0) would return everything, so an explicit 0 must mean none
+    recentMessages: recent > 0 ? s.recentMessages.slice(-recent).map(compactMessage) : [],
+  };
+}
+
+/** Short label for "other events in flight" lists. */
+export function eventLabel(e: OrchestratorEvent): string {
+  switch (e.type) {
+    case 'intent':
+      return `intent:${e.intent.type} ${e.intent.summary}`.slice(0, 120);
+    case 'suggestion':
+      return `suggestion ${e.message.id}`;
+    case 'suggestion_applied':
+      return `suggestion_applied ${e.message.id}`;
+    case 'ask':
+      return `ask ${e.message.id}`;
+    case 'exploration_finished':
+      return `exploration_finished ${e.outcome.explorationId} (${e.outcome.topic})`.slice(0, 120);
+    case 'proposal_event':
+      return `proposal ${e.event.type} ${e.event.proposal.id}`;
+    case 'revert':
+      return `revert ${e.change.sha}`;
+    case 'expiry_check':
+      return 'expiry_check';
+  }
+}
+
+export function eventPayload(e: OrchestratorEvent): Record<string, unknown> {
+  switch (e.type) {
+    case 'intent':
+      return {
+        intent: e.intent,
+        messages: e.messages.map(compactMessage),
+        // lets the orchestrator judge expiry on every listener cycle (PRD 7.4) without an extra turn
+        ...(e.openProposals && e.openProposals.length > 0
+          ? { openProposals: e.openProposals.map(compactProposal) }
+          : {}),
+        ...(e.intent.type === 'question' && e.intent.needsResearch
+          ? {
+              hint: 'This question needs the web: call start_exploration with mode "research" (never draft mode), then answer from its findings when exploration_finished arrives.',
+            }
+          : {}),
+      };
+    case 'suggestion': {
+      const card = e.message.card;
+      return {
+        messageId: e.message.id,
+        author: compactMessage(e.message).from,
+        authorUserId: e.message.author.kind === 'user' ? e.message.author.userId : null,
+        anchor: card?.type === 'suggestion' ? card.anchor : e.message.anchor,
+        replacement: card?.type === 'suggestion' ? card.replacement : null,
+        cardStatus: card?.type === 'suggestion' ? card.status : null,
+        note: e.message.body,
+        ...(e.notApplied ? { notAppliedByServer: e.notApplied } : {}),
+      };
+    }
+    case 'suggestion_applied': {
+      const card = e.message.card;
+      const anchor = card?.type === 'suggestion' ? card.anchor : e.message.anchor;
+      return {
+        messageId: e.message.id,
+        author: compactMessage(e.message).from,
+        authorUserId: e.message.author.kind === 'user' ? e.message.author.userId : null,
+        document: e.documentPath,
+        lines: anchor ? [anchor.startLine, anchor.endLine] : null,
+        replacement: card?.type === 'suggestion' ? card.replacement : null,
+        sha: e.sha,
+        ...(e.bookkeepingFailed
+          ? {
+              problem: e.bookkeepingFailed,
+              note: 'The server committed this suggestion as given, but its bookkeeping failed: call resolve_suggestion with status "applied" and this sha. Then check whether other documents now contradict it.',
+            }
+          : {
+              note: 'The server applied this suggestion as given and resolved its card. Nothing to edit or resolve; only check whether other documents now contradict it.',
+            }),
+      };
+    }
+    case 'exploration_finished': {
+      const o = e.outcome;
+      const common = {
+        explorationId: o.explorationId,
+        mode: o.mode,
+        document: o.documentPath,
+        topic: o.topic,
+        partial: o.partial,
+        failures: o.failures,
+        chatSinceStart: o.chatSinceStart,
+      };
+      if (o.mode === 'research')
+        return {
+          ...common,
+          findings: o.findings,
+          next: 'Answer the question in chat from these findings and their sources.',
+        };
+      return {
+        ...common,
+        branchBase: o.branchBase,
+        workers: o.workers.map((w) => ({
+          label: w.label,
+          branch: w.branch,
+          thesis: w.thesis,
+          changed: w.changed,
+          headSha: w.headSha,
+          diffStat: w.diffStat ?? null,
+          summary: w.summary,
+          tradeoffs: w.tradeoffs,
+          assumptions: w.assumptions,
+          openQuestions: w.openQuestions,
+          sourcesConsulted: w.sourcesConsulted,
+          timedOut: w.timedOut,
+          ...(w.error ? { error: w.error } : {}),
+          ...(w.scopeReverted ? { scopeReverted: w.scopeReverted } : {}),
+        })),
+        next: 'Read chatSinceStart, then open_proposal (branchBase as given): quorum for two or more changed options, review for one.',
+      };
+    }
+    case 'ask': {
+      const card = e.message.card;
+      return {
+        messageId: e.message.id,
+        author: compactMessage(e.message).from,
+        anchor: card?.type === 'ask' ? card.anchor : e.message.anchor,
+        question: card?.type === 'ask' ? card.question : e.message.body,
+      };
+    }
+    case 'proposal_event': {
+      const ev = e.event;
+      const base: Record<string, unknown> = {
+        event: ev.type,
+        proposal: compactProposal(ev.proposal),
+      };
+      if (ev.type === 'merged')
+        Object.assign(base, { optionId: ev.optionId, sha: ev.sha, reconciled: ev.reconciled });
+      if (ev.type === 'rejected') base.byUserId = ev.byUserId;
+      if (ev.type === 'merge_failed') base.reason = ev.reason;
+      return base;
+    }
+    case 'revert':
+      return {
+        change: {
+          sha: e.change.sha,
+          documentId: e.change.documentId,
+          summary: e.change.summary,
+          actor: e.change.actor,
+          triggerMessageIds: e.change.triggerMessageIds,
+        },
+        revertSha: e.revertSha,
+        byUserId: e.byUserId,
+      };
+    case 'expiry_check':
+      return { now: e.now, openProposals: e.proposals.map(compactProposal) };
+  }
+}
+
+/** The user turn the orchestrator sees: `[event:<type>]` header plus a JSON payload. */
+export function formatEvent(e: OrchestratorEvent, otherInFlight: string[] = []): string {
+  const payload: Record<string, unknown> = { ...eventPayload(e) };
+  if (otherInFlight.length > 0) payload.otherEventsInFlight = otherInFlight;
+  return `[event:${e.type}]\n${JSON.stringify(payload, null, 2)}`;
+}
+
+export function formatRehydrate(preamble: string, state: RoomState, messages: Message[]): string {
+  return `[event:rehydrate]\n${preamble}\n${JSON.stringify({ state: { ...compactState(state, 0) }, lastMessages: messages.map(compactMessage) }, null, 2)}`;
+}

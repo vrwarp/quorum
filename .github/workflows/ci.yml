@@ -1,0 +1,68 @@
+name: CI
+
+# Unit and end-to-end checks for every pull request and every push to main.
+# The two jobs run in parallel; both must pass before "Publish Docker image"
+# builds the merged commit (that workflow listens for this one to succeed).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Typecheck, format, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run format:check
+      - name: Unit and integration tests (vitest)
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  e2e:
+    name: End-to-end tests (Playwright, fake runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+      - name: Production build
+        run: npm run build
+      # The suite starts the built server itself with QUORUM_RUNTIME=fake, so no
+      # Anthropic credentials are needed or used.
+      - name: Playwright
+        run: npm run test:e2e
+        env:
+          CI: 'true'
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report
+            test-results
+          retention-days: 14
+          if-no-files-found: ignore
