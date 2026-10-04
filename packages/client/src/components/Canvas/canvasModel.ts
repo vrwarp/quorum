@@ -1,25 +1,83 @@
 import type { Anchor, DocumentId, Message } from '@quorum/shared';
 import { textHash } from '@quorum/shared';
 
+export type BlockKind = 'text' | 'code' | 'table' | 'definition';
+
+/** One block of the canvas: what a click edits and an anchor points at. */
 export interface Line {
-  /** 1-based source line */
+  /** 1-based first source line */
   line: number;
+  /** 1-based last source line (the same as `line` for a one-line block) */
+  endLine: number;
+  /** the source lines of the block joined with "\n", exactly as they are in the file */
   text: string;
-  /** true for fence markers and lines inside a fenced code block */
-  raw: boolean;
+  /**
+   * text: one paragraph line; code: a whole fenced block (```mermaid is drawn as a diagram); table: a GFM table, header
+   * to last row; definition: a link reference definition (`[image1]: data:image/png;base64,...`), which the other blocks
+   * need in order to resolve `![alt][image1]`
+   */
+  kind: BlockKind;
 }
 
-/** One block per non-blank source line (a paragraph is one line); fenced code is kept verbatim. */
+const FENCE = /^\s{0,3}(```|~~~)/;
+/** `| a | b |` style row: has a pipe and is not a fence */
+const TABLE_ROW = /\|/;
+/** the delimiter row under a table header: `| --- | :-: |` */
+const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+/** `[label]: destination` (a footnote `[^1]:` is not one) */
+const DEFINITION = /^\s{0,3}\[(?!\^)[^\]]+\]:\s*\S/;
+
+/**
+ * Splits a document into blocks: one per non-blank line (a paragraph is one line), except that a fenced code block
+ * (blank lines inside it included) and a table each make one block, so they can be rendered whole.
+ */
 export function splitLines(source: string): Line[] {
+  const src = source.split('\n');
   const out: Line[] = [];
-  let fenced = false;
-  source.split('\n').forEach((text, i) => {
-    const isFence = /^\s*(```|~~~)/.test(text);
-    if (isFence) fenced = !fenced;
-    if (text.trim() === '') return;
-    out.push({ line: i + 1, text, raw: isFence || fenced });
-  });
+  const push = (start: number, end: number, kind: BlockKind) =>
+    out.push({
+      line: start + 1,
+      endLine: end + 1,
+      text: src.slice(start, end + 1).join('\n'),
+      kind,
+    });
+  for (let i = 0; i < src.length; i++) {
+    const text = src[i]!;
+    if (text.trim() === '') continue;
+    const fence = FENCE.exec(text);
+    if (fence) {
+      const marker = fence[1]!;
+      let end = i + 1;
+      while (end < src.length && !src[end]!.trimStart().startsWith(marker)) end++;
+      end = Math.min(end, src.length - 1); // an unclosed fence runs to the end of the document
+      push(i, end, 'code');
+      i = end;
+      continue;
+    }
+    if (
+      TABLE_ROW.test(text) &&
+      i + 1 < src.length &&
+      TABLE_DELIMITER.test(src[i + 1]!) &&
+      src[i + 1]!.includes('|')
+    ) {
+      let end = i + 1;
+      while (end + 1 < src.length && src[end + 1]!.trim() !== '' && TABLE_ROW.test(src[end + 1]!))
+        end++;
+      push(i, end, 'table');
+      i = end;
+      continue;
+    }
+    push(i, i, DEFINITION.test(text) ? 'definition' : 'text');
+  }
   return out;
+}
+
+/** The document's link reference definitions, appended to each block so `![alt][label]` resolves wherever it is. */
+export function definitionsOf(lines: readonly Line[]): string {
+  return lines
+    .filter((l) => l.kind === 'definition')
+    .map((l) => l.text)
+    .join('\n');
 }
 
 /** line number -> hash of its text (the same hash anchors carry) */
@@ -39,7 +97,7 @@ export function makeAnchor(documentId: DocumentId, baseSha: string, l: Line): An
     documentId,
     baseSha,
     startLine: l.line,
-    endLine: l.line,
+    endLine: l.endLine,
     textHash: textHash(l.text),
     text: l.text,
   };

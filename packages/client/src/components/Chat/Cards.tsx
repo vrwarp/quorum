@@ -8,6 +8,7 @@ import type { CollapseReason } from '../../proposalState';
 import { useCommand, useProposal, useRoom } from '../../store';
 import { shortSha, useUi } from '../../ui';
 import { Markdown } from '../Markdown';
+import { WordDiff } from '../Diff/WordDiff';
 import { actorName } from './MessageView';
 
 export function CardView({ message, card }: { message: Message; card: Card }) {
@@ -203,28 +204,33 @@ function ChangeCard({ change }: { change: Change }) {
   );
 }
 
+/** "+12 −3 words": how big a suggested edit is, shown while its diff is folded. */
+export function changeSize(before: string, after: string): string {
+  let added = 0;
+  let removed = 0;
+  for (const p of diffWords(before, after)) {
+    const words = p.value.split(/\s+/).filter(Boolean).length;
+    if (p.added) added += words;
+    else if (p.removed) removed += words;
+  }
+  return `+${added} −${removed} word${added + removed === 1 ? '' : 's'}`;
+}
+
 function SuggestionCard({ card }: { card: Extract<Card, { type: 'suggestion' }> }) {
-  const parts = diffWords(card.anchor.text, card.replacement);
+  const size = useMemo(
+    () => changeSize(card.anchor.text, card.replacement),
+    [card.anchor.text, card.replacement],
+  );
   return (
     <div className="card suggestion" data-testid="card-suggestion">
       <div className="card-title">
         Suggestion <span className={`pill status-${card.status}`}>{card.status}</span>
       </div>
-      <div className="diff-text">
-        {parts.map((p, i) =>
-          p.added ? (
-            <ins key={i} className="diff-ins">
-              {p.value}
-            </ins>
-          ) : p.removed ? (
-            <del key={i} className="diff-del">
-              {p.value}
-            </del>
-          ) : (
-            <span key={i}>{p.value}</span>
-          ),
-        )}
-      </div>
+      {/* folded by default: a suggestion can rewrite a whole table or carry an embedded image */}
+      <details className="card-diff" data-testid="suggestion-diff">
+        <summary>Show changes ({size})</summary>
+        <WordDiff before={card.anchor.text} after={card.replacement} />
+      </details>
       {card.replacement === '' && <div className="muted small-text">Deletes this paragraph.</div>}
       <div className="muted small-text">line {card.anchor.startLine}</div>
       {card.note && <p className="muted small-text">{card.note}</p>}

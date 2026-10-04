@@ -53,7 +53,7 @@ export function Editor(props: {
         ref={areaRef}
         data-testid="suggest-textarea"
         aria-label="Suggested text"
-        rows={Math.min(8, Math.max(2, Math.ceil(value.length / 70)))}
+        rows={Math.min(16, Math.max(2, value.split('\n').length, Math.ceil(value.length / 70)))}
         value={value}
         onChange={(e) => props.onValue(e.target.value)}
         onKeyDown={(e) => {

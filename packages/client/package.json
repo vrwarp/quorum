@@ -11,6 +11,7 @@
   "dependencies": {
     "@quorum/shared": "0.1.0",
     "diff": "^8.0.2",
+    "mermaid": "^11.17.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.0.0",

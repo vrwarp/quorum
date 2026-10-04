@@ -142,9 +142,13 @@ archive (a small ustar writer in `tar.ts`, gzip from `node:zlib`).
 
 Vite dev proxy `/api` and `/ws` to the server. Screens: Login, Rooms, Room. Room = chat pane (left) +
 canvas (right) + branch rail (collapsible). Cards per PRD §7.1 with Approve/Reject/vote/Revert buttons.
-Canvas renders markdown by paragraph (one source line = one block) so click-to-suggest and select-to-ask
-can compute `Anchor`s (`textHash` from shared). Diff view uses the `diff` package for word-level diffs of
-`DiffResponse.before/after`. Keep state in a small store (React context + reducer); no state libraries.
+Canvas renders markdown by paragraph (one source line = one block, except that a fenced code block and a GFM table are
+one block each, so their anchors span several lines) so click-to-suggest and select-to-ask can compute `Anchor`s
+(`textHash` from shared). ` ```mermaid ` fences are drawn with Mermaid (loaded on first use, `securityLevel:
+'strict'`); `data:image/*` URLs are allowed as image sources, and link reference definitions (`[image1]: data:...`) are
+handed to every block so `![alt][image1]` resolves. Diff view uses the `diff` package for word-level diffs of
+`DiffResponse.before/after`, with unchanged stretches folded (3 lines of context); suggestion cards keep their diff folded
+until opened. Keep state in a small store (React context + reducer); no state libraries.
 
 ### integration and e2e (M2)
 
