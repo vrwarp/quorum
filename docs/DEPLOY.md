@@ -52,6 +52,8 @@ itself after 28 s; Docker's default of 10 s would kill it in the middle of a mer
 | `QUORUM_RUNTIME`                    | `.env` (optional)      | `claude` (the default) or `fake` (scripted agents, for smoke tests).                                     |
 | `QUORUM_TRUST_PROXY`                | `.env` (optional)      | `1` takes the client address from `X-Forwarded-For`. Compose defaults it to `1`; see "HTTPS".            |
 | `QUORUM_ALLOWED_ORIGINS`            | `.env` (optional)      | Extra origins allowed to open the WebSocket, comma-separated (for example `https://quorum.example.com`). |
+| `QUORUM_TRACE`                      | `.env` (optional)      | `0` turns the debug trace off (on by default); see "Debug trace and export".                             |
+| `QUORUM_TRACE_MAX_MB`               | `.env` (optional)      | Space the debug trace files may take before the oldest are deleted, default 500.                         |
 | `QUORUM_DOMAIN`                     | `.env` (caddy profile) | Public host name for automatic HTTPS.                                                                    |
 
 `PORT`, `QUORUM_DATA_DIR`, `QUORUM_CLIENT_DIST`, `HOME`, `CLAUDE_CONFIG_DIR` and `NODE_ENV` are fixed in the image
@@ -189,6 +191,21 @@ docker compose ps            # the healthcheck hits /api/health
 
 Set `QUORUM_DEBUG=1` in `.env` for debug logging. If the `caddy` container keeps restarting, `docker compose logs caddy`
 says what it is missing (usually `QUORUM_DOMAIN`).
+
+### Debug trace and export
+
+The server keeps a structured debug trace (JSON lines) under `/data/debug/traces`: every log line (debug ones too,
+whatever `QUORUM_DEBUG` says), API requests, WebSocket commands and their outcome, room events, runtime calls, every
+Agent SDK session (its options, prompt, streamed input and each message it produced) and listener request and reply, and
+errors reported by browsers. It is not anonymized. Files rotate at 20 MB and the oldest are deleted once all of them pass
+`QUORUM_TRACE_MAX_MB` (default 500). `QUORUM_TRACE=0` turns it off.
+
+The admin downloads everything as one `.tar.gz` from **Settings -> Diagnostics** (or `GET /api/debug/export`, with
+`?sinceHours=N` to limit traces and transcripts to recent ones and `?repos=0` to leave the repositories out). The
+archive holds `manifest.json` (versions, configuration, tunables), `traces/`, `database/<table>.jsonl` (every table
+except `sessions`), `repos/<roomId>.bundle` and `.log.txt` (`git clone x.bundle` restores a room's history) and
+`claude/projects/` (the agents' Claude Code transcripts). Passwords, API keys, OAuth tokens and session tokens are not
+included; chat, documents and prompts are, as they are.
 
 ## Resources
 

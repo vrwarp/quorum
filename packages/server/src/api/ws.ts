@@ -5,6 +5,7 @@ import type { ClientCommand, ServerEvent } from '@quorum/shared';
 import type { Storage } from '../contracts/index.js';
 import type { Hub, Logger } from '../room/types.js';
 import { RoomError } from '../room/types.js';
+import { noopTracer, type Tracer } from '../debug/tracer.js';
 import { createAuth } from './auth.js';
 import { originAllowed } from './net.js';
 import { parseClientCommand } from './schemas.js';
@@ -16,6 +17,8 @@ export interface WsOptions {
   pingIntervalMs?: number;
   /** Origins (beyond the server's own host) whose pages may open a socket: `QUORUM_ALLOWED_ORIGINS` */
   allowedOrigins?: readonly string[];
+  /** debug trace: connections, commands (with their outcome and duration) and disconnects */
+  trace?: Tracer;
 }
 
 export interface WsHandle {
@@ -46,6 +49,8 @@ function reject(socket: Duplex, status: number, text: string): void {
 export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
   const { service, storage } = opts;
   const log: Logger = opts.logger ?? (() => undefined);
+  const trace = opts.trace ?? noopTracer;
+  let nextSocketId = 1;
   // only token resolution is needed here; password is irrelevant
   const auth = createAuth({ storage, config: { password: null } });
   const alive = new WeakMap<WebSocket, boolean>();
@@ -95,6 +100,9 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
   }
 
   function onConnection(ws: WebSocket, roomId: string, userId: string): void {
+    const socketId = nextSocketId++;
+    const connectedAt = Date.now();
+    trace.record('ws.connect', { socketId, roomId, userId });
     alive.set(ws, true);
     let disconnect: (() => void) | null = null;
     let closed = false;
@@ -114,9 +122,19 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
 
     /** Run one command; whatever goes wrong is reported to the sender under the command's `cid`. */
     const run = async (cmd: ClientCommand, cid: string | undefined): Promise<void> => {
+      const started = Date.now();
       try {
         await service.handle(roomId, userId, cmd);
+        trace.record('ws.command', { socketId, roomId, userId, cmd, ms: Date.now() - started });
       } catch (err) {
+        trace.record('ws.command', {
+          socketId,
+          roomId,
+          userId,
+          cmd,
+          ms: Date.now() - started,
+          error: err instanceof RoomError ? { code: err.code, message: err.message } : err,
+        });
         if (!(err instanceof RoomError))
           log('error', 'command failed', {
             type: cmd.type,
@@ -137,6 +155,13 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
         });
       const parsed = parseClientCommand(data.toString());
       if (!parsed.ok) {
+        trace.record('ws.bad_command', {
+          socketId,
+          roomId,
+          userId,
+          raw: data.toString(),
+          message: parsed.message,
+        });
         return sendEvent(ws, {
           type: 'error',
           code: 'bad_request',
@@ -160,6 +185,7 @@ export function attachWebSocket(server: Server, opts: WsOptions): WsHandle {
     const cleanup = () => {
       if (closed) return;
       closed = true;
+      trace.record('ws.disconnect', { socketId, roomId, userId, ms: Date.now() - connectedAt });
       void ready.then(() => disconnect?.());
     };
     ws.on('close', cleanup);

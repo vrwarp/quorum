@@ -1,4 +1,5 @@
 import type { ClientCommand, ServerEvent } from '@quorum/shared';
+import { clientLog } from './debug';
 
 type EventHandler = (ev: ServerEvent) => void;
 type StatusHandler = (connected: boolean) => void;
@@ -63,6 +64,7 @@ export class RoomSocket {
     let opened = false;
     ws.onopen = () => {
       opened = true;
+      clientLog('info', 'socket open', { roomId: this.roomId, attempts: this.attempts });
       this.statusHandlers.forEach((h) => h(true));
     };
     ws.onmessage = (e) => {
@@ -78,9 +80,16 @@ export class RoomSocket {
         return;
       }
       if (ev.type === 'hello') this.attempts = 0;
+      if (ev.type === 'error') clientLog('warn', 'server error event', ev);
       this.handlers.forEach((h) => h(ev));
     };
-    ws.onclose = () => {
+    ws.onclose = (e) => {
+      clientLog(this.closed ? 'debug' : 'warn', 'socket closed', {
+        roomId: this.roomId,
+        code: e?.code,
+        reason: e?.reason,
+        opened,
+      });
       if (this.ws === ws) this.ws = null;
       this.statusHandlers.forEach((h) => h(false));
       if (this.closed) return;
@@ -103,6 +112,7 @@ export class RoomSocket {
 
   /** Stop for good; a new RoomSocket is made when the person acts on the notice. */
   private giveUp(failure: SocketFailure): void {
+    clientLog('warn', 'socket gave up', { roomId: this.roomId, failure });
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     this.ws?.close();
@@ -125,7 +135,13 @@ export class RoomSocket {
 
   /** Returns false when the socket is not open (the command is dropped). */
   send(cmd: ClientCommand): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      clientLog('warn', 'command dropped: socket not open', {
+        roomId: this.roomId,
+        type: cmd.type,
+      });
+      return false;
+    }
     this.ws.send(JSON.stringify(cmd));
     return true;
   }

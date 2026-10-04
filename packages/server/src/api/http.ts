@@ -10,6 +10,7 @@ import { RoomError, type Logger, type RoomErrorCode } from '../room/types.js';
 import { LoginLimitError, type ClaudeAuthService } from '../claudeauth/index.js';
 import { AuthError, createAuth } from './auth.js';
 import { clientAddress, originAllowed } from './net.js';
+import { noopTracer, writeDebugExport, type Tracer, type TraceFiles } from '../debug/index.js';
 
 export interface HttpOptions {
   service: Pick<
@@ -28,6 +29,16 @@ export interface HttpOptions {
     ClaudeAuthService,
     'status' | 'startLogin' | 'submitCode' | 'cancel' | 'logout'
   >;
+  /**
+   * Debug instrumentation: `trace` records API requests and client reports; `debugExport` makes
+   * `GET /api/debug/export` (admin only) answer with a .tar.gz of traces, database, repositories and transcripts.
+   */
+  trace?: Tracer;
+  debugExport?: {
+    config: Parameters<typeof writeDebugExport>[1]['config'];
+    traces: TraceFiles | null;
+    databasePath: string | null;
+  };
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -35,6 +46,8 @@ const MAX_BODY_BYTES = 256 * 1024;
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const LOGIN_FAILURES_PER_WINDOW = 10;
 const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
+/** most entries one client report may carry */
+const CLIENT_LOG_MAX_ENTRIES = 100;
 
 class HttpError extends Error {
   constructor(
@@ -167,6 +180,9 @@ function safeRef(ref: string): string {
 export function createHttpServer(opts: HttpOptions): Server {
   const { service, storage, config } = opts;
   const log: Logger = opts.logger ?? (() => undefined);
+  const trace = opts.trace ?? noopTracer;
+  /** who made each request, for the trace */
+  const requestUsers = new WeakMap<ServerResponse, string>();
   const auth = createAuth({ storage, config });
   const distRoot = path.resolve(config.clientDistDir);
   const loginStartThrottle = new Throttle(5, 10 * 60_000);
@@ -236,16 +252,17 @@ export function createHttpServer(opts: HttpOptions): Server {
       return user;
     };
     /** Quorum has no global owner; the first person who signed in is the admin of the server itself. */
-    const requireAdmin = (): User => {
+    const requireAdmin = (what = 'manage the Claude sign-in'): User => {
       const u = requireUser();
       if (!u.admin)
         throw new HttpError(
           403,
           'forbidden',
-          "only the server's admin (the first person who signed in) can manage the Claude sign-in",
+          `only the server's admin (the first person who signed in) can ${what}`,
         );
       return u;
     };
+    if (user) requestUsers.set(res, user.id);
 
     if (method === 'GET' && p === '/api/me') {
       const u = requireUser();
@@ -263,6 +280,68 @@ export function createHttpServer(opts: HttpOptions): Server {
       if (typeof body.name !== 'string')
         throw new HttpError(400, 'bad_request', 'name is required');
       sendJson(res, 201, await service.createRoom(u.id, body.name));
+      return true;
+    }
+
+    if (method === 'POST' && p === '/api/debug/client-log') {
+      const u = requireUser();
+      const body = await readJson(req);
+      const entries = Array.isArray(body.entries) ? body.entries : [];
+      for (const entry of entries.slice(0, CLIENT_LOG_MAX_ENTRIES))
+        trace.record('client.log', { userId: u.id, userAgent: req.headers['user-agent'], entry });
+      if (entries.length > CLIENT_LOG_MAX_ENTRIES)
+        trace.record('client.log.dropped', {
+          userId: u.id,
+          count: entries.length - CLIENT_LOG_MAX_ENTRIES,
+        });
+      sendJson(res, 200, { ok: true, enabled: trace.enabled });
+      return true;
+    }
+    if (method === 'GET' && p === '/api/debug/status') {
+      requireAdmin('read the debug status');
+      const files = opts.debugExport?.traces?.files() ?? [];
+      sendJson(res, 200, {
+        tracing: trace.enabled,
+        exportAvailable: Boolean(opts.debugExport),
+        traceFiles: files.length,
+        traceBytes: files.reduce((n, f) => n + f.bytes, 0),
+        oldestTrace: files[0] ? new Date(files[0].mtimeMs).toISOString() : null,
+      });
+      return true;
+    }
+    if (method === 'GET' && p === '/api/debug/export') {
+      const u = requireAdmin('download a debug export');
+      const exp = opts.debugExport;
+      if (!exp)
+        throw new HttpError(503, 'debug_export_unavailable', 'debug export is not available');
+      const hoursRaw = url.searchParams.get('sinceHours');
+      const hours = hoursRaw ? Number(hoursRaw) : NaN;
+      if (hoursRaw && (!Number.isFinite(hours) || hours <= 0))
+        throw new HttpError(400, 'bad_request', 'sinceHours must be a positive number');
+      const flag = (name: string) =>
+        !['0', 'false', 'no'].includes(url.searchParams.get(name) ?? '');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      trace.record('debug.export', { userId: u.id, sinceHours: hoursRaw ? hours : null });
+      res.writeHead(200, {
+        'content-type': 'application/gzip',
+        'content-disposition': `attachment; filename="quorum-debug-${stamp}.tar.gz"`,
+        'cache-control': 'no-store',
+      });
+      await writeDebugExport(
+        res,
+        {
+          ...exp,
+          status: async () => ({
+            claude: opts.claudeAuth ? await opts.claudeAuth.status() : null,
+            rooms: service.listRooms().length,
+          }),
+        },
+        {
+          sinceMs: hoursRaw ? Date.now() - hours * 3_600_000 : undefined,
+          repos: flag('repos'),
+          transcripts: flag('transcripts'),
+        },
+      );
       return true;
     }
 
@@ -492,6 +571,23 @@ export function createHttpServer(opts: HttpOptions): Server {
   }
 
   return http.createServer((req, res) => {
+    const started = Date.now();
+    if (trace.enabled && req.url?.startsWith('/api')) {
+      res.once('close', () => {
+        const path = req.url?.split('?')[0];
+        if (path === '/api/debug/client-log' || path === '/api/health') return; // reports are recorded as themselves
+        trace.record('http', {
+          method: req.method,
+          path,
+          // no API route takes a secret in the query string (the WebSocket's ?token= never reaches this handler)
+          query: req.url?.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : undefined,
+          status: res.statusCode,
+          ms: Date.now() - started,
+          userId: requestUsers.get(res),
+          aborted: !res.writableFinished,
+        });
+      });
+    }
     void (async () => {
       try {
         const url = new URL(req.url ?? '/', 'http://localhost');

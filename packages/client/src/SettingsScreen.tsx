@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import * as api from './api';
-import type { ClaudeStatus, Me } from './api';
+import type { ClaudeStatus, DebugStatus, Me } from './api';
 import { navigate } from './router';
 
 /** Link to /settings, used in the rooms and room headers. */
@@ -47,6 +47,92 @@ function describe(status: ClaudeStatus): string {
  */
 export function endsLogin(e: unknown): boolean {
   return e instanceof api.ApiError && e.status >= 400 && e.status < 500 && e.status !== 429;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+const EXPORT_WINDOWS: Array<{ label: string; hours?: number }> = [
+  { label: 'Last 24 hours', hours: 24 },
+  { label: 'Last 7 days', hours: 24 * 7 },
+  { label: 'Everything' },
+];
+
+/** Admin-only: what the debug trace holds and a link that downloads all of it, compressed. */
+function DiagnosticsCard() {
+  const [status, setStatus] = useState<DebugStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [windowIndex, setWindowIndex] = useState(2);
+  const [repos, setRepos] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .debugStatus()
+      .then((s) => !cancelled && setStatus(s))
+      .catch((e: unknown) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const href = api.debugExportUrl({ sinceHours: EXPORT_WINDOWS[windowIndex]?.hours, repos });
+  return (
+    <section className="settings-card" aria-labelledby="diagnostics-heading">
+      <h2 id="diagnostics-heading">Diagnostics</h2>
+      <p className="muted small-text">
+        A compressed archive (.tar.gz) of the server&apos;s debug trace (logs, requests, room
+        events, every agent prompt and response, browser errors), the database, each room&apos;s git
+        history and the agents&apos; session transcripts. It is not anonymized: chat and documents
+        are included as they are. Passwords, API keys and session tokens are left out.
+      </p>
+      <div className="settings-status">
+        <span data-testid="debug-status">
+          {status
+            ? status.tracing
+              ? `Tracing on: ${status.traceFiles} file${status.traceFiles === 1 ? '' : 's'}, ${formatBytes(status.traceBytes)}`
+              : 'Tracing is off on this server (QUORUM_TRACE=0)'
+            : error
+              ? 'Status unavailable'
+              : 'Checking…'}
+        </span>
+      </div>
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="settings-actions">
+        <select
+          aria-label="Time window"
+          data-testid="debug-window"
+          value={windowIndex}
+          onChange={(e) => setWindowIndex(Number(e.target.value))}
+        >
+          {EXPORT_WINDOWS.map((w, i) => (
+            <option key={w.label} value={i}>
+              {w.label}
+            </option>
+          ))}
+        </select>
+        <label className="small-text">
+          <input
+            type="checkbox"
+            data-testid="debug-repos"
+            checked={repos}
+            onChange={(e) => setRepos(e.target.checked)}
+          />{' '}
+          Include document repositories
+        </label>
+        <a className="btn primary" href={href} download data-testid="debug-export">
+          Download debug export
+        </a>
+      </div>
+    </section>
+  );
 }
 
 export function SettingsScreen() {
@@ -316,6 +402,8 @@ export function SettingsScreen() {
           </div>
         )}
       </section>
+
+      {isAdmin && <DiagnosticsCard />}
     </div>
   );
 }
