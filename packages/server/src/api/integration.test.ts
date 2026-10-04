@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -57,6 +57,24 @@ afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
 });
 
+/**
+ * A stand-in for the built client, so this suite does not depend on `vite build` having run (on a clean checkout, CI
+ * runs the tests before the build). What matters here is the static serving and the SPA fallback, not the real bundle.
+ */
+let clientFixtureDir: string | null = null;
+function clientFixture(): string {
+  if (clientFixtureDir) return clientFixtureDir;
+  const dir = mkdtempSync(path.join(tmpdir(), 'quorum-client-fixture-'));
+  dirs.push(dir);
+  mkdirSync(path.join(dir, 'assets'));
+  writeFileSync(
+    path.join(dir, 'index.html'),
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Quorum</title></head><body><div id="root"></div></body></html>\n',
+  );
+  clientFixtureDir = dir;
+  return dir;
+}
+
 async function boot(dataDir?: string, extraEnv: Record<string, string> = {}): Promise<App> {
   const dir = dataDir ?? mkdtempSync(path.join(tmpdir(), 'quorum-int-'));
   if (!dataDir) dirs.push(dir);
@@ -65,6 +83,7 @@ async function boot(dataDir?: string, extraEnv: Record<string, string> = {}): Pr
     QUORUM_RUNTIME: 'fake',
     QUORUM_PASSWORD: PASSWORD,
     QUORUM_DATA_DIR: dir,
+    QUORUM_CLIENT_DIST: clientFixture(),
     ...FAST,
     ...extraEnv,
   });
