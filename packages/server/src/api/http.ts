@@ -7,6 +7,7 @@ import type { Storage, User } from '../contracts/index.js';
 import type { ServerConfig } from '../config.js';
 import type { RoomService } from '../room/RoomService.js';
 import { RoomError, type Logger, type RoomErrorCode } from '../room/types.js';
+import { LoginLimitError, type ClaudeAuthService } from '../claudeauth/index.js';
 import { AuthError, createAuth } from './auth.js';
 
 export interface HttpOptions {
@@ -17,6 +18,8 @@ export interface HttpOptions {
   storage: Pick<Storage, 'users' | 'sessions' | 'rooms' | 'documents' | 'proposals' | 'changes' | 'usage' | 'messages'>;
   config: Pick<ServerConfig, 'password' | 'clientDistDir'>;
   logger?: Logger;
+  /** The server's Claude credential (web sign-in). When absent, `/api/claude/*` answers 503. */
+  claudeAuth?: Pick<ClaudeAuthService, 'status' | 'startLogin' | 'submitCode' | 'cancel' | 'logout'>;
 }
 
 const MAX_BODY_BYTES = 256 * 1024;
@@ -76,6 +79,23 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
+/** Sliding-window per-key limiter for the endpoints that cost something (a login attempt is a live subprocess). */
+class Throttle {
+  private readonly hits = new Map<string, number[]>();
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+  ) {}
+  allow(key: string, now = Date.now()): boolean {
+    const recent = (this.hits.get(key) ?? []).filter((at) => now - at < this.windowMs);
+    const ok = recent.length < this.limit;
+    if (ok) recent.push(now);
+    if (recent.length === 0) this.hits.delete(key);
+    else this.hits.set(key, recent);
+    return ok;
+  }
+}
+
 /** git ref/sha as accepted from the query string: no leading dash, no odd characters. */
 function safeRef(ref: string): string {
   if (!/^[A-Za-z0-9._/~^-]+$/.test(ref) || ref.startsWith('-') || ref.includes('..')) throw new HttpError(400, 'bad_ref', 'invalid ref');
@@ -87,6 +107,8 @@ export function createHttpServer(opts: HttpOptions): Server {
   const log: Logger = opts.logger ?? (() => undefined);
   const auth = createAuth({ storage, config });
   const distRoot = path.resolve(config.clientDistDir);
+  const loginStartThrottle = new Throttle(5, 10 * 60_000);
+  const loginCodeThrottle = new Throttle(20, 10 * 60_000);
 
   async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
     const method = req.method ?? 'GET';
@@ -138,6 +160,57 @@ export function createHttpServer(opts: HttpOptions): Server {
       if (typeof body.name !== 'string') throw new HttpError(400, 'bad_request', 'name is required');
       sendJson(res, 201, await service.createRoom(u.id, body.name));
       return true;
+    }
+
+    if (p.startsWith('/api/claude/')) {
+      requireUser();
+      const claude = opts.claudeAuth;
+      if (!claude) throw new HttpError(503, 'claude_auth_unavailable', 'Claude sign-in is not available on this server');
+      const ip = req.socket.remoteAddress ?? 'unknown';
+
+      if (method === 'GET' && p === '/api/claude/status') {
+        sendJson(res, 200, await claude.status());
+        return true;
+      }
+      if (method === 'POST' && p === '/api/claude/login/start') {
+        const body = await readJson(req);
+        const mode = body.mode ?? 'claudeai';
+        if (mode !== 'claudeai' && mode !== 'console') throw new HttpError(400, 'bad_request', 'mode must be "claudeai" or "console"');
+        if (!loginStartThrottle.allow(ip)) throw new HttpError(429, 'rate_limited', 'Too many sign-in attempts. Wait a few minutes.');
+        try {
+          const login = await claude.startLogin(mode);
+          sendJson(res, 200, { loginId: login.loginId, url: login.url });
+        } catch (err) {
+          if (err instanceof LoginLimitError) throw new HttpError(429, 'too_many_logins', err.message);
+          log('warn', 'could not start a claude sign-in', { err: String(err) });
+          throw new HttpError(502, 'claude_login_failed', err instanceof Error ? err.message : 'Could not start the sign-in.');
+        }
+        return true;
+      }
+      if (method === 'POST' && p === '/api/claude/login/code') {
+        const body = await readJson(req);
+        if (typeof body.loginId !== 'string' || !body.loginId || typeof body.code !== 'string' || !body.code.trim()) {
+          throw new HttpError(400, 'bad_request', 'loginId and code are required');
+        }
+        if (!loginCodeThrottle.allow(ip)) throw new HttpError(429, 'rate_limited', 'Too many attempts. Wait a few minutes.');
+        const result = await claude.submitCode(body.loginId, body.code);
+        if (!result.ok) throw new HttpError(400, 'claude_login_failed', result.error ?? 'The code was not accepted.');
+        sendJson(res, 200, await claude.status());
+        return true;
+      }
+      if (method === 'POST' && p === '/api/claude/login/cancel') {
+        const body = await readJson(req);
+        if (typeof body.loginId !== 'string' || !body.loginId) throw new HttpError(400, 'bad_request', 'loginId is required');
+        claude.cancel(body.loginId);
+        sendJson(res, 200, { ok: true });
+        return true;
+      }
+      if (method === 'POST' && p === '/api/claude/logout') {
+        await claude.logout();
+        sendJson(res, 200, await claude.status());
+        return true;
+      }
+      return false;
     }
 
     const m = /^\/api\/rooms\/([^/]+)\/(.+)$/.exec(p);

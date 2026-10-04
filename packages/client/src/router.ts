@@ -23,12 +23,13 @@ export function usePath(): string {
   return path;
 }
 
-export type Route = { name: 'home' } | { name: 'rooms' } | { name: 'room'; roomId: string } | { name: 'unknown' };
+export type Route = { name: 'home' } | { name: 'rooms' } | { name: 'settings' } | { name: 'room'; roomId: string } | { name: 'unknown' };
 
 export function parseRoute(path: string): Route {
   const p = path.replace(/\/+$/, '') || '/';
   if (p === '/') return { name: 'home' };
   if (p === '/rooms') return { name: 'rooms' };
+  if (p === '/settings') return { name: 'settings' };
   const m = /^\/rooms\/([^/]+)$/.exec(p);
   if (m && m[1]) return { name: 'room', roomId: decodeURIComponent(m[1]) };
   return { name: 'unknown' };

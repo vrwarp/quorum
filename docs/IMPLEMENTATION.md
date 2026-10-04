@@ -15,6 +15,7 @@ packages/server/src/
   room/                 M1b  RoomService: all domain logic, implements contracts/agents.ts RoomActions, emits events
   api/                  M1b  http.ts (REST + static client), ws.ts (protocol), auth.ts (password + session cookie)
   agents/               M1c  claude/ (real runtime on the Agent SDK + Messages API), fake/ (scripted runtime), shared prompts
+  claudeauth/           M1e  ClaudeAuthService: web sign-in of the Claude CLI (see docs/CLAUDE-SIGNIN.md)
   main.ts               M2   composition root
 packages/client/        M1d  React + Vite SPA
 e2e/                    M2   Playwright tests against the server with QUORUM_RUNTIME=fake

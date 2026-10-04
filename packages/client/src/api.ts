@@ -24,8 +24,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     let msg = res.statusText || `HTTP ${res.status}`;
     try {
       const j = (await res.json()) as { error?: unknown; message?: unknown };
-      if (typeof j.error === 'string') msg = j.error;
-      else if (typeof j.message === 'string') msg = j.message;
+      // The server sends a stable code in `error` and a readable sentence in `message`; show the sentence.
+      if (typeof j.message === 'string') msg = j.message;
+      else if (typeof j.error === 'string') msg = j.error;
     } catch {
       /* ignore non-JSON error bodies */
     }
@@ -76,3 +77,29 @@ export const getMessages = (roomId: string, before?: string, limit = 50) =>
     `/api/rooms/${enc(roomId)}/messages?limit=${limit}${before ? `&before=${enc(before)}` : ''}`,
   );
 export const getUsage = (roomId: string) => request<UsageResponse>(`/api/rooms/${enc(roomId)}/usage`);
+
+export interface ClaudeStatus {
+  signedIn: boolean;
+  method: 'oauth_login' | 'oauth_token' | 'api_key' | 'none';
+  account: { email?: string; organization?: string; subscriptionType?: string } | null;
+  pendingLogins: number;
+}
+export interface ClaudeLogin {
+  loginId: string;
+  url: string;
+}
+
+export const claudeStatus = () => request<ClaudeStatus>('/api/claude/status');
+export const claudeLoginStart = (mode: 'claudeai' | 'console' = 'claudeai') =>
+  post<ClaudeLogin>('/api/claude/login/start', { mode });
+export const claudeLoginCode = (loginId: string, code: string) =>
+  post<ClaudeStatus>('/api/claude/login/code', { loginId, code });
+export const claudeLoginCancel = (loginId: string) => post<{ ok: true }>('/api/claude/login/cancel', { loginId });
+export const claudeLogout = () => post<ClaudeStatus>('/api/claude/logout');
+
+/** What gets pasted back is either the bare code or the whole redirect URL; both work. */
+export function normalizeCode(pasted: string): string {
+  const trimmed = pasted.trim();
+  const fromUrl = /[?&]code=([^&\s#]+)/.exec(trimmed);
+  return (fromUrl?.[1] ?? trimmed).trim();
+}

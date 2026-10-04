@@ -9,13 +9,13 @@ npm run dev -w @quorum/client      # vite dev server; proxies /api -> :8787 and 
 npm run build -w @quorum/client    # tsc -b && vite build -> packages/client/dist
 ```
 
-Routes use the History API: `/` (login, or rooms when authenticated), `/rooms`, `/rooms/:roomId`.
+Routes use the History API: `/` (login, or rooms when authenticated), `/rooms`, `/rooms/:roomId`, `/settings`.
 The server must serve `index.html` for unknown paths.
 
 ## Source map
 
 - `src/api.ts` typed fetch helpers; `src/ws.ts` reconnecting WebSocket; `src/store.tsx` context + reducer
-- `src/LoginScreen.tsx`, `RoomsScreen.tsx`, `RoomScreen.tsx`
+- `src/LoginScreen.tsx`, `RoomsScreen.tsx`, `RoomScreen.tsx`, `SettingsScreen.tsx` (Claude account sign-in)
 - `src/components/Chat`, `Canvas`, `Rail`, `Diff`
 
 ## Canvas interaction
@@ -46,11 +46,20 @@ the editor with the ask prompt already revealed. Questions are sent with the anc
 | `rail-toggle` | collapse/expand the branch rail; `rail`, `rail-proposal-<proposalId>`, `rail-option-<optionId>` |
 | `branch-banner`, `branch-exit` | branch view banner / back to main |
 | `presence-<userId>` | connected-user chip |
+| `settings-link` | "Settings" link in the rooms header and the room header (navigates to `/settings`) |
+| `claude-status` | status line on `/settings` (e.g. "Signed in with a Claude subscription login (email)", "Not signed in") |
+| `claude-signin` | "Sign in with Claude" button (shown while not signed in); step 1 |
+| `claude-signin-link` | link to Claude's sign-in page, opens in a new tab; step 2 |
+| `claude-code`, `claude-code-submit` | paste box for the code (or whole redirect URL) and its Finish button |
+| `claude-cancel` | cancels the pending sign-in |
+| `claude-signout` | "Sign out" (only for a stored web login; token/API-key credentials come from the server env) |
+| `agent-unavailable-banner` | room banner "The agent is not signed in" linking to `/settings`, shown when `agentStatus === 'unavailable'` |
 | `agent-status`, `private-marker`, `rule-select` (owner), `rule-label` (others), `usage`, `diff-drawer`, `diff-raw-toggle`, `diff-close`, `word-diff`, `whoami`, `room-name` | misc |
 
 ## API assumptions
 
 - `GET /api/me` returns 401 when unauthenticated; errors are JSON `{error}` or `{message}`.
+- `/api/claude/*` (status, login/start, login/code, login/cancel, logout) needs a session; 503 when the server has no sign-in service. Error bodies are `{error: code, message}`; the client shows `message` when present.
 - Document fetch is `?ref=main` or `?ref=<branch>`; `ref` omitted is not used.
 - WebSocket uses the cookie (no `token` query); server sends `hello` first, then events; `hello` replaces state.
 - `GET /api/rooms/:id/messages?before=` returns older messages oldest-first.

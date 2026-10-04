@@ -9,6 +9,8 @@ import type { BranchView } from './components/Canvas/Canvas';
 import { Rail } from './components/Rail/Rail';
 import { DiffDrawer } from './components/Diff/DiffDrawer';
 import { UsageFooter } from './components/UsageFooter';
+import { SettingsLink } from './SettingsScreen';
+import { navigate } from './router';
 
 export function RoomScreen(props: { roomId: string; you: { userId: string; displayName: string } }) {
   return (
@@ -68,6 +70,7 @@ function RoomInner() {
               Rule: {room.votingRule}
             </span>
           )}
+          <SettingsLink />
           <button
             type="button"
             className="btn small"
@@ -79,6 +82,23 @@ function RoomInner() {
             {railOpen ? 'Hide branches' : 'Branches'}
           </button>
         </div>
+        {state.agentStatus === 'unavailable' && (
+          <div className="banner info" role="status" data-testid="agent-unavailable-banner">
+            <span>
+              The agent is not signed in.{' '}
+              <a
+                href="/settings"
+                onClick={(e) => {
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                  e.preventDefault();
+                  navigate('/settings');
+                }}
+              >
+                Sign in to Claude in Settings
+              </a>
+            </span>
+          </div>
+        )}
         {state.error && (
           <div className="banner error" role="alert">
             <span>{state.error}</span>

@@ -5,6 +5,7 @@ import { navigate, parseRoute, usePath } from './router';
 import { LoginScreen } from './LoginScreen';
 import { RoomsScreen } from './RoomsScreen';
 import { RoomScreen } from './RoomScreen';
+import { SettingsScreen } from './SettingsScreen';
 
 export function App() {
   const path = usePath();
@@ -62,6 +63,8 @@ export function App() {
       <main className="app-main">
         {route.name === 'room' ? (
           <RoomScreen key={route.roomId} roomId={route.roomId} you={user} />
+        ) : route.name === 'settings' ? (
+          <SettingsScreen />
         ) : route.name === 'unknown' ? (
           <div className="center-screen">Page not found.</div>
         ) : (

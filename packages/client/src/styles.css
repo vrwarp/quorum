@@ -235,3 +235,15 @@ textarea { width: 100%; resize: vertical; }
   .transcript { max-height: 50vh; }
   .drawer { width: 100%; }
 }
+
+/* settings */
+a.btn { display: inline-block; text-decoration: none; }
+.screen-head { display: flex; align-items: center; gap: 12px; }
+.settings-screen { max-width: 640px; width: 100%; margin: 0 auto; padding: 24px 16px; display: flex; flex-direction: column; gap: 16px; }
+.settings-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.settings-card h2 { margin: 0; font-size: 1.05rem; }
+.settings-card p { margin: 0; }
+.settings-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.settings-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.settings-card input { width: 100%; box-sizing: border-box; }

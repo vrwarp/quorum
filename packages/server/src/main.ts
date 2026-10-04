@@ -6,6 +6,7 @@ import { openStorage } from './db/index.js';
 import { createGitProvider } from './git/index.js';
 import { RoomService } from './room/index.js';
 import { createAgentRuntime } from './agents/index.js';
+import { ClaudeAuthService } from './claudeauth/index.js';
 import { createHttpServer, attachWebSocket } from './api/index.js';
 
 // node:sqlite still prints an ExperimentalWarning on Node 22; silence just that one.
@@ -28,6 +29,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
   mkdirSync(config.dataDir, { recursive: true });
   const storage = openStorage(path.join(config.dataDir, 'quorum.sqlite'));
   const git = createGitProvider(config.dataDir);
+  const claudeAuth = new ClaudeAuthService({ config, logger });
   const service = new RoomService({ storage, git, tunables: config.tunables, logger });
   const runtime = createAgentRuntime(config.runtime, service, {
     dataDir: config.dataDir,
@@ -36,10 +38,12 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     anthropicApiKey: config.anthropicApiKey,
     maxBudgetUsd: config.maxBudgetUsdPerRoom,
   });
+  // TODO(integrator): pass claudeAuth.env() into the Claude runtime's SDK env (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN)
+  // and call claudeAuth.onChange(() => <restart room sessions>) so a web sign-in or sign-out takes effect.
   service.setRuntime(runtime);
   await service.start?.();
 
-  const server = createHttpServer({ service, storage, config, logger });
+  const server = createHttpServer({ service, storage, config, logger, claudeAuth });
   attachWebSocket(server, { service, storage, logger });
 
   await new Promise<void>((resolve) => server.listen(config.port, resolve));
@@ -47,6 +51,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
 
   const shutdown = async () => {
     logger('info', 'shutting down');
+    claudeAuth.cancelAll();
     await runtime.stopAll().catch(() => undefined);
     await service.close();
     server.close();

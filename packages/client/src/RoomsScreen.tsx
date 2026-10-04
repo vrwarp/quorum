@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import type { Room } from '@quorum/shared';
 import * as api from './api';
 import { navigate, roomPath } from './router';
+import { SettingsLink } from './SettingsScreen';
 
 export function RoomsScreen() {
   const [rooms, setRooms] = useState<Room[] | null>(null);
@@ -30,7 +31,11 @@ export function RoomsScreen() {
 
   return (
     <div className="rooms-screen">
-      <h1>Rooms</h1>
+      <div className="screen-head">
+        <h1>Rooms</h1>
+        <span className="spacer" />
+        <SettingsLink />
+      </div>
       <form className="inline-form" onSubmit={create}>
         <input
           data-testid="room-create-name"
