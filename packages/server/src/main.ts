@@ -37,6 +37,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     maxBudgetUsd: config.maxBudgetUsdPerRoom,
   });
   service.setRuntime(runtime);
+  await service.start?.();
 
   const server = createHttpServer({ service, storage, config, logger });
   attachWebSocket(server, { service, storage, logger });
@@ -47,7 +48,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
   const shutdown = async () => {
     logger('info', 'shutting down');
     await runtime.stopAll().catch(() => undefined);
-    await service.close?.();
+    await service.close();
     server.close();
     storage.close();
     process.exit(0);
