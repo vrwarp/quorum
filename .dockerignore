@@ -1,15 +1,18 @@
 .git
 .gitignore
-.env
-.env.*
-!.env.example
+# Secrets and local state, at any depth. `npm run dev:server` keeps its data in packages/server/data, which holds
+# the Claude login (claude/.credentials.json) and session tokens: it must never reach the build context.
+**/.env
+**/.env.*
+!**/.env.example
+**/data
+**/*.tgz
 node_modules
 **/node_modules
 dist
 **/dist
 **/dist-types
 **/*.tsbuildinfo
-data
 playwright-report
 test-results
 e2e/.auth

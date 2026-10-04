@@ -81,13 +81,13 @@ Components:
 
 - **Web client.** React and TypeScript. Chat pane and document canvas side by side. The canvas renders markdown from main, or from a selected branch, and offers two interactions on any paragraph: Suggest and Ask. It never holds an editable copy of a document.
 - **Room server.** Node.js and TypeScript. Owns presence, the transcript, proposals and votes, the per-room write queue for main, WebSocket fan-out, and the lifecycle of agent sessions. State lives in SQLite; documents live in git.
-- **Listener.** A stateless classification call to the Messages API on Sonnet 5.5 at low effort, fired after a debounce on chat activity. It emits structured intents. It has no tools and never writes.
+- **Listener.** A stateless classification call on Sonnet 5.5 at low effort, fired after a debounce on chat activity. With an API key it is a Messages API call; without one (the web sign-in or a setup token) the server runs it as a one-shot Agent SDK session instead (§6.1). It emits structured intents. It has no tools and never writes.
 - **Orchestrator.** One long-lived Claude Agent SDK session per room on Opus 5.5. It receives events as user turns, speaks in chat, performs immediate changes to main, decides when to open proposals, and dispatches workers through server-provided tools.
 - **Workers.** Short-lived Agent SDK sessions spawned by the server at the orchestrator's request: exploration workers (Sonnet 5.5) that draft on branches, the merge driver (Opus 5.5) that merges proposals into main, and the digest writer (Sonnet 5.5) that briefs a returning participant.
 
 Single tenant: one deployment serves one organization's rooms and all participants are trusted. Agent sessions run on the same host as the room server, inside the deployment container.
 
-**Credentials.** The agent runs on the Claude Agent SDK, which spawns the Claude Code CLI, so it can authenticate with the owner's own Claude login instead of an API key. The server signs that CLI in through the web interface: Settings shows the sign-in link the CLI produces, the owner approves access and pastes the code back, and the server promotes the resulting credentials into the config directory the SDK reads (the same pattern FanZiTong uses for its assistant sidecar). Two alternatives are supported: a long-lived token from `claude setup-token` in `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. Until one of the three is present the agent reports itself unavailable and rooms keep working as plain chat. This is a personal-use arrangement: the login is the owner's, the instance is theirs, and it must not be offered as a service to other people. **Decided**
+**Credentials.** The agent runs on the Claude Agent SDK, which spawns the Claude Code CLI, so it can authenticate with the owner's own Claude login instead of an API key. The server signs that CLI in through the web interface: Settings shows the sign-in link the CLI produces, the owner approves access and pastes the code back, and the server promotes the resulting credentials into the config directory the SDK reads (the same pattern FanZiTong uses for its assistant sidecar). Only the instance admin, the first user to log in, can sign the server in or out. Two alternatives are supported: a long-lived token from `claude setup-token` in `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. Until one of the three is present the agent reports itself unavailable and rooms keep working as plain chat. This is a personal-use arrangement: the login is the owner's, the instance is theirs, and it must not be offered as a service to other people. **Decided**
 
 **Packaging.** The whole system ships as one Docker image: Node 22, git, the SDK's bundled Claude binary, and the built server and client. A single `/data` volume holds the SQLite database, the room repositories, and the Claude credentials, so backing up the volume backs up everything. A compose file runs it on loopback with an optional Caddy profile for HTTPS on a domain. See `docs/DEPLOY.md` and `docs/CLAUDE-SIGNIN.md`. **Decided**
 
@@ -105,6 +105,8 @@ rooms/<roomId>/
     <proposalId>/           one worktree per exploration branch or merge in progress
   documents are files at the repository root: Architecture.md, PRD.md, API-Spec.md
 ```
+
+Worktrees are scratch space: a proposal's are removed when it ends, and its branches stay in the repository.
 
 Branches are scoped to a single document. The scope is a convention enforced by the server: a proposal whose diff touches any file other than its document is rejected when the agent tries to open it. A decision that affects two documents therefore produces two proposals and two votes; in practice the second is a follow-up Change after the first merges (§6.3). An alternative, one repository per document, enforces the scope structurally but splits history and complicates cross-document reads; revisit if the convention proves leaky.
 
@@ -139,33 +141,34 @@ These trailers, `git blame`, and `git log -L` are the entire traceability mechan
 main is authoritative and changes only through the room's write queue, which serializes four kinds of writes:
 
 1. Immediate changes by the orchestrator (§6.3).
-2. Merges of passed proposals by the merge driver (§4.5).
+2. Merges of passed proposals (§4.5), reconciled by the merge driver when main has moved.
 3. Mechanical reverts requested by participants (§4.6).
 4. Mechanical structural operations by the server: create, rename, archive a document.
 
-The queue is per room, so a merge never races an immediate change. Orchestrator turns, reverts, and structural operations run in the main worktree while they hold the queue. The merge driver works in a detached worktree at main's head; when it finishes, the queue advances main to its commit and refreshes the main worktree.
+The queue is per room, so a merge never races an immediate change. Orchestrator turns, reverts, and structural operations run in the main worktree while they hold the queue. A merge is made in a detached worktree at main's head (the merge driver does its reconciling there); when the merge commit exists, the queue advances main to it and refreshes the main worktree.
 
 ### 4.4 Branches and proposals
 
 A proposal is a branch plus a card in chat. Branch names follow `<doc-slug>/<topic-slug>/<option>`, for example `architecture/storage-engine/b`. There are two kinds:
 
-| Kind | Origin | Options | How it closes |
-|---|---|---|---|
-| Review | A direct request judged too large to apply immediately | One | Merges when anyone approves or when the objection window elapses with no rejection; a rejection archives it |
-| Quorum | A divergence exploration | Two or more, typically A, B, and a synthesis C | Merges the option that satisfies the room's voting rule |
+| Kind   | Origin                                                 | Options                                        | How it closes                                                                                                                              |
+| ------ | ------------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Review | A direct request judged too large to apply immediately | One                                            | Merges on the first approval from a connected participant, or when the objection window elapses with no rejection; a rejection archives it |
+| Quorum | A divergence exploration                               | Two or more, typically A, B, and a synthesis C | Merges the option that satisfies the room's voting rule                                                                                    |
 
 ### 4.5 Merging **Decided: the agent merges, on the Opus tier**
 
 Automatic merges have no semantics, in git just as in CRDTs; two branches can merge cleanly and still contradict each other. Therefore:
 
-- If main has not moved since the branch point, the merge is a fast-forward. The voted artifact lands unchanged.
+- A proposal always lands as a merge commit (`git merge --no-ff`), never as a fast-forward. The proposal is therefore one commit on main, and a single Revert (§4.6) undoes the whole proposal, however many commits its branch holds.
+- If main has not moved since the branch point, that merge is trivial: the voted artifact lands unchanged and there is no reconciliation pass. No merge-driver session is started and no model is called.
 - Otherwise the merge driver (Opus 5.5) runs `git merge --no-commit`, reads the base, both sides, and the result, repairs semantic contradictions and resolves any textual conflicts, and commits a clean result. Conflict markers never reach main. **Decided**
 - When reconciliation changed the voted text, the merge announcement says so and summarizes the change. Revert remains available.
 - If the driver cannot produce a result it is confident in, the proposal stays open with an explanation in chat.
 
 ### 4.6 Undo
 
-- Every Change card and merge announcement carries Revert. Revert is mechanical: `git revert` of that commit through the write queue, authored as the participant, with a `Quorum-Reverts` trailer. No model call.
+- Every Change card and merge announcement carries Revert. Revert is mechanical: `git revert` of that commit through the write queue, authored as the participant, with a `Quorum-Reverts` trailer. No model call. A merged proposal is a single merge commit (§4.5), reverted as a whole (`git revert -m 1`).
 - If the revert conflicts with later commits, the write queue hands it to the merge driver to perform semantically.
 - Natural-language undo in chat ("drop the latency section") is an ordinary direct request handled by the orchestrator.
 
@@ -238,6 +241,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 
 - Threshold: intents at or above 0.7 confidence are forwarded. The orchestrator is told what is already in flight so it does not act twice.
 - Model: Sonnet 5.5 at effort low with adaptive thinking, prompt caching on the prefix. If classification latency needs it, thinking is switched off with the between-tools thinking mode, which Sonnet 5.5 accepts at effort high or below. Forced tool choice is rejected on Sonnet 5.5, which is another reason the output uses structured outputs.
+- Transport: with `ANTHROPIC_API_KEY` set, a classification is a direct Messages API call with explicit prompt-cache breakpoints after the stable prefix. Without a key, which is the default when the server is signed in through the web interface or with a setup token, only the Claude Code subprocess can use the login, so each classification runs as a one-shot Agent SDK session: no tools, the same system prompt, the same JSON schema as structured output. That path costs a process per classification and sets no explicit cache breakpoints, so it is slower and the latency target in §12 is not expected to hold on it. An API key is how to get the direct, cached call.
 
 ### 6.2 Orchestrator
 
@@ -245,16 +249,16 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 - Working directory: `worktrees/main`. Built-in tools: Read, Edit, Write, Grep, Glob, Bash. Bash is limited through the SDK's permission callback to git, the formatter, and read-only shell commands.
 - Server-provided tools, registered as an in-process MCP server on the session:
 
-| Tool | Purpose |
-|---|---|
-| `post_chat` | Speak in chat, optionally rendering a card |
-| `read_transcript` | Fetch messages by id or range |
-| `get_room_state` | Participants, presence, documents, open proposals, votes, voting rule |
-| `commit_main` | Commit the main worktree through the write queue, with trailers |
-| `start_exploration` | Ask the server to spawn exploration workers for a document with a list of theses |
-| `open_proposal` | Register a branch as a Review or Quorum proposal and post its card; validates single-document scope |
-| `close_proposal` | Archive a proposal as expired or rejected |
-| `request_merge` | Hand a passed proposal to the merge driver |
+| Tool                | Purpose                                                                                             |
+| ------------------- | --------------------------------------------------------------------------------------------------- |
+| `post_chat`         | Speak in chat, optionally rendering a card                                                          |
+| `read_transcript`   | Fetch messages by id or range                                                                       |
+| `get_room_state`    | Participants, presence, documents, open proposals, votes, voting rule                               |
+| `commit_main`       | Commit the main worktree through the write queue, with trailers                                     |
+| `start_exploration` | Ask the server to spawn exploration workers for a document with a list of theses                    |
+| `open_proposal`     | Register a branch as a Review or Quorum proposal and post its card; validates single-document scope |
+| `close_proposal`    | Archive a proposal as expired or rejected                                                           |
+| `request_merge`     | Hand a passed proposal to the merge driver                                                          |
 
 - Memory: the SDK compacts automatically; a PreCompact hook reminds the session to re-read room state after compaction. Durable state is never only in the session: the transcript, proposals, and votes are in SQLite, so a crashed session is restarted and rehydrated from `get_room_state` and the recent transcript.
 - A CLAUDE.md in the room workspace carries the house rules: formatting discipline, trailers, scope, the size rule, when to open which proposal kind, and tone in chat.
@@ -264,7 +268,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 **Direct request** (`edit_request`). The orchestrator drafts the change. The size rule is applied by the orchestrator before drafting and verified mechanically by the server on the resulting diff:
 
 - Immediate when the change deletes or rewrites at most 3 existing paragraphs. Additions of any size are immediate. The change is committed to main through the write queue and announced with a Change card (summary, diff link, Revert). **Decided**
-- Otherwise a worker drafts it on a branch and the orchestrator opens a Review proposal with a 2 minute objection window. Anyone can approve early; a rejection archives it and the orchestrator asks what should change.
+- Otherwise a worker drafts it on a branch and the orchestrator opens a Review proposal with a 2 minute objection window. The first approval from a connected participant merges it at once, whatever the room's voting rule; a rejection archives it and the orchestrator asks what should change. If the window elapses with no rejection, it merges.
 - Both thresholds are room configuration.
 
 **Divergence.** The orchestrator posts "Exploring X vs Y for <document>" and calls `start_exploration` with the theses: each participant's position and a synthesis. The server spawns one worker per thesis. When all return, or time out, the orchestrator reads their summaries and diffs, writes the Quorum card (options, summaries, tradeoffs, diff links), and opens the proposal.
@@ -299,12 +303,14 @@ Several explorations may run at once, including on the same document; v1 imposes
 
 ### 7.2 Voting rules **Decided**
 
-| Rule | Passes when |
-|---|---|
+| Rule                | Passes when                                                                    |
+| ------------------- | ------------------------------------------------------------------------------ |
 | Unanimous (default) | Every connected participant has approved the same option, and at least one has |
-| Majority | One option's approvals exceed half of the connected participants |
+| Majority            | One option's approvals exceed half of the connected participants               |
 
-The agent never votes. There is no owner override, cancel, or force-merge. The room owner, its creator, can change the rule and archive the room.
+The rule decides Quorum proposals. A Review proposal has one option and merges on the first approval from a connected participant (§4.4), whatever the rule.
+
+The agent never votes. There is no owner override, cancel, or force-merge. The room owner, its creator, can change the rule and archive the room. Archiving is owner-only. An archived room is read-only history: it takes no further commands and cannot be joined again, its agent session ends, and clients that have it open show a read-only banner.
 
 ### 7.3 Eligibility and evaluation **Decided: active means connected**
 
@@ -337,42 +343,48 @@ This section replaces the empty "State & Branch Lifecycle Model" of the first dr
                                        +--> REJECTED / SUPERSEDED (archived)
 ```
 
-| State | Meaning | Entered by | Leaves by |
-|---|---|---|---|
-| Drafting | Branch exists, workers writing | `start_exploration`, or a large direct request | Workers return, fail, or time out |
-| Open | Card posted; Review window running or Quorum voting | `open_proposal` | Vote outcome, rejection, expiry |
-| Merging | Write queue holds main; fast-forward or merge driver | Vote passed or window elapsed | Merge commit, or failure back to Open |
-| Merged | On main, milestone tag applied | Merge commit | Revert |
-| Reverted | A revert commit undid the merge | Participant Revert | Terminal |
-| Rejected | Review rejected, or Quorum option lost | Vote | Terminal, archived |
-| Superseded | A sibling option merged | Sibling merge | Terminal, archived |
-| Expired | Orchestrator judged the discussion concluded | `close_proposal` | Terminal, archived, reopenable by request |
-| Abandoned | No usable draft | Worker failure | Terminal |
+| State      | Meaning                                                                                    | Entered by                                            | Leaves by                                 |
+| ---------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------- | ----------------------------------------- |
+| Drafting   | Branch exists, workers writing                                                             | `start_exploration`, or a large direct request        | Workers return, fail, or time out         |
+| Open       | Card posted; Review window running or Quorum voting                                        | `open_proposal`                                       | Vote outcome, rejection, expiry           |
+| Merging    | Write queue holds main; a merge commit, reconciled by the merge driver when main has moved | Vote passed, first Review approval, or window elapsed | Merge commit, or failure back to Open     |
+| Merged     | On main, milestone tag applied                                                             | Merge commit                                          | Revert                                    |
+| Reverted   | A revert commit undid the merge                                                            | Participant Revert                                    | Terminal                                  |
+| Rejected   | Review rejected, or Quorum option lost                                                     | Vote                                                  | Terminal, archived                        |
+| Superseded | A sibling option merged                                                                    | Sibling merge                                         | Terminal, archived                        |
+| Expired    | Orchestrator judged the discussion concluded                                               | `close_proposal`                                      | Terminal, archived, reopenable by request |
+| Abandoned  | No usable draft                                                                            | Worker failure                                        | Terminal                                  |
 
 Orthogonal flags: `stale` (posted after the conversation moved on) and `reconciled` (the merge driver altered the voted text).
+
+As built: a Quorum proposal is one record with several options. When one option merges, the proposal becomes Merged and records the winner (`mergedOptionId`); the losing options carry no state of their own, so the Superseded state is never entered. Drafting is not stored either: the record is created, in Open, when the card is posted.
 
 Milestones: every merge of a Quorum proposal tags main `milestone/<n>` with the proposal id in the tag message.
 
 ## 9. Model tiering and cost **Decided**
 
-| Role | Model | Effort | Shape | Notes |
-|---|---|---|---|---|
-| Listener | Sonnet 5.5, `claude-sonnet-5-5` | low | Messages API, structured output, cached prefix | Window bounded for cost and cache stability, not context |
-| Orchestrator | Opus 5.5, `claude-opus-5-5` | medium | Long-lived Agent SDK session | Auto-compaction; durable state in SQLite |
-| Exploration worker | Sonnet 5.5, `claude-sonnet-5-5` | medium | One-shot Agent SDK session per branch | Web search allowed |
-| Merge driver | Opus 5.5, `claude-opus-5-5` | medium | One-shot Agent SDK session | Reviews every non-fast-forward merge |
-| Digest writer | Sonnet 5.5, `claude-sonnet-5-5` | low | One-shot Agent SDK session | Private output |
+| Role               | Model                           | Effort | Shape                                                                                                | Notes                                                           |
+| ------------------ | ------------------------------- | ------ | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Listener           | Sonnet 5.5, `claude-sonnet-5-5` | low    | Messages API, structured output, cached prefix; with no API key, a one-shot Agent SDK session (§6.1) | Window bounded for cost and cache stability, not context        |
+| Orchestrator       | Opus 5.5, `claude-opus-5-5`     | medium | Long-lived Agent SDK session                                                                         | Auto-compaction; durable state in SQLite                        |
+| Exploration worker | Sonnet 5.5, `claude-sonnet-5-5` | medium | One-shot Agent SDK session per branch                                                                | Web search allowed                                              |
+| Merge driver       | Opus 5.5, `claude-opus-5-5`     | medium | One-shot Agent SDK session                                                                           | Runs only when main has moved since the proposal's branch point |
+| Digest writer      | Sonnet 5.5, `claude-sonnet-5-5` | low    | One-shot Agent SDK session                                                                           | Private output                                                  |
 
 List prices on the Anthropic API, input / output per million tokens: Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, with cache reads at $0.20 on both. Order-of-magnitude expectations for a lively one-hour room with three participants, to be replaced by measurement:
 
-| Activity | Rough cost |
-|---|---|
+| Activity                                                                    | Rough cost        |
+| --------------------------------------------------------------------------- | ----------------- |
 | Listener, one classification every 10 to 20 s of active chat, prefix cached | $2 to $4 per hour |
-| Orchestrator turn, immediate change or chat reply | $0.05 to $0.30 |
-| One exploration, three Sonnet workers with web search | $2 to $5 |
-| One merge by the driver | $0.20 to $0.50 |
+| Orchestrator turn, immediate change or chat reply                           | $0.05 to $0.30    |
+| One exploration, three Sonnet workers with web search                       | $2 to $5          |
+| One merge by the driver                                                     | $0.20 to $0.50    |
 
 Caches are keyed by model and by exact prefix, so the listener shares nothing with the workers or the orchestrator even where the model matches; its cost lever is a stable, append-only prefix and a tiny per-call delta. The SDK reports usage and cost per turn and per session with a per-model breakdown; the server records it per room.
+
+The listener estimate assumes the API-key path. Without a key the listener is a one-shot Agent SDK session with no explicit cache breakpoints (§6.1), so the estimate does not carry over to it; measure it.
+
+Spend caps. The server hands every Agent SDK session a hard cap, `QUORUM_MAX_BUDGET_USD_PER_SESSION` (default $20; the old name `QUORUM_MAX_BUDGET_USD_PER_ROOM` is still read, with a warning). The cap is per session, not per room: the orchestrator, each exploration worker, each merge-driver run and semantic revert, and each digest writer has its own, so a room's worst case is the sum of its sessions. The listener's classification calls are not capped. Per-room spend caps surfaced to users remain deferred (§1.3).
 
 ## 10. Data model
 
@@ -395,13 +407,13 @@ Git holds documents only. Commit trailers reference message and proposal ids; th
 
 Server to client over WebSocket: `chat.message`, `chat.card`, `presence.update`, `document.updated { documentId, headSha }`, `document.created`, `document.archived`, `proposal.updated`, `suggestion.pending`, `suggestion.resolved`, `digest.private`.
 
-Client to server: `chat.send`, `suggestion.create`, `ask.create`, `vote.cast`, `revert.request`, `document.create`, `document.rename`, `document.archive`, `room.setRule`.
+Client to server: `chat.send`, `suggestion.create`, `ask.create`, `vote.cast`, `revert.request`, `document.create`, `document.rename`, `document.archive`, `room.setRule`, `room.archive`.
 
-Agent-facing tools are listed in §6.2. The listener is called by the server directly through the Anthropic TypeScript SDK.
+Agent-facing tools are listed in §6.2. The listener is called by the server directly through the Anthropic TypeScript SDK when an API key is set, and through a one-shot Agent SDK session otherwise (§6.1).
 
 ## 12. Non-functional requirements
 
-Latency targets: listener classification under 2 s after the debounce fires; an exact-match suggestion applied within 10 s; an immediate change within 30 s of the triggering message; exploration results within 3 minutes typical and 5 minutes cap.
+Latency targets: listener classification under 2 s after the debounce fires (on the Messages API path; the Agent SDK path used without an API key is slower, §6.1); an exact-match suggestion applied within 10 s; an immediate change within 30 s of the triggering message; exploration results within 3 minutes typical and 5 minutes cap.
 
 Failure handling:
 
@@ -410,7 +422,7 @@ Failure handling:
 - Merge driver failure: the proposal stays Open with an explanation.
 - API outage: chat keeps working, the agent status indicator shows unavailable, and queued events are processed on recovery.
 
-Security: single tenant, trusted participants. Agent sessions run with the room workspace as working directory and Bash restricted to git and the formatter through the SDK permission callback. The deployment container holds the API key and nothing else of value. Authentication is minimal: a deployment password and a display name, or an invite link per room (open, §13).
+Security: single tenant, trusted participants. Agent sessions run with the room workspace as working directory and Bash restricted to git and the formatter through the SDK permission callback. Authentication is minimal: a deployment password and a display name, or an invite link per room (open, §13). The first user to log in is the instance admin and the only one who can sign the server in to Claude or out of it; failed logins are throttled (10 per 15 minutes per client address, taken from `X-Forwarded-For` when `QUORUM_TRUST_PROXY=1`), and browser requests that change something, and WebSocket connections, are accepted only from the app's own origin (`QUORUM_ALLOWED_ORIGINS` adds extras). The `/data` volume holds the Claude web login (if one was made), every room's documents and chat history, and the agents' session transcripts; an API key or setup token lives in the deployment's `.env`. The volume, its backups and the `.env` are therefore secrets.
 
 Export: a room's documents are a git repository, so `git clone` is the export.
 
@@ -425,25 +437,34 @@ Export: a room's documents are a git repository, so `git clone` is the export.
 7. Overlapping explorations on one document are allowed in v1; watch whether the resulting double merges are confusing enough to justify the deferred one-per-document cap.
 8. Web client stack beyond React and TypeScript: markdown rendering and diff rendering libraries.
 
+### Known limitations of the current build
+
+- Single tenant, trusted users. There is one shared password and an identity is only a display name: anyone with the password can log in under any name. The admin (the first user to log in) controls the Claude sign-in, which is a guard rail rather than a boundary between people who share the password, and there is no per-user isolation.
+- No per-room spend cap yet. `QUORUM_MAX_BUDGET_USD_PER_SESSION` limits each agent session separately (§9), the listener's calls are not capped, and the server only records usage per room.
+- Mobile is not supported (§1.2): the layouts are for a desktop browser.
+- The size-rule and Review-window thresholds (§6.3) are server-wide tunables (`QUORUM_IMMEDIATE_REWRITE_LIMIT`, `QUORUM_REVIEW_WINDOW_MS`), not per-room settings yet.
+- The cross-document follow-up after a merge (§6.3) is an instruction to the orchestrator, not a rule the server enforces. The scripted fake runtime does not perform it and the end-to-end suite does not cover it.
+- Without an API key the listener runs as a one-shot Agent SDK session (§6.1): slower than the direct call and without explicit prompt-cache breakpoints.
+
 ## Appendix A. Changes from the first draft
 
-| Area | First draft | This draft |
-|---|---|---|
-| Storage and history | CRDT (Automerge or branched Yjs) | Markdown files in one git repository per room |
-| Concurrency | Block leases with 15 s TTL | Removed; humans do not edit documents, so there is nothing to race |
-| Human editing | Direct live editing supported | Chat, in-document suggestions, Ask; the agent is the only writer |
-| Merge | CRDT merge, agent only on structural conflict | Fast-forward when main is unchanged; otherwise the merge driver on Opus reviews every merge |
-| Conflict markers | Resolution output with diff markers | Never on main |
-| Branch scope | Per document | Per document, kept, enforced by the server |
-| Direct requests | Unclear whether a vote was required | No vote; immediate below a size threshold, Review proposal above it |
-| Votes | Unanimous, Majority, Owner Override | Unanimous, Majority; no override, cancel, or force-merge |
-| Active participant | Undefined | Connected now; evaluated on votes and presence changes |
-| Vote expiry | Undefined | Orchestrator decides; archived, never deleted |
-| Citations and provenance | Required | Non-goal; traceability through commit trailers and git blame instead |
-| Late results | Undefined | Posted anyway, collapsed and marked stale |
-| Undo | Undefined | Mechanical git revert on every card; the agent for semantic undo |
-| Section 5 | Empty | Proposal lifecycle state machine (§8) |
-| Models | Unspecified | Sonnet 5.5 listener, workers, and digests; Opus 5.5 orchestrator and merge driver |
-| Runtime | Unspecified | Claude Agent SDK, TypeScript, single tenant |
-| Credentials | API key implied | Web sign-in of the Claude CLI, setup token, or API key |
-| Packaging | Unspecified | One Docker image, one `/data` volume, optional Caddy HTTPS |
+| Area                     | First draft                                   | This draft                                                                                                                                           |
+| ------------------------ | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Storage and history      | CRDT (Automerge or branched Yjs)              | Markdown files in one git repository per room                                                                                                        |
+| Concurrency              | Block leases with 15 s TTL                    | Removed; humans do not edit documents, so there is nothing to race                                                                                   |
+| Human editing            | Direct live editing supported                 | Chat, in-document suggestions, Ask; the agent is the only writer                                                                                     |
+| Merge                    | CRDT merge, agent only on structural conflict | Always a merge commit, so one Revert undoes a proposal; no reconciliation pass when main is unchanged, otherwise the merge driver on Opus reconciles |
+| Conflict markers         | Resolution output with diff markers           | Never on main                                                                                                                                        |
+| Branch scope             | Per document                                  | Per document, kept, enforced by the server                                                                                                           |
+| Direct requests          | Unclear whether a vote was required           | No vote; immediate below a size threshold, Review proposal above it                                                                                  |
+| Votes                    | Unanimous, Majority, Owner Override           | Unanimous, Majority; no override, cancel, or force-merge                                                                                             |
+| Active participant       | Undefined                                     | Connected now; evaluated on votes and presence changes                                                                                               |
+| Vote expiry              | Undefined                                     | Orchestrator decides; archived, never deleted                                                                                                        |
+| Citations and provenance | Required                                      | Non-goal; traceability through commit trailers and git blame instead                                                                                 |
+| Late results             | Undefined                                     | Posted anyway, collapsed and marked stale                                                                                                            |
+| Undo                     | Undefined                                     | Mechanical git revert on every card; the agent for semantic undo                                                                                     |
+| Section 5                | Empty                                         | Proposal lifecycle state machine (§8)                                                                                                                |
+| Models                   | Unspecified                                   | Sonnet 5.5 listener, workers, and digests; Opus 5.5 orchestrator and merge driver                                                                    |
+| Runtime                  | Unspecified                                   | Claude Agent SDK, TypeScript, single tenant                                                                                                          |
+| Credentials              | API key implied                               | Web sign-in of the Claude CLI, setup token, or API key                                                                                               |
+| Packaging                | Unspecified                                   | One Docker image, one `/data` volume, optional Caddy HTTPS                                                                                           |

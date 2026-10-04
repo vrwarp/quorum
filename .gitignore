@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 .env
 data/
+*.tgz
 test-results/
 playwright-report/
 e2e/.auth/

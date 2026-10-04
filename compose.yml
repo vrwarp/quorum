@@ -8,7 +8,7 @@
 #
 #   docker compose --profile caddy up -d --build
 #
-# See docs/DEPLOY.md.
+# Needs Docker Compose 2.24 or newer (env_file `required`). See docs/DEPLOY.md.
 
 services:
   quorum:
@@ -18,18 +18,31 @@ services:
       dockerfile: Dockerfile
     init: true
     restart: unless-stopped
+    # A clean stop lets a merge in flight finish (up to 25 s, the merge driver takes minutes), then stops the agents,
+    # closes the sockets, records last-seen times and closes the database. The server exits by itself after 28 s; Docker's
+    # default grace period is 10 s, which would SIGKILL it in the middle of a merge.
+    stop_grace_period: 30s
+    # The optional settings (credentials, budget, runtime, tunables) come from .env and only from there: the file is
+    # handed to the container as it is, so a variable exported in the shell that runs `docker compose` does not reach it.
+    # A stray ANTHROPIC_API_KEY would outrank the web sign-in and switch the agents to pay-per-token billing without
+    # a word. Without a .env the password guard below still stops the start.
+    #
+    # Compose expands $ in these values, double quotes included: single-quote one that contains a dollar sign,
+    # QUORUM_PASSWORD='ab$cd'. Leave a setting you do not use commented out: an uncommented empty ANTHROPIC_API_KEY=
+    # reaches the claude CLI as an empty string. The Claude login can instead be done in the app
+    # (Settings -> Sign in with Claude), stored in the volume.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Required: the shared deployment password.
-      - QUORUM_PASSWORD=${QUORUM_PASSWORD:?set QUORUM_PASSWORD in .env}
-      # Optional, passed through only when set in .env (an empty value would
-      # reach the claude CLI as an empty string). The Claude login can instead
-      # be done in the app (Settings -> Sign in with Claude), stored in the volume.
-      - ANTHROPIC_API_KEY
-      - CLAUDE_CODE_OAUTH_TOKEN
-      - QUORUM_MAX_BUDGET_USD_PER_ROOM
-      - QUORUM_RUNTIME
+      QUORUM_PASSWORD: ${QUORUM_PASSWORD:?set QUORUM_PASSWORD in .env}
+      # The app is only reachable through a proxy (the caddy profile below, or your own on the host), so take the client
+      # address from X-Forwarded-For: the login throttle then counts people, not the proxy. Set QUORUM_TRUST_PROXY=0
+      # in .env if something else reaches port 8787 directly.
+      QUORUM_TRUST_PROXY: ${QUORUM_TRUST_PROXY:-1}
     volumes:
-      # quorum.sqlite, rooms/ (git repos), claude/ (Claude login), home/.
+      # quorum.sqlite, rooms/ (git repos), claude/ (Claude login, agent session transcripts), home/.
       - quorum-data:/data
     # Loopback only: put TLS in front (the caddy profile, or a proxy of your
     # own). Never publish the plain-HTTP port on a public interface.
@@ -47,8 +60,20 @@ services:
       - '443:443/udp'
     environment:
       # Not `:?`: compose interpolates every service, profile or not, so a hard
-      # requirement would break `up -d` for everyone not using Caddy.
+      # requirement would break `up -d` for everyone not using Caddy. The
+      # entrypoint below checks it instead.
       QUORUM_DOMAIN: ${QUORUM_DOMAIN:-}
+    # Caddy cannot load its Caddyfile with an empty site address, and would crash-loop with a message about an
+    # unrecognized global option. Fail first, readably. (`$$` is compose's escape for a literal `$`.)
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ -z "$$QUORUM_DOMAIN" ]; then
+          echo 'set QUORUM_DOMAIN in .env to the host name whose DNS points at this machine (see docs/DEPLOY.md)' >&2
+          exit 1
+        fi
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

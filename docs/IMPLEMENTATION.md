@@ -14,7 +14,7 @@ packages/server/src/
   git/                  M1a  implementation of contracts/git.ts (bare repo + worktrees, trailers, write lock, formatter hook)
   room/                 M1b  RoomService: all domain logic, implements contracts/agents.ts RoomActions, emits events
   api/                  M1b  http.ts (REST + static client), ws.ts (protocol), auth.ts (password + session cookie)
-  agents/               M1c  claude/ (real runtime on the Agent SDK + Messages API), fake/ (scripted runtime), shared prompts
+  agents/               M1c  claude/ (real runtime on the Agent SDK; the listener on the Messages API with an API key, else an SDK session), fake/ (scripted runtime), shared prompts
   claudeauth/           M1e  ClaudeAuthService: web sign-in of the Claude CLI (see docs/CLAUDE-SIGNIN.md)
   main.ts               M2   composition root
 packages/client/        M1d  React + Vite SPA
@@ -40,11 +40,13 @@ implementations). `client -> shared` only.
 ## Module responsibilities
 
 ### db (M1a)
+
 Implements `Storage`. Single file `quorum.sqlite` under `QUORUM_DATA_DIR`. Schema in `schema.ts` with a
 `migrations` array; `openStorage(path)` applies them. Messages store `card`/`anchor`/`author` as JSON columns.
 `ProposalRepo.get` must return options and votes populated.
 
 ### git (M1a)
+
 Implements `GitProvider` / `RoomRepository` by shelling out to `git` (`child_process.execFile`, never a shell
 string with user input). Layout per PRD §4.1: `rooms/<roomId>/repo.git` and `rooms/<roomId>/worktrees/<name>`.
 `init()` creates the bare repo, a `main` branch with an initial empty commit, the `main` worktree, and a
@@ -57,7 +59,9 @@ updates `refs/heads/main` in the bare repo and resets the main worktree. `revert
 `rewrittenLineCount` = removed lines in `git diff --numstat` for the path (added separately).
 
 ### room (M1b)
+
 `RoomService` is the only place with domain rules. It:
+
 - creates rooms (also calls `git.open(roomId).init()` and creates no default documents),
 - creates documents (`<Title>.md` with `# Title` as first line, committed through the write lock, actor user),
 - stores every message and broadcasts via an `EventEmitter` (`emit('event', roomId, ServerEvent, {privateTo?})`),
@@ -65,10 +69,20 @@ updates `refs/heads/main` in the bare repo and resets the main worktree. `revert
 - implements proposals: `openProposal` validates scope with `repo.changedFiles(branchBase, branch)` (must be
   exactly `[document.path]`), sets state open, posts the card message, starts the Review window timer;
   `castVote` persists and evaluates (PRD §7.2–7.3; eligible = currently connected participants, agent excluded);
-  presence changes also trigger evaluation; a passed Review/Quorum proposal enters `merging` and the merge pipeline:
-  `repo.withMainLock(beginMerge)`; fast-forward => done; else `runtime.runMergeDriver` then `finishMerge`;
-  record Change, tag `milestone/<n>` for quorum proposals, post a merge card, mark sibling options `superseded`,
-  notify `runtime.onProposalEvent({type:'merged'})`; on failure state back to `open` and `merge_failed` event,
+  presence changes also trigger evaluation; a passed proposal enters `merging` and the merge pipeline (a Review passes
+  on the first approval from a connected participant, or when its window elapses; a Quorum proposal when an option
+  satisfies the voting rule): `repo.withMainLock(beginMerge)` always ends in a merge commit (`--no-ff`), so one Revert
+  undoes the whole proposal; when main has not moved since the fork the merge is clean and there is no reconciliation
+  pass, else `runtime.runMergeDriver` reconciles, then `finishMerge`; record Change, tag `milestone/<n>` for quorum
+  proposals, post a merge card, record the winner in `mergedOptionId` (losing options are implicit: there is no
+  per-option status and nothing is marked `superseded`), notify `runtime.onProposalEvent({type:'merged'})`; on failure
+  state back to `open` and `merge_failed` event,
+- removes a proposal's option worktrees when the proposal ends (the branches stay in the repository), and stops a
+  room's agent session once the room has been empty for a while (15 minutes by default, `idleStopMs`) and starts it
+  again when someone connects (durable state is in SQLite and git, so nothing is lost),
+- archives a room on the owner's `room.archive` command: owner-only, sets `archivedAt`, posts a system message and
+  broadcasts `room.updated`; clients then show a read-only banner. An archived room refuses every other command and any
+  new connection, and its agent session stops,
 - implements revert: `repo.revert` through the lock, `RevertConflictError` => `runtime.runSemanticRevert`,
 - implements presence: connect/disconnect, and the rejoin digest (PRD §7.5): on connect, if lastSeen is older
   than `digestAbsenceMs` and notable events (changes, proposal state changes, document created) happened since,
@@ -77,27 +91,41 @@ updates `refs/heads/main` in the bare repo and resets the main worktree. `revert
   `handle(roomId, userId, ClientCommand)`, `disconnect`).
 
 ### api (M1b)
+
 `http.ts`: Node `http` server (no framework), JSON routes from `packages/shared/src/protocol.ts`, static files
 from `packages/client/dist` with SPA fallback, cookie auth. `ws.ts`: `ws` server on `/ws`, one socket per
-(room, user) connection, validates `ClientCommand` with zod before handing to the hub. Login compares
-`password` with `QUORUM_PASSWORD` (constant-time), finds or creates the user by display name.
+(room, user) connection, validates `ClientCommand` with zod before handing to the hub. Both check the `Origin` header
+(the app's own origin, meaning its host equals the request's `Host`, plus `QUORUM_ALLOWED_ORIGINS`): a socket upgrade
+and any non-GET request from another origin is refused with 403. Login compares `password` with `QUORUM_PASSWORD`
+(constant-time), finds or creates the user by display name, and throttles failures: 10 wrong passwords per 15 minutes per
+client address. The client address is the socket's, or the one in `X-Forwarded-For` when `QUORUM_TRUST_PROXY=1`
+(behind Caddy or nginx; otherwise every visitor shares the proxy's address). The first user ever created is the admin;
+the routes that sign the server in or out of Claude (`/api/claude/login/*`, `/api/claude/logout`) are admin-only.
 
 ### agents (M1c)
+
 Two implementations of `AgentRuntime`:
+
 - `fake/FakeRuntime.ts`: deterministic, keyword-driven, no network. Must exercise every RoomActions path so
   the e2e tests can cover the PRD scenario. Behaviors are documented in `agents/fake/README.md`.
 - `claude/ClaudeRuntime.ts`: the real thing. Listener = `@anthropic-ai/sdk` Messages API on
   `MODELS.listener` with structured output (`output_config.format` json schema from `IntentBatchJsonSchema`),
-  prompt caching breakpoints after the stable prefix, debounce/max-wait per DEFAULTS. Orchestrator = one
+  prompt caching breakpoints after the stable prefix, debounce/max-wait per DEFAULTS. That needs an API key: without
+  one (a web sign-in or `CLAUDE_CODE_OAUTH_TOKEN`) only the `claude` subprocess can use the login, so
+  `claude/sdkListener.ts` stands in as a `ListenerClient` that runs each classification as a one-shot Agent SDK session
+  (no tools, same system prompt and JSON schema as `outputFormat`): a process per call, no explicit cache
+  breakpoints, slower. Orchestrator = one
   `query()` from `@anthropic-ai/claude-agent-sdk` per room with streaming input (async iterable of user
   messages), `cwd` = main worktree, `model`/`effort` from shared config, `allowedTools` built-ins +
   the in-process MCP server (`createSdkMcpServer` + `tool()` wrapping RoomActions), `canUseTool` restricting
-  Bash to git/prettier/read-only commands, `hooks.PreCompact` reminder, `maxBudgetUsd` from env. Workers =
+  Bash to git/prettier/read-only commands, `hooks.PreCompact` reminder, `maxBudgetUsd` from env (a cap per SDK session:
+  every session below gets its own, the listener none). Workers =
   one `query()` each with `cwd` set to the branch worktree; exploration workers get `WebSearch`/`WebFetch`;
   merge driver and digest writer as in the PRD. Usage from result messages -> `recordUsage`.
   Read `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` for exact option names; do not guess.
 
 ### client (M1d)
+
 Vite dev proxy `/api` and `/ws` to the server. Screens: Login, Rooms, Room. Room = chat pane (left) +
 canvas (right) + branch rail (collapsible). Cards per PRD §7.1 with Approve/Reject/vote/Revert buttons.
 Canvas renders markdown by paragraph (one source line = one block) so click-to-suggest and select-to-ask
@@ -105,6 +133,7 @@ can compute `Anchor`s (`textHash` from shared). Diff view uses the `diff` packag
 `DiffResponse.before/after`. Keep state in a small store (React context + reducer); no state libraries.
 
 ### integration and e2e (M2)
+
 `packages/server/src/api/integration.test.ts` boots `startServer()` for real (SQLite, git, HTTP + WebSocket, fake
 runtime) and drives it with `fetch` and `ws`: the PRD §2 scenario, restarts, merges through the merge driver,
 presence-completed votes, rename/archive and the error paths. It runs under `npm test`.
@@ -123,13 +152,13 @@ experimental warning can be filtered (a static import warns while the module gra
 
 ## Milestones
 
-| Milestone | Scope | Exit criteria |
-|---|---|---|
-| M0 | scaffold, shared, contracts, this doc | `npm run typecheck` passes for shared |
-| M1a–d | the four module groups above, in parallel | each module typechecks and its unit tests pass |
-| M2 | main.ts, integration and e2e tests | `npm run validate && npm run test:e2e` green with the fake runtime |
-| M3 | Opus review, fixes | findings addressed |
-| M4 | final verification | manual walkthrough, screenshots, push |
+| Milestone | Scope                                     | Exit criteria                                                      |
+| --------- | ----------------------------------------- | ------------------------------------------------------------------ |
+| M0        | scaffold, shared, contracts, this doc     | `npm run typecheck` passes for shared                              |
+| M1a–d     | the four module groups above, in parallel | each module typechecks and its unit tests pass                     |
+| M2        | main.ts, integration and e2e tests        | `npm run validate && npm run test:e2e` green with the fake runtime |
+| M3        | Opus review, fixes                        | findings addressed                                                 |
+| M4        | final verification                        | manual walkthrough, screenshots, push                              |
 
 ## Running it
 
@@ -157,26 +186,36 @@ npm run build
 QUORUM_PASSWORD=change-me QUORUM_DATA_DIR=/var/lib/quorum npm start     # http://localhost:8787
 ```
 
+Behind a reverse proxy also set `QUORUM_TRUST_PROXY=1` (see `docs/DEPLOY.md`).
+
 `npm start` runs `node packages/server/dist/main.js`, which serves the API, `/ws` and the built client
-(`packages/client/dist`, with SPA fallback). SIGINT/SIGTERM shut it down cleanly: agents stop, sockets close and
-last-seen times are recorded, then the database closes.
+(`packages/client/dist`, with SPA fallback). SIGINT/SIGTERM shut it down cleanly: a merge in flight gets up to 25 s to
+finish, then agents stop, sockets close and last-seen times are recorded, then the database closes; a stop that has not
+finished after 28 s exits anyway (compose's `stop_grace_period` is 30 s).
 
 ### Configuration
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `QUORUM_PASSWORD` | required | Shared password (`QUORUM_ALLOW_NO_PASSWORD=1` runs without one: tests and local use only). |
-| `PORT` | `8787` | HTTP and WebSocket port. |
-| `QUORUM_DATA_DIR` | `./data` | SQLite database, per-room git repositories, the Claude login (`claude/`). |
-| `QUORUM_RUNTIME` | `claude` | `claude` (real agents) or `fake` (scripted, no network). |
-| `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | unset | Credentials for the real agents; otherwise sign in from Settings. |
-| `CLAUDE_CONFIG_DIR` | `<data>/claude` | Where the web sign-in stores the Claude login. |
-| `QUORUM_CLAUDE_BINARY` | the Agent SDK's bundled binary | Another Claude Code executable (a path, or a name looked up on the PATH). |
-| `QUORUM_MAX_BUDGET_USD_PER_ROOM` | `20` | Spend cap per room. |
-| `QUORUM_CLIENT_DIST` | `packages/client/dist` | Built client to serve. |
-| `QUORUM_<NAME>_MS` ... | `packages/shared/src/config.ts` | Any `DEFAULTS` key, upper-snake-cased: `QUORUM_DIGEST_ABSENCE_MS`, `QUORUM_REVIEW_WINDOW_MS`, `QUORUM_LISTENER_DEBOUNCE_MS`, ... |
-| `QUORUM_FAKE_EXPLORE_MS` | `500` | Fake runtime only: how long an exploration takes. |
-| `QUORUM_DEBUG` | unset | `1` enables debug logging. |
+| Variable                                       | Default                         | Meaning                                                                                                                                               |
+| ---------------------------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `QUORUM_PASSWORD`                              | required                        | Shared password (`QUORUM_ALLOW_NO_PASSWORD=1` runs without one: tests and local use only).                                                            |
+| `PORT`                                         | `8787`                          | HTTP and WebSocket port.                                                                                                                              |
+| `QUORUM_DATA_DIR`                              | `./data`                        | SQLite database, per-room git repositories, the Claude login (`claude/`).                                                                             |
+| `QUORUM_RUNTIME`                               | `claude`                        | `claude` (real agents) or `fake` (scripted, no network).                                                                                              |
+| `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | unset                           | Credentials for the real agents; otherwise sign in from Settings (admin only). An API key also puts the listener on the Messages API.                 |
+| `CLAUDE_CONFIG_DIR`                            | `<data>/claude`                 | Where the web sign-in stores the Claude login.                                                                                                        |
+| `QUORUM_CLAUDE_BINARY`                         | the Agent SDK's bundled binary  | Another Claude Code executable (a path, or a name looked up on the PATH).                                                                             |
+| `QUORUM_MAX_BUDGET_USD_PER_SESSION`            | `20`                            | Spend cap in USD for each Agent SDK session, not for a room (see below). `QUORUM_MAX_BUDGET_USD_PER_ROOM` is the old name, still read with a warning. |
+| `QUORUM_TRUST_PROXY`                           | unset                           | `1` takes the client address from `X-Forwarded-For` (login throttle, Claude sign-in limits). Set it behind Caddy or nginx; compose sets it.           |
+| `QUORUM_ALLOWED_ORIGINS`                       | unset                           | Comma-separated extra origins allowed to open the WebSocket.                                                                                          |
+| `QUORUM_CLIENT_DIST`                           | `packages/client/dist`          | Built client to serve.                                                                                                                                |
+| `QUORUM_<NAME>_MS` ...                         | `packages/shared/src/config.ts` | Any `DEFAULTS` key, upper-snake-cased: `QUORUM_DIGEST_ABSENCE_MS`, `QUORUM_REVIEW_WINDOW_MS`, `QUORUM_LISTENER_DEBOUNCE_MS`, ...                      |
+| `QUORUM_FAKE_EXPLORE_MS`                       | `500`                           | Fake runtime only: how long an exploration takes.                                                                                                     |
+| `QUORUM_DEBUG`                                 | unset                           | `1` enables debug logging.                                                                                                                            |
+
+The budget is a cap per Agent SDK session: the orchestrator (one long-lived session per room), and each exploration
+worker, merge run, semantic revert and digest writer, gets its own, so a room's worst case is their sum. The listener's
+classification calls are not capped. A per-room cap would be enforced from the usage the server already records
+(`storage.usage.summarize`); it is not built yet (PRD §13).
 
 ### Tests
 
@@ -206,4 +245,4 @@ and an HTML report in `playwright-report/` (`npx playwright show-report`).
 
 ### Docker
 
-`docker compose up -d --build`; see `docs/DEPLOY.md`.
+`docker compose up -d --build`; see `docs/DEPLOY.md` (configuration, backups, HTTPS) and `docs/CLAUDE-SIGNIN.md`.
