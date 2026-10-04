@@ -18,6 +18,8 @@ Quorum is a live, multiplayer room where a small group deliberates in chat while
 - Multi-document rooms with per-document branches and votes. **Decided**
 - Traceability: any paragraph can be traced to the conversation that produced it, and participants can ask the engine about any passage. **Decided**
 - Single-tenant private deployment, TypeScript throughout, built on the Claude Agent SDK. **Decided**
+- Sign the server's Claude Code CLI into the owner's Claude account from the web interface, so no API key is required. **Decided**
+- Ship as a single Docker image with one persistent volume. **Decided**
 
 ### 1.2 Non-goals for v1
 
@@ -84,6 +86,10 @@ Components:
 - **Workers.** Short-lived Agent SDK sessions spawned by the server at the orchestrator's request: exploration workers (Sonnet 5.5) that draft on branches, the merge driver (Opus 5.5) that merges proposals into main, and the digest writer (Sonnet 5.5) that briefs a returning participant.
 
 Single tenant: one deployment serves one organization's rooms and all participants are trusted. Agent sessions run on the same host as the room server, inside the deployment container.
+
+**Credentials.** The agent runs on the Claude Agent SDK, which spawns the Claude Code CLI, so it can authenticate with the owner's own Claude login instead of an API key. The server signs that CLI in through the web interface: Settings shows the sign-in link the CLI produces, the owner approves access and pastes the code back, and the server promotes the resulting credentials into the config directory the SDK reads (the same pattern FanZiTong uses for its assistant sidecar). Two alternatives are supported: a long-lived token from `claude setup-token` in `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. Until one of the three is present the agent reports itself unavailable and rooms keep working as plain chat. This is a personal-use arrangement: the login is the owner's, the instance is theirs, and it must not be offered as a service to other people. **Decided**
+
+**Packaging.** The whole system ships as one Docker image: Node 22, git, the SDK's bundled Claude binary, and the built server and client. A single `/data` volume holds the SQLite database, the room repositories, and the Claude credentials, so backing up the volume backs up everything. A compose file runs it on loopback with an optional Caddy profile for HTTPS on a domain. See `docs/DEPLOY.md` and `docs/CLAUDE-SIGNIN.md`. **Decided**
 
 ## 4. Document model: markdown in git
 
@@ -439,3 +445,5 @@ Export: a room's documents are a git repository, so `git clone` is the export.
 | Section 5 | Empty | Proposal lifecycle state machine (§8) |
 | Models | Unspecified | Sonnet 5.5 listener, workers, and digests; Opus 5.5 orchestrator and merge driver |
 | Runtime | Unspecified | Claude Agent SDK, TypeScript, single tenant |
+| Credentials | API key implied | Web sign-in of the Claude CLI, setup token, or API key |
+| Packaging | Unspecified | One Docker image, one `/data` volume, optional Caddy HTTPS |
