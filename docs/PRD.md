@@ -145,7 +145,7 @@ main is authoritative and changes only through the room's write queue, which ser
 3. Mechanical reverts requested by participants (§4.6).
 4. Mechanical structural operations by the server: create, rename, archive a document.
 
-The queue is per room, so a merge never races an immediate change. Orchestrator turns, reverts, and structural operations run in the main worktree while they hold the queue. A merge is made in a detached worktree at main's head (the merge driver does its reconciling there); when the merge commit exists, the queue advances main to it and refreshes the main worktree.
+The queue is per room, so a merge never races an immediate change. Reverts and structural operations run in the main worktree while they hold the queue. The orchestrator never edits the main worktree: it works in its own detached scratch worktree, reset to main's head at the start of every turn, and `commit_main` applies the edited document to main under the queue, directly when main has not moved and by a three-way merge of that one file otherwise (refusing, and asking the model to re-read, when the merge does not apply cleanly). Exact-match suggestions are applied by the server under the queue without a model turn. A merge is made in a detached worktree at main's head (the merge driver does its reconciling there); when the merge commit exists, the queue advances main to it and refreshes the main worktree.
 
 ### 4.4 Branches and proposals
 
@@ -246,7 +246,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 ### 6.2 Orchestrator
 
 - One Agent SDK session per room, Opus 5.5 at effort medium, streaming input, resumable by session id. Events arrive as user turns, one at a time: listener intents, suggestions, Ask requests, worker results, vote outcomes, merge results.
-- Working directory: `worktrees/main`. Built-in tools: Read, Edit, Write, Grep, Glob, Bash. Bash is limited through the SDK's permission callback to git, the formatter, and read-only shell commands.
+- Working directory: a detached scratch worktree of the room repository, reset to main's head before every turn (§4.3). Built-in tools: Read, Edit, Write, Grep, Glob, Bash. Bash is limited through the SDK's permission callback to an allow-list of git subcommands and flags, the formatter, and read-only shell commands, and runs inside the SDK sandbox with writes confined to that worktree.
 - Server-provided tools, registered as an in-process MCP server on the session:
 
 | Tool                | Purpose                                                                                             |
@@ -254,7 +254,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 | `post_chat`         | Speak in chat, optionally rendering a card                                                          |
 | `read_transcript`   | Fetch messages by id or range                                                                       |
 | `get_room_state`    | Participants, presence, documents, open proposals, votes, voting rule                               |
-| `commit_main`       | Commit the main worktree through the write queue, with trailers                                     |
+| `commit_main`       | Apply the scratch worktree's edit to main through the write queue, with trailers                    |
 | `start_exploration` | Ask the server to spawn exploration workers for a document with a list of theses                    |
 | `open_proposal`     | Register a branch as a Review or Quorum proposal and post its card; validates single-document scope |
 | `close_proposal`    | Archive a proposal as expired or rejected                                                           |

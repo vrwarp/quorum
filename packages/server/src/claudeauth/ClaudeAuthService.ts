@@ -13,6 +13,15 @@ import path from 'node:path';
 import type { ServerConfig } from '../config.js';
 import type { Logger } from '../room/types.js';
 
+/** The CLI must not see the server's own configuration (QUORUM_PASSWORD, QUORUM_DATA_DIR, ...). */
+function withoutQuorumSettings(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (!key.toUpperCase().startsWith('QUORUM_')) env[key] = value;
+  }
+  return env;
+}
+
 export type ClaudeAuthMethod = 'oauth_login' | 'oauth_token' | 'api_key' | 'none';
 export type LoginMode = 'claudeai' | 'console';
 
@@ -241,7 +250,7 @@ export class ClaudeAuthService {
     if (config.claudeOauthToken) return { signedIn: true, method: 'oauth_token', account: null };
 
     const env: NodeJS.ProcessEnv = {
-      ...(this.deps.env ?? process.env),
+      ...withoutQuorumSettings(this.deps.env ?? process.env),
       CLAUDE_CONFIG_DIR: this.configDir,
     };
     // Judge the config dir alone; ambient credentials are reported through the config fields above.
@@ -287,7 +296,7 @@ export class ClaudeAuthService {
     await mkdir(stagingDir, { recursive: true, mode: 0o700 });
 
     const env: NodeJS.ProcessEnv = {
-      ...(this.deps.env ?? process.env),
+      ...withoutQuorumSettings(this.deps.env ?? process.env),
       CLAUDE_CONFIG_DIR: stagingDir,
       // Nothing to open in a server; the CLI then prints the URL, which is what we need.
       BROWSER: '/bin/true',

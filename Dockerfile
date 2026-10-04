@@ -28,10 +28,11 @@ RUN npm run build
 FROM node:22-bookworm-slim AS runtime
 
 # git: the room layer shells out to it. ca-certificates: TLS to the Anthropic API.
+# bubblewrap + socat: the Agent SDK's Bash sandbox; without them it silently degrades to unsandboxed Bash.
 # No init in the image: run it with one (compose sets `init: true`; with plain
 # docker use `--init`) so the agent child processes are reaped.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates \
+  && apt-get install -y --no-install-recommends git ca-certificates bubblewrap socat \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system user.name Quorum \
   && git config --system user.email quorum@localhost \
