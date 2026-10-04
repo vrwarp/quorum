@@ -13,6 +13,7 @@
     "dev:server": "npm run dev -w @quorum/server",
     "dev:client": "npm run dev -w @quorum/client",
     "start": "node packages/server/dist/main.js",
+    "docker:build": "docker build -t quorum .",
     "format": "prettier --write \"packages/**/*.{ts,tsx,css,json}\" \"e2e/**/*.ts\"",
     "format:check": "prettier --check \"packages/**/*.{ts,tsx,css,json}\" \"e2e/**/*.ts\""
   },

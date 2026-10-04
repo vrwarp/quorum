@@ -35,7 +35,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env) {
     dataDir: config.dataDir,
     tunables: config.tunables,
     logger,
-    anthropicApiKey: config.anthropicApiKey,
+    anthropicApiKey: config.anthropicApiKey ?? undefined,
     maxBudgetUsd: config.maxBudgetUsdPerRoom,
   });
   // TODO(integrator): pass claudeAuth.env() into the Claude runtime's SDK env (CLAUDE_CONFIG_DIR, CLAUDE_CODE_OAUTH_TOKEN)

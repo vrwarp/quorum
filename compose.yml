@@ -1,0 +1,62 @@
+# Quorum, one container.
+#
+#   cp .env.example .env                  # set QUORUM_PASSWORD
+#   docker compose up -d --build
+#   open http://localhost:8787
+#
+# With automatic HTTPS in front (set QUORUM_DOMAIN in .env first):
+#
+#   docker compose --profile caddy up -d --build
+#
+# See docs/DEPLOY.md.
+
+services:
+  quorum:
+    image: quorum:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    environment:
+      # Required: the shared deployment password.
+      - QUORUM_PASSWORD=${QUORUM_PASSWORD:?set QUORUM_PASSWORD in .env}
+      # Optional, passed through only when set in .env (an empty value would
+      # reach the claude CLI as an empty string). The Claude login can instead
+      # be done in the app (Settings -> Sign in with Claude), stored in the volume.
+      - ANTHROPIC_API_KEY
+      - CLAUDE_CODE_OAUTH_TOKEN
+      - QUORUM_MAX_BUDGET_USD_PER_ROOM
+      - QUORUM_RUNTIME
+    volumes:
+      # quorum.sqlite, rooms/ (git repos), claude/ (Claude login), home/.
+      - quorum-data:/data
+    # Loopback only: put TLS in front (the caddy profile, or a proxy of your
+    # own). Never publish the plain-HTTP port on a public interface.
+    ports:
+      - '127.0.0.1:8787:8787'
+
+  caddy:
+    # Only with `--profile caddy`, so a host that already has a proxy (or
+    # something else on 80/443) is not fighting it.
+    profiles: ['caddy']
+    image: caddy:2
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    environment:
+      # Not `:?`: compose interpolates every service, profile or not, so a hard
+      # requirement would break `up -d` for everyone not using Caddy.
+      QUORUM_DOMAIN: ${QUORUM_DOMAIN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [quorum]
+    restart: unless-stopped
+
+volumes:
+  quorum-data:
+  caddy-data:
+  caddy-config:

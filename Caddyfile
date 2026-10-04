@@ -1,0 +1,6 @@
+# Point QUORUM_DOMAIN's DNS at this host and Caddy gets a certificate on first
+# start. WebSocket upgrades (/ws) are proxied without extra configuration.
+{$QUORUM_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy quorum:8787
+}
