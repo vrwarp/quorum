@@ -136,6 +136,40 @@ mkdir -p data/home data/claude && sudo chown -R 1000:1000 data
 
 A named volume needs no preparation.
 
+## Continuous integration and published images
+
+Three GitHub Actions workflows live in `.github/workflows/`:
+
+| Workflow             | File                 | Runs when                                            | Does                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------------------- | -------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CI                   | `ci.yml`             | every pull request, every push to `main`, manual     | two parallel jobs: typecheck + format check + unit and integration tests + build, and the Playwright end-to-end suite against the fake runtime (no credentials needed)                                                                                                                                                                                                                                                                      |
+| Docker dry run       | `docker-dry-run.yml` | every pull request, manual                           | builds the image for `linux/amd64` without pushing it, starts it with a bind-mounted `/data`, and runs `scripts/docker-smoke.sh`: the bundled Claude binary runs, `/api/health` and the SPA answer, login and room creation work (git, prettier and SQLite inside the container), the first user is admin, the data layout appears, Docker's `HEALTHCHECK` reaches healthy, and SIGTERM exits cleanly; then validates both compose profiles |
+| Publish Docker image | `docker-publish.yml` | after CI has passed on a commit on `main`, or manual | builds `linux/amd64` and `linux/arm64` and pushes `latest` and `sha-<short>` to Docker Hub; a manual run can add an extra tag such as `v0.1.0`                                                                                                                                                                                                                                                                                              |
+
+The publish workflow listens for the CI workflow to complete on `main` and only runs when that CI run succeeded, so a merge that breaks a test is never published. It builds the exact commit CI tested.
+
+### One-time setup for publishing
+
+1. Create a Docker Hub access token at <https://app.docker.com/settings/personal-access-tokens> with read and write scope.
+2. In the GitHub repository, open Settings, then Secrets and variables, then Actions, and add the secret `DOCKERHUB_TOKEN`.
+3. If the Docker Hub account is not named after the GitHub owner, add the repository variable `DOCKERHUB_USERNAME`. To publish under a different repository name than `<username>/quorum`, add the variable `DOCKERHUB_IMAGE` (for example `myorg/quorum-server`).
+
+Without the token the publish workflow fails fast with an explanatory error and nothing else is affected: CI and the dry run never need credentials.
+
+### Running a published image
+
+Set `QUORUM_IMAGE` in `.env` and pull instead of building:
+
+```bash
+echo 'QUORUM_IMAGE=vrwarp/quorum:latest' >> .env
+docker compose pull
+docker compose up -d
+```
+
+Pin a specific build with its `sha-<short>` tag when you want reproducible upgrades. `docker compose up -d --build` keeps working for a local build; it then tags the result with whatever `QUORUM_IMAGE` names.
+
+The smoke test the dry run uses is a plain script you can run against any local build: `scripts/docker-smoke.sh quorum:latest`.
+
 ## Updating
 
 ```bash

@@ -12,7 +12,8 @@
 
 services:
   quorum:
-    image: quorum:latest
+    # Set QUORUM_IMAGE (for example vrwarp/quorum:latest) to run a published image instead of building.
+    image: ${QUORUM_IMAGE:-quorum:latest}
     build:
       context: .
       dockerfile: Dockerfile

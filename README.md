@@ -1,5 +1,7 @@
 # Quorum
 
+[![CI](https://github.com/vrwarp/quorum/actions/workflows/ci.yml/badge.svg)](https://github.com/vrwarp/quorum/actions/workflows/ci.yml) [![Docker dry run](https://github.com/vrwarp/quorum/actions/workflows/docker-dry-run.yml/badge.svg)](https://github.com/vrwarp/quorum/actions/workflows/docker-dry-run.yml) [![Publish Docker image](https://github.com/vrwarp/quorum/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/vrwarp/quorum/actions/workflows/docker-publish.yml)
+
 Quorum is a live, multiplayer room where a small group deliberates in chat while an autonomous multi-agent engine, built
 on the Claude Agent SDK, writes and maintains the group's documents. Nobody edits a document directly: people talk,
 suggest, ask and vote, and the engine listens without being prompted, applies the changes people ask for, explores
