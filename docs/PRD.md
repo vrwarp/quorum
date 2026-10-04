@@ -66,7 +66,7 @@ Assumed target: a small engineering team writing design documents on a live call
 |         v                   v                      v                         |
 |   +-----------+   +------------------+   +--------------------------------+  |
 |   | Listener  |   | Orchestrator     |   | Workers (one SDK session each) |  |
-|   | Haiku 4.5 |   | Opus 5.5         |   | Exploration   Sonnet 5.5       |  |
+|   | Sonnet 5.5|   | Opus 5.5         |   | Exploration   Sonnet 5.5       |  |
 |   | Messages  |   | Agent SDK,       |   | Merge driver  Opus 5.5         |  |
 |   | API call  |   | long-lived,      |   | Digest writer Sonnet 5.5       |  |
 |   | per       |   | one per room     |   | each in its own git worktree   |  |
@@ -79,7 +79,7 @@ Components:
 
 - **Web client.** React and TypeScript. Chat pane and document canvas side by side. The canvas renders markdown from main, or from a selected branch, and offers two interactions on any paragraph: Suggest and Ask. It never holds an editable copy of a document.
 - **Room server.** Node.js and TypeScript. Owns presence, the transcript, proposals and votes, the per-room write queue for main, WebSocket fan-out, and the lifecycle of agent sessions. State lives in SQLite; documents live in git.
-- **Listener.** A stateless classification call to the Messages API on Haiku 4.5, fired after a debounce on chat activity. It emits structured intents. It has no tools and never writes.
+- **Listener.** A stateless classification call to the Messages API on Sonnet 5.5 at low effort, fired after a debounce on chat activity. It emits structured intents. It has no tools and never writes.
 - **Orchestrator.** One long-lived Claude Agent SDK session per room on Opus 5.5. It receives events as user turns, speaks in chat, performs immediate changes to main, decides when to open proposals, and dispatches workers through server-provided tools.
 - **Workers.** Short-lived Agent SDK sessions spawned by the server at the orchestrator's request: exploration workers (Sonnet 5.5) that draft on branches, the merge driver (Opus 5.5) that merges proposals into main, and the digest writer (Sonnet 5.5) that briefs a returning participant.
 
@@ -193,7 +193,7 @@ A participant is active when connected. Presence changes are broadcast and feed 
 ## 6. Passive listening and orchestration
 
 ```
-chat message --> debounce 3 s (max wait 20 s) --> Listener (Haiku) --> intents[]
+chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[]
                                                                         |
         none <----------------------------------------------------------+
                                                                         |
@@ -231,7 +231,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Haiku) --> intents[]
 ```
 
 - Threshold: intents at or above 0.7 confidence are forwarded. The orchestrator is told what is already in flight so it does not act twice.
-- Model: Haiku 4.5, no thinking, prompt caching on the prefix.
+- Model: Sonnet 5.5 at effort low with adaptive thinking, prompt caching on the prefix. If classification latency needs it, thinking is switched off with the between-tools thinking mode, which Sonnet 5.5 accepts at effort high or below. Forced tool choice is rejected on Sonnet 5.5, which is another reason the output uses structured outputs.
 
 ### 6.2 Orchestrator
 
@@ -351,22 +351,22 @@ Milestones: every merge of a Quorum proposal tags main `milestone/<n>` with the 
 
 | Role | Model | Effort | Shape | Notes |
 |---|---|---|---|---|
-| Listener | Haiku 4.5, `claude-haiku-4-5` | none | Messages API, structured output, cached prefix | 200K context; the window is bounded |
+| Listener | Sonnet 5.5, `claude-sonnet-5-5` | low | Messages API, structured output, cached prefix | Window bounded for cost and cache stability, not context |
 | Orchestrator | Opus 5.5, `claude-opus-5-5` | medium | Long-lived Agent SDK session | Auto-compaction; durable state in SQLite |
 | Exploration worker | Sonnet 5.5, `claude-sonnet-5-5` | medium | One-shot Agent SDK session per branch | Web search allowed |
 | Merge driver | Opus 5.5, `claude-opus-5-5` | medium | One-shot Agent SDK session | Reviews every non-fast-forward merge |
 | Digest writer | Sonnet 5.5, `claude-sonnet-5-5` | low | One-shot Agent SDK session | Private output |
 
-List prices on the Anthropic API, input / output per million tokens: Haiku 4.5 $1 / $5, Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20. Order-of-magnitude expectations for a lively one-hour room with three participants, to be replaced by measurement:
+List prices on the Anthropic API, input / output per million tokens: Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, with cache reads at $0.20 on both. Order-of-magnitude expectations for a lively one-hour room with three participants, to be replaced by measurement:
 
 | Activity | Rough cost |
 |---|---|
-| Listener, one classification every 10 to 20 s of active chat, prefix cached | under $2 per hour |
+| Listener, one classification every 10 to 20 s of active chat, prefix cached | $2 to $4 per hour |
 | Orchestrator turn, immediate change or chat reply | $0.05 to $0.30 |
 | One exploration, three Sonnet workers with web search | $2 to $5 |
 | One merge by the driver | $0.20 to $0.50 |
 
-Caches are per model, so the listener's prefix and the orchestrator's prefix are separate; the listener's cost lever is a stable, append-only prefix and a tiny per-call delta, not the model choice. The SDK reports usage and cost per turn and per session with a per-model breakdown; the server records it per room.
+Caches are keyed by model and by exact prefix, so the listener shares nothing with the workers or the orchestrator even where the model matches; its cost lever is a stable, append-only prefix and a tiny per-call delta. The SDK reports usage and cost per turn and per session with a per-model breakdown; the server records it per room.
 
 ## 10. Data model
 
@@ -437,5 +437,5 @@ Export: a room's documents are a git repository, so `git clone` is the export.
 | Late results | Undefined | Posted anyway, collapsed and marked stale |
 | Undo | Undefined | Mechanical git revert on every card; the agent for semantic undo |
 | Section 5 | Empty | Proposal lifecycle state machine (§8) |
-| Models | Unspecified | Haiku 4.5 listener; Opus 5.5 orchestrator and merge driver; Sonnet 5.5 workers and digests |
+| Models | Unspecified | Sonnet 5.5 listener, workers, and digests; Opus 5.5 orchestrator and merge driver |
 | Runtime | Unspecified | Claude Agent SDK, TypeScript, single tenant |
