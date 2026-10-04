@@ -104,6 +104,16 @@ pre {
 .error {
   color: var(--danger);
 }
+.field-error {
+  margin: 4px 0 0;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
 
 input,
 textarea,
@@ -317,11 +327,17 @@ textarea {
   background: var(--del-bg);
   color: var(--del-text);
 }
-.banner.info {
+.banner.info,
+.banner.warn {
   background: var(--warn-bg);
   color: var(--warn);
   border-radius: 6px;
   margin-bottom: 8px;
+}
+.banner-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 .room-grid {
   flex: 1;
@@ -462,6 +478,32 @@ textarea {
 }
 .card.change.reverted {
   opacity: 0.75;
+}
+.card.collapsed {
+  background: var(--surface-2);
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.card.collapsed .card-title {
+  margin-bottom: 0;
+}
+.collapsed-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.triggers {
+  margin-top: 2px;
+}
+.btn.link.trigger {
+  display: inline;
+  padding: 0 4px;
+  text-align: left;
+  font-size: inherit;
+}
+.tally-away {
+  margin-left: 4px;
 }
 .card.digest {
   background: var(--private-bg);
@@ -628,6 +670,14 @@ textarea {
   background: var(--surface-2);
   border-radius: 6px;
 }
+.editor-notice {
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background: var(--warn-bg);
+  color: var(--warn);
+}
 .ask-form {
   margin-top: 6px;
 }
@@ -676,6 +726,13 @@ textarea {
   }
   .app-main {
     overflow: auto;
+  }
+  /* The panes stack and the page scrolls: the room and its grid take the height their content needs instead of
+     being squeezed into the window (which made the panes overlap). */
+  .room,
+  .room-grid {
+    flex: none;
+    min-height: auto;
   }
   .chat {
     max-height: 70vh;

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import * as api from './api';
-import type { ClaudeStatus } from './api';
+import type { ClaudeStatus, Me } from './api';
 import { navigate } from './router';
 
 /** Link to /settings, used in the rooms and room headers. */
@@ -41,12 +41,40 @@ function describe(status: ClaudeStatus): string {
   }
 }
 
+/**
+ * A 4xx on the code (other than the rate limit) means the server has ended that login: the CLI process is gone and
+ * the same login cannot be tried again. Anything else (rate limit, network, server trouble) leaves it pending.
+ */
+export function endsLogin(e: unknown): boolean {
+  return e instanceof api.ApiError && e.status >= 400 && e.status < 500 && e.status !== 429;
+}
+
 export function SettingsScreen() {
+  const [me, setMe] = useState<Me | null>(null);
   const [status, setStatus] = useState<ClaudeStatus | null>(null);
   const [phase, setPhase] = useState<Phase>({ step: 'idle' });
   const [code, setCode] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** the last code was rejected, which ended its login: the next step is a new one */
+  const [startAgain, setStartAgain] = useState(false);
+  /** the login this screen started and has not finished or cancelled; it is cancelled if the screen goes away */
+  const pendingLogin = useRef<string | null>(null);
+
+  // Only the first registered user may sign the agent in; /api/me says whether this is them. A server that does not
+  // say (isAdmin absent) is left to refuse.
+  const isAdmin = me === null ? null : me.isAdmin !== false;
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .me()
+      .then((m) => !cancelled && setMe(m))
+      .catch(() => !cancelled && setMe({ userId: '', displayName: '' }));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refresh = useCallback(() => {
     api
@@ -57,7 +85,33 @@ export function SettingsScreen() {
       })
       .catch((e) => setError(e instanceof Error ? e.message : 'Could not read the Claude status'));
   }, []);
-  useEffect(refresh, [refresh]);
+  // The status is the admin's to see: nobody else is asked for it (the server would only refuse).
+  useEffect(() => {
+    if (isAdmin) refresh();
+  }, [isAdmin, refresh]);
+
+  // Leaving the screen (or closing the tab) with a sign-in half done would leave its CLI process running.
+  useEffect(() => {
+    const cancelPending = () => {
+      const id = pendingLogin.current;
+      if (!id) return;
+      pendingLogin.current = null;
+      void api.claudeLoginCancel(id).catch(() => undefined);
+    };
+    const onHide = () => {
+      const id = pendingLogin.current;
+      if (id)
+        navigator.sendBeacon?.(
+          '/api/claude/login/cancel',
+          new Blob([JSON.stringify({ loginId: id })], { type: 'application/json' }),
+        );
+    };
+    window.addEventListener('pagehide', onHide);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      cancelPending();
+    };
+  }, []);
 
   async function begin() {
     setError(null);
@@ -65,8 +119,12 @@ export function SettingsScreen() {
     try {
       const login = await api.claudeLoginStart();
       // Only ever render an https link, so a bad response cannot become a javascript: URL.
-      if (!/^https:\/\//i.test(login.url))
+      if (!/^https:\/\//i.test(login.url)) {
+        void api.claudeLoginCancel(login.loginId).catch(() => undefined);
         throw new Error('The server offered a sign-in link that is not safe to open.');
+      }
+      pendingLogin.current = login.loginId;
+      setStartAgain(false);
       setPhase({ step: 'code', loginId: login.loginId, url: login.url });
     } catch (e) {
       setPhase({ step: 'idle' });
@@ -81,16 +139,29 @@ export function SettingsScreen() {
     setPhase({ step: 'finishing' });
     try {
       setStatus(await api.claudeLoginCode(loginId, api.normalizeCode(code)));
+      pendingLogin.current = null;
       setCode('');
+      setStartAgain(false);
       setPhase({ step: 'idle' });
     } catch (e) {
-      setPhase({ step: 'code', loginId, url });
-      setError(e instanceof Error ? e.message : 'That code was not accepted');
+      const message = e instanceof Error ? e.message : 'That code was not accepted';
+      if (endsLogin(e)) {
+        // the server ended this login with the rejection: only a new one can work
+        pendingLogin.current = null;
+        setCode('');
+        setStartAgain(true);
+        setPhase({ step: 'idle' });
+      } else {
+        setPhase({ step: 'code', loginId, url });
+      }
+      setError(message);
     }
   }
 
   function cancel() {
-    if (phase.step === 'code') void api.claudeLoginCancel(phase.loginId).catch(() => undefined);
+    const id = pendingLogin.current;
+    if (id) void api.claudeLoginCancel(id).catch(() => undefined);
+    pendingLogin.current = null;
     setPhase({ step: 'idle' });
     setCode('');
     setError(null);
@@ -133,20 +204,26 @@ export function SettingsScreen() {
           The agent runs on this server&apos;s Claude credential. This uses the owner&apos;s
           personal Claude login and must not be offered to other people.
         </p>
+        <p className="muted small-text" data-testid="claude-admin-note">
+          Only the first registered user can sign the agent in.
+          {isAdmin === false && ' That is not you, so the sign-in controls are hidden.'}
+        </p>
 
-        <div className="settings-status">
-          <span data-testid="claude-status">
-            {status ? describe(status) : error ? 'Status unavailable' : 'Checking…'}
-          </span>
-        </div>
+        {isAdmin !== false && (
+          <div className="settings-status">
+            <span data-testid="claude-status">
+              {status ? describe(status) : error ? 'Status unavailable' : 'Checking…'}
+            </span>
+          </div>
+        )}
 
-        {error && (
+        {error && isAdmin !== false && (
           <p className="error" role="alert">
             {error}
           </p>
         )}
 
-        {status && !flowOpen && (
+        {isAdmin && status && !flowOpen && (
           <div className="settings-actions">
             {!status.signedIn && (
               <button
@@ -156,7 +233,11 @@ export function SettingsScreen() {
                 disabled={phase.step === 'starting'}
                 onClick={() => void begin()}
               >
-                {phase.step === 'starting' ? 'Opening…' : 'Sign in with Claude'}
+                {phase.step === 'starting'
+                  ? 'Opening…'
+                  : startAgain
+                    ? 'Start again'
+                    : 'Sign in with Claude'}
               </button>
             )}
             {status.method === 'oauth_login' && (
@@ -178,7 +259,7 @@ export function SettingsScreen() {
           </div>
         )}
 
-        {flowOpen && (
+        {isAdmin && flowOpen && (
           <div className="settings-flow">
             <ol className="settings-steps">
               <li>

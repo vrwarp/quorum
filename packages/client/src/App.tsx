@@ -6,6 +6,7 @@ import { LoginScreen } from './LoginScreen';
 import { RoomsScreen } from './RoomsScreen';
 import { RoomScreen } from './RoomScreen';
 import { SettingsScreen } from './SettingsScreen';
+import { ErrorBoundary } from './ErrorBoundary';
 
 export function App() {
   const path = usePath();
@@ -61,15 +62,22 @@ export function App() {
         </button>
       </header>
       <main className="app-main">
-        {route.name === 'room' ? (
-          <RoomScreen key={route.roomId} roomId={route.roomId} you={user} />
-        ) : route.name === 'settings' ? (
-          <SettingsScreen />
-        ) : route.name === 'unknown' ? (
-          <div className="center-screen">Page not found.</div>
-        ) : (
-          <RoomsScreen />
-        )}
+        <ErrorBoundary key={path}>
+          {route.name === 'room' ? (
+            <RoomScreen
+              key={route.roomId}
+              roomId={route.roomId}
+              you={user}
+              onSessionEnded={() => setUser(null)}
+            />
+          ) : route.name === 'settings' ? (
+            <SettingsScreen />
+          ) : route.name === 'unknown' ? (
+            <div className="center-screen">Page not found.</div>
+          ) : (
+            <RoomsScreen />
+          )}
+        </ErrorBoundary>
       </main>
     </div>
   );

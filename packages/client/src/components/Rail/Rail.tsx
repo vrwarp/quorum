@@ -1,9 +1,7 @@
-import type { Proposal, ProposalState } from '@quorum/shared';
+import type { Proposal } from '@quorum/shared';
+import { ARCHIVED_STATES, MERGED_STATES } from '../../proposalState';
 import { useRoom } from '../../store';
 import { ProposalDiffButton } from '../Chat/Cards';
-
-const ARCHIVED: ProposalState[] = ['rejected', 'expired', 'superseded', 'abandoned'];
-const MERGED: ProposalState[] = ['merged', 'reverted'];
 
 export function groupProposals(proposals: Proposal[]) {
   const open: Proposal[] = [];
@@ -11,8 +9,8 @@ export function groupProposals(proposals: Proposal[]) {
   const archived: Proposal[] = [];
   const merged: Proposal[] = [];
   for (const p of proposals) {
-    if (MERGED.includes(p.state)) merged.push(p);
-    else if (ARCHIVED.includes(p.state)) archived.push(p);
+    if (MERGED_STATES.includes(p.state)) merged.push(p);
+    else if (ARCHIVED_STATES.includes(p.state)) archived.push(p);
     else if (p.stale) stale.push(p);
     else open.push(p);
   }

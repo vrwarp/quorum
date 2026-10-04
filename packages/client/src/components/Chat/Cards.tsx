@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { diffWords } from 'diff';
 import type { Card, Change, Message, Proposal, ProposalOption } from '@quorum/shared';
 import { getChangeDiff, getProposalDiff } from '../../api';
 import { formatCountdown, useNow } from '../../hooks';
-import { useRoom } from '../../store';
+import { collapseReason, tallyOption } from '../../proposalState';
+import type { CollapseReason } from '../../proposalState';
+import { useCommand, useProposal, useRoom } from '../../store';
 import { shortSha, useUi } from '../../ui';
 import { Markdown } from '../Markdown';
 import { actorName } from './MessageView';
@@ -65,24 +67,109 @@ function DiffButton({
   );
 }
 
-/** Sends revert.request once per click; re-enabled when the server answered with an error. */
+/** The reason a command was rejected, shown next to the control that sent it. */
+function CommandMessage({ error }: { error: string | null }) {
+  if (!error) return null;
+  return (
+    <p className="error small-text field-error" role="alert" data-testid="card-error">
+      {error}
+    </p>
+  );
+}
+
+function useArchived(): boolean {
+  const { state } = useRoom();
+  return !!state.room?.archivedAt;
+}
+
+/**
+ * Sends revert.request once per click. The button is held while the request is out and released again if the server
+ * rejects it (the reason shows next to the button) or the connection drops before the card updates.
+ */
 function useRevert(sha: string) {
-  const { send, state } = useRoom();
+  const { state } = useRoom();
+  const cmd = useCommand();
   const [requested, setRequested] = useState(false);
+  const connected = state.connected;
   useEffect(() => {
-    if (state.error) setRequested(false);
-  }, [state.error]);
+    if (!connected) setRequested(false);
+  }, [connected]);
   return {
     requested,
+    error: cmd.error,
     revert: () => {
-      if (send({ type: 'revert.request', sha })) setRequested(true);
+      if (cmd.run({ type: 'revert.request', sha }, () => setRequested(false))) setRequested(true);
     },
   };
 }
 
+const MESSAGE_PREVIEW = 80;
+
+const CARD_NOUN: Record<Card['type'], string> = {
+  change: 'a change',
+  suggestion: 'a suggestion',
+  ask: 'a question',
+  review: 'a review proposal',
+  quorum: 'a vote',
+  exploration_started: 'an exploration',
+  merge: 'a merge',
+  digest: 'a digest',
+  agent_status: 'a status update',
+};
+
+function triggerText(m: Message): string {
+  if (m.card) return CARD_NOUN[m.card.type];
+  const line = (m.body.split('\n').find((l) => l.trim()) ?? '').trim();
+  return line.length > MESSAGE_PREVIEW ? `${line.slice(0, MESSAGE_PREVIEW - 1)}…` : line;
+}
+
+function jumpToMessage(id: string) {
+  const wanted = `message-${id}`;
+  const el = [...document.querySelectorAll<HTMLElement>('[data-testid^="message-"]')].find(
+    (candidate) => candidate.dataset.testid === wanted,
+  );
+  el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+/** "On behalf of which messages" (PRD 7.1): the chat that caused a change, each one a link into the transcript. */
+function Triggers({ ids }: { ids: string[] }) {
+  const { state } = useRoom();
+  const found = useMemo(() => {
+    const byId = new Map(state.messages.map((m) => [m.id, m]));
+    return ids.map((id) => byId.get(id)).filter((m): m is Message => !!m);
+  }, [ids, state.messages]);
+  if (ids.length === 0) return null;
+  const unseen = ids.length - found.length;
+  return (
+    <div className="triggers muted small-text" data-testid="change-triggers">
+      On behalf of:{' '}
+      {found.slice(0, 3).map((m) => (
+        <button
+          key={m.id}
+          type="button"
+          className="btn small link trigger"
+          data-testid={`trigger-${m.id}`}
+          title="Show this message in the chat"
+          onClick={() => jumpToMessage(m.id)}
+        >
+          {actorName(m.author)}: {triggerText(m)}
+        </button>
+      ))}
+      {found.length > 3 && <span> and {found.length - 3} more</span>}
+      {unseen > 0 && (
+        <span>
+          {found.length > 0 ? ' · ' : ''}
+          {unseen} earlier {unseen === 1 ? 'message' : 'messages'}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function ChangeCard({ change }: { change: Change }) {
   const { roomId } = useRoom();
-  const { requested, revert } = useRevert(change.sha);
+  const archived = useArchived();
+  const { requested, error, revert } = useRevert(change.sha);
   const reverted = !!change.revertedBySha;
   const isRevert = !!change.revertsSha;
   return (
@@ -94,6 +181,7 @@ function ChangeCard({ change }: { change: Change }) {
       </div>
       <p>{change.summary}</p>
       <div className="muted small-text">by {actorName(change.actor)}</div>
+      <Triggers ids={change.triggerMessageIds} />
       <div className="card-actions">
         <DiffButton
           title={`Change ${shortSha(change.sha)}`}
@@ -103,12 +191,14 @@ function ChangeCard({ change }: { change: Change }) {
           type="button"
           className="btn small danger"
           data-testid={`revert-${change.sha}`}
-          disabled={reverted || isRevert || requested}
+          title={isRevert ? 'Undo this revert: put the reverted change back' : undefined}
+          disabled={reverted || requested || archived}
           onClick={revert}
         >
           {reverted ? 'Reverted' : 'Revert'}
         </button>
       </div>
+      <CommandMessage error={error} />
     </div>
   );
 }
@@ -172,10 +262,15 @@ function ExplorationCard({ card }: { card: Extract<Card, { type: 'exploration_st
 
 function MergeCard({ card }: { card: Extract<Card, { type: 'merge' }> }) {
   const { roomId, state } = useRoom();
-  const { requested, revert } = useRevert(card.sha);
-  const p = state.proposals.find((x) => x.id === card.proposalId);
+  const archived = useArchived();
+  const { requested, error, revert } = useRevert(card.sha);
+  const { proposal: p } = useProposal(card.proposalId);
   const opt = p?.options.find((o) => o.id === card.optionId);
-  const reverted = p?.state === 'reverted' && p.mergeSha === card.sha;
+  // The proposal says so when it is in the store; the revert's own Change card says so when it is not (a proposal
+  // older than the recent history the snapshot carries).
+  const reverted =
+    (p?.state === 'reverted' && p.mergeSha === card.sha) ||
+    state.messages.some((m) => m.card?.type === 'change' && m.card.change.revertsSha === card.sha);
   return (
     <div className={`card merge${reverted ? ' reverted' : ''}`} data-testid="card-merge">
       <div className="card-title">
@@ -185,6 +280,7 @@ function MergeCard({ card }: { card: Extract<Card, { type: 'merge' }> }) {
       </div>
       {opt && <div className="muted small-text">Option {opt.label}</div>}
       <p>{card.summary}</p>
+      {p && <Triggers ids={p.triggerMessageIds} />}
       <div className="card-actions">
         <DiffButton
           title={`Merge ${shortSha(card.sha)}`}
@@ -194,40 +290,123 @@ function MergeCard({ card }: { card: Extract<Card, { type: 'merge' }> }) {
           type="button"
           className="btn small danger"
           data-testid={`revert-${card.sha}`}
-          disabled={reverted || requested}
+          disabled={reverted || requested || archived}
           onClick={revert}
         >
           {reverted ? 'Reverted' : 'Revert'}
         </button>
       </div>
+      <CommandMessage error={error} />
+    </div>
+  );
+}
+
+/** Stale and archived proposals render collapsed and labelled (PRD 6.5, 7.4); the person can expand them. */
+function useCollapse(reason: CollapseReason | null) {
+  const [expanded, setExpanded] = useState(false);
+  return {
+    collapsed: reason !== null && !expanded,
+    toggle: reason ? () => setExpanded((v) => !v) : null,
+    expanded,
+  };
+}
+
+function CardToggle({ expanded, onClick }: { expanded: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className="btn small link"
+      aria-expanded={expanded}
+      data-testid="card-toggle"
+      onClick={onClick}
+    >
+      {expanded ? 'Hide details' : 'Show details'}
+    </button>
+  );
+}
+
+function CollapsedProposal(props: {
+  kind: 'review' | 'quorum';
+  proposal: Proposal;
+  reason: CollapseReason;
+  onExpand: () => void;
+}) {
+  const { kind, proposal: p, reason } = props;
+  return (
+    <div className={`card ${kind} collapsed state-${p.state}`} data-testid={`card-${kind}`}>
+      <div className="collapsed-row">
+        <span className="card-title">{kind === 'review' ? `Review: ${p.title}` : p.title}</span>
+        <span className={`pill state-${p.state}`}>{p.state}</span>
+        {p.stale && <span className="pill warn">stale</span>}
+        <span className="spacer" />
+        <CardToggle expanded={false} onClick={props.onExpand} />
+      </div>
+      <div className="muted small-text" data-testid="card-collapsed-label">
+        {reason.label}
+      </div>
+    </div>
+  );
+}
+
+/** The label of an expanded stale or archived card, with the way to collapse it again. */
+function CollapseNote({ reason, onToggle }: { reason: CollapseReason; onToggle: () => void }) {
+  return (
+    <div className="collapsed-row">
+      <span className="muted small-text" data-testid="card-collapsed-label">
+        {reason.label}
+      </span>
+      <span className="spacer" />
+      <CardToggle expanded onClick={onToggle} />
+    </div>
+  );
+}
+
+function ProposalPlaceholder({ kind, missing }: { kind: 'review' | 'quorum'; missing: boolean }) {
+  return (
+    <div className={`card ${kind}`} data-testid={`card-${kind}`}>
+      {missing ? (
+        <span className="muted" data-testid="card-proposal-missing">
+          The details of this proposal are older than the history this page has.
+        </span>
+      ) : (
+        'Loading proposal…'
+      )}
     </div>
   );
 }
 
 function ReviewCard({ proposalId }: { proposalId: string }) {
-  const { state, send, you } = useRoom();
-  const p = state.proposals.find((x) => x.id === proposalId);
+  const { state, you } = useRoom();
+  const archivedRoom = useArchived();
+  const cmd = useCommand();
+  const { proposal: p, missing } = useProposal(proposalId);
+  const reason = p ? collapseReason(p) : null;
+  const collapse = useCollapse(reason);
   const closes = p?.windowClosesAt ? Date.parse(p.windowClosesAt) : null;
   const open = p?.state === 'open';
   const now = useNow(1000, open && closes !== null);
-  if (!p)
+  if (!p) return <ProposalPlaceholder kind="review" missing={missing} />;
+  if (reason && collapse.collapsed) {
     return (
-      <div className="card review" data-testid="card-review">
-        Loading proposal…
-      </div>
+      <CollapsedProposal kind="review" proposal={p} reason={reason} onExpand={collapse.toggle!} />
     );
+  }
   const opt = p.options[0];
   const mine = p.votes.find((v) => v.userId === you.userId);
-  const approvals = p.votes.filter((v) => v.decision === 'approve').length;
+  const connected = new Set(state.presence.filter((x) => x.connected).map((x) => x.userId));
+  const { counted: approvals, away } = tallyOption(p, opt?.id, connected);
   const rejections = p.votes.filter((v) => v.decision === 'reject').length;
   return (
     <div className={`card review state-${p.state}`} data-testid="card-review">
       <div className="card-title">
         Review: {p.title} <span className={`pill state-${p.state}`}>{p.state}</span>
+        {p.stale && <span className="pill warn">stale</span>}
       </div>
-      {opt && <OptionBody option={opt} proposal={p} />}
+      {reason && collapse.toggle && <CollapseNote reason={reason} onToggle={collapse.toggle} />}
+      {opt && <OptionBody option={opt} />}
       <div className="muted small-text">
-        {approvals} approve, {rejections} reject
+        {approvals} approve
+        {away > 0 && ` (+${away} not connected)`}, {rejections} reject
         {open && closes !== null && (
           <>
             {' '}
@@ -243,9 +422,14 @@ function ReviewCard({ proposalId }: { proposalId: string }) {
           className={`btn small${mine?.decision === 'approve' ? ' selected' : ''}`}
           data-testid="review-approve"
           aria-pressed={mine?.decision === 'approve'}
-          disabled={!open}
+          disabled={!open || archivedRoom}
           onClick={() =>
-            send({ type: 'vote.cast', proposalId: p.id, decision: 'approve', optionId: opt?.id })
+            cmd.run({
+              type: 'vote.cast',
+              proposalId: p.id,
+              decision: 'approve',
+              optionId: opt?.id,
+            })
           }
         >
           Approve
@@ -255,18 +439,18 @@ function ReviewCard({ proposalId }: { proposalId: string }) {
           className={`btn small danger${mine?.decision === 'reject' ? ' selected' : ''}`}
           data-testid="review-reject"
           aria-pressed={mine?.decision === 'reject'}
-          disabled={!open}
-          onClick={() => send({ type: 'vote.cast', proposalId: p.id, decision: 'reject' })}
+          disabled={!open || archivedRoom}
+          onClick={() => cmd.run({ type: 'vote.cast', proposalId: p.id, decision: 'reject' })}
         >
           Reject
         </button>
       </div>
+      <CommandMessage error={cmd.error} />
     </div>
   );
 }
 
-function OptionBody({ option, proposal }: { option: ProposalOption; proposal: Proposal }) {
-  void proposal;
+function OptionBody({ option }: { option: ProposalOption }) {
   return (
     <div className="option-body">
       {option.summary && <Markdown>{option.summary}</Markdown>}
@@ -301,30 +485,34 @@ export function ProposalDiffButton({
 }
 
 function QuorumCard({ proposalId }: { proposalId: string }) {
-  const { state, send, you } = useRoom();
-  const p = state.proposals.find((x) => x.id === proposalId);
-  if (!p)
+  const { state, you } = useRoom();
+  const archivedRoom = useArchived();
+  const cmd = useCommand();
+  const { proposal: p, missing } = useProposal(proposalId);
+  const reason = p ? collapseReason(p) : null;
+  const collapse = useCollapse(reason);
+  if (!p) return <ProposalPlaceholder kind="quorum" missing={missing} />;
+  if (reason && collapse.collapsed) {
     return (
-      <div className="card quorum" data-testid="card-quorum">
-        Loading proposal…
-      </div>
+      <CollapsedProposal kind="quorum" proposal={p} reason={reason} onExpand={collapse.toggle!} />
     );
+  }
   const open = p.state === 'open';
   const mine = p.votes.find((v) => v.userId === you.userId);
-  const eligible = state.presence.filter((x) => x.connected).length;
+  const connected = new Set(state.presence.filter((x) => x.connected).map((x) => x.userId));
   return (
     <div className={`card quorum state-${p.state}`} data-testid="card-quorum">
       <div className="card-title">
         {p.title} <span className={`pill state-${p.state}`}>{p.state}</span>
+        {p.stale && <span className="pill warn">stale</span>}
       </div>
+      {reason && collapse.toggle && <CollapseNote reason={reason} onToggle={collapse.toggle} />}
       <div className="muted small-text">
-        Rule: {state.room?.votingRule ?? '?'} · {eligible} connected
+        Rule: {state.room?.votingRule ?? '?'} · {connected.size} connected
       </div>
       <ol className="options">
         {p.options.map((o) => {
-          const tally = p.votes.filter(
-            (v) => v.decision === 'approve' && v.optionId === o.id,
-          ).length;
+          const { counted: tally, away } = tallyOption(p, o.id, connected);
           const chosen = mine?.decision === 'approve' && mine.optionId === o.id;
           const merged = p.mergedOptionId === o.id;
           return (
@@ -338,9 +526,18 @@ function QuorumCard({ proposalId }: { proposalId: string }) {
                 <span className="pill" data-testid={`tally-${o.id}`}>
                   {tally} {tally === 1 ? 'vote' : 'votes'}
                 </span>
+                {away > 0 && (
+                  <span
+                    className="muted small-text tally-away"
+                    data-testid={`tally-away-${o.id}`}
+                    title="Votes from people who are not connected do not count toward the rule"
+                  >
+                    +{away} not connected
+                  </span>
+                )}
                 {merged && <span className="pill ok">merged</span>}
               </div>
-              <OptionBody option={o} proposal={p} />
+              <OptionBody option={o} />
               <div className="card-actions">
                 <ProposalDiffButton proposal={p} option={o} />
                 <button
@@ -348,9 +545,9 @@ function QuorumCard({ proposalId }: { proposalId: string }) {
                   className={`btn small${chosen ? ' selected' : ' primary'}`}
                   data-testid={`vote-${o.id}`}
                   aria-pressed={chosen}
-                  disabled={!open}
+                  disabled={!open || archivedRoom}
                   onClick={() =>
-                    send({
+                    cmd.run({
                       type: 'vote.cast',
                       proposalId: p.id,
                       decision: 'approve',
@@ -365,6 +562,7 @@ function QuorumCard({ proposalId }: { proposalId: string }) {
           );
         })}
       </ol>
+      <CommandMessage error={cmd.error} />
     </div>
   );
 }

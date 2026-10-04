@@ -1,8 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-
-const plugins = [remarkGfm];
+import type { ReactNode } from 'react';
+import { Markdown } from '../Markdown';
 
 export function Block(props: {
   line: number;
@@ -10,28 +7,19 @@ export function Block(props: {
   raw: boolean;
   readOnly: boolean;
   pending: boolean;
-  active: boolean;
-  startWithAsk: boolean;
+  /** the open editor, when this is the block it is shown on */
+  editor: ReactNode | null;
   onActivate: () => void;
-  onClose: () => void;
-  onSuggest: (replacement: string) => void;
-  onAsk: (question: string) => void;
 }) {
-  const { line, text, raw, readOnly, pending, active, startWithAsk } = props;
+  const { line, text, raw, readOnly, pending, editor } = props;
   return (
     <div
-      className={`block${pending ? ' has-pending' : ''}${active ? ' editing' : ''}`}
+      className={`block${pending ? ' has-pending' : ''}${editor ? ' editing' : ''}`}
       data-testid={`block-${line}`}
       data-line={line}
     >
-      {active && !readOnly ? (
-        <Editor
-          text={text}
-          startWithAsk={startWithAsk}
-          onClose={props.onClose}
-          onSuggest={props.onSuggest}
-          onAsk={props.onAsk}
-        />
+      {editor && !readOnly ? (
+        editor
       ) : (
         <div
           className={`block-view${readOnly ? '' : ' clickable'}`}
@@ -39,8 +27,9 @@ export function Block(props: {
           role={readOnly ? undefined : 'button'}
           tabIndex={readOnly ? undefined : 0}
           aria-label={readOnly ? undefined : `Line ${line}: click to suggest an edit`}
-          onClick={() => {
+          onClick={(e) => {
             if (readOnly) return;
+            if ((e.target as Element).closest('a')) return; // following a link is not an edit
             const sel = window.getSelection();
             if (sel && !sel.isCollapsed && sel.toString().trim()) return; // selecting to Ask
             props.onActivate();
@@ -49,103 +38,13 @@ export function Block(props: {
             if (!readOnly && e.key === 'Enter' && e.target === e.currentTarget) props.onActivate();
           }}
         >
-          {raw ? (
-            <pre className="raw-line">{text}</pre>
-          ) : (
-            <div className="md">
-              <ReactMarkdown remarkPlugins={plugins}>{text}</ReactMarkdown>
-            </div>
-          )}
+          {raw ? <pre className="raw-line">{text}</pre> : <Markdown>{text}</Markdown>}
         </div>
       )}
       {pending && (
         <span className="pill pending-marker" data-testid={`pending-${line}`}>
           suggestion pending
         </span>
-      )}
-    </div>
-  );
-}
-
-function Editor(props: {
-  text: string;
-  startWithAsk: boolean;
-  onClose: () => void;
-  onSuggest: (replacement: string) => void;
-  onAsk: (question: string) => void;
-}) {
-  const [value, setValue] = useState(props.text);
-  const [asking, setAsking] = useState(props.startWithAsk);
-  const [question, setQuestion] = useState('');
-  const askRef = useRef<HTMLInputElement>(null);
-  const areaRef = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    if (asking) askRef.current?.focus();
-    else areaRef.current?.focus();
-  }, [asking]);
-
-  return (
-    <div className="editor">
-      <textarea
-        ref={areaRef}
-        data-testid="suggest-textarea"
-        aria-label="Suggested text"
-        rows={Math.min(8, Math.max(2, Math.ceil(value.length / 70)))}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => e.key === 'Escape' && props.onClose()}
-      />
-      <div className="card-actions">
-        <button
-          type="button"
-          className="btn small primary"
-          data-testid="suggest-submit"
-          disabled={value === props.text}
-          onClick={() => props.onSuggest(value)}
-        >
-          Suggest
-        </button>
-        <button type="button" className="btn small" onClick={props.onClose}>
-          Cancel
-        </button>
-        {!asking && (
-          <button
-            type="button"
-            className="btn small"
-            data-testid="ask-button"
-            onClick={() => setAsking(true)}
-          >
-            Ask
-          </button>
-        )}
-      </div>
-      {asking && (
-        <form
-          className="inline-form ask-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (question.trim()) props.onAsk(question.trim());
-          }}
-        >
-          <input
-            ref={askRef}
-            data-testid="ask-input"
-            aria-label="Question about this passage"
-            placeholder="Ask about this passage…"
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => e.key === 'Escape' && props.onClose()}
-          />
-          <button
-            type="submit"
-            className="btn small primary"
-            data-testid="ask-submit"
-            disabled={!question.trim()}
-          >
-            Ask
-          </button>
-        </form>
       )}
     </div>
   );

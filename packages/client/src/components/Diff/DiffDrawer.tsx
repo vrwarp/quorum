@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DiffResponse } from '@quorum/shared';
 import type { DiffRequest } from '../../ui';
-import { shortSha } from '../../ui';
+import { shortRef } from '../../ui';
 import { WordDiff } from './WordDiff';
 
 export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose: () => void }) {
@@ -9,6 +9,10 @@ export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose
   const [error, setError] = useState<string | null>(null);
   const [raw, setRaw] = useState(false);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     let cancelled = false;
@@ -23,12 +27,18 @@ export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose
     };
   }, [request]);
 
+  // Focus moves into the drawer once, when it opens (not again whenever the room re-renders), and goes back to
+  // whatever opened it when it closes.
   useEffect(() => {
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     closeRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onCloseRef.current();
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
 
   return (
     <div className="drawer-backdrop" onClick={onClose}>
@@ -70,8 +80,8 @@ export function DiffDrawer({ request, onClose }: { request: DiffRequest; onClose
         {!diff && !error && <p className="muted">Loading diff…</p>}
         {diff && (
           <>
-            <p className="muted small-text">
-              {diff.path} · {shortSha(diff.baseSha)} → {shortSha(diff.headSha)}
+            <p className="muted small-text" data-testid="diff-range">
+              {diff.path} · {shortRef(diff.baseSha)} → {shortRef(diff.headSha)}
             </p>
             {raw ? (
               <pre className="unified">{diff.unified || '(empty)'}</pre>

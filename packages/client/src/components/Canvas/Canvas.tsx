@@ -1,11 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Anchor, Document } from '@quorum/shared';
-import { textHash } from '@quorum/shared';
+import type { Anchor, ClientCommand } from '@quorum/shared';
 import { getDocument } from '../../api';
 import { useRoom } from '../../store';
 import type { DocWithHead } from '../../store';
 import { DocTabs } from './DocTabs';
 import { Block } from './Block';
+import { Editor } from './Editor';
+import {
+  hashLines,
+  locateAnchor,
+  makeAnchor,
+  pendingSuggestionLines,
+  splitLines,
+} from './canvasModel';
+import type { Line } from './canvasModel';
 
 export interface BranchView {
   proposalId: string;
@@ -19,25 +27,24 @@ export interface BranchView {
 interface Loaded {
   key: string;
   content: string;
+  /** the revision the content was read at: what an anchor taken from it is based on */
+  sha: string;
 }
 
-interface Line {
-  line: number;
-  text: string;
-  /** true for fence markers and lines inside a fenced code block */
-  raw: boolean;
-}
-
-export function splitLines(source: string): Line[] {
-  const out: Line[] = [];
-  let fenced = false;
-  source.split('\n').forEach((text, i) => {
-    const isFence = /^\s*(```|~~~)/.test(text);
-    if (isFence) fenced = !fenced;
-    if (text.trim() === '') return;
-    out.push({ line: i + 1, text, raw: isFence || fenced });
-  });
-  return out;
+/**
+ * An open editor. The anchor is captured when it opens and is what gets submitted, however the document moves on
+ * meanwhile: line numbers shift when someone else's change lands above, and an anchor read at submit time would
+ * point at a different paragraph.
+ */
+interface EditSession {
+  id: number;
+  /** `${document}|${ref}` it was opened on; it closes when the person looks at another */
+  key: string;
+  anchor: Anchor;
+  ask: boolean;
+  draft: string;
+  question: string;
+  error: string | null;
 }
 
 export function Canvas(props: {
@@ -46,11 +53,13 @@ export function Canvas(props: {
   branch: BranchView | null;
   onExitBranch: () => void;
 }) {
-  const { state, roomId, send } = useRoom();
+  const { state, roomId, send, reportError } = useRoom();
   const { selectedId, onSelect, branch, onExitBranch } = props;
   const docs = state.documents.filter((d) => d.status === 'active');
   const doc: DocWithHead | null = docs.find((d) => d.id === selectedId) ?? docs[0] ?? null;
   const viewingBranch = !!branch && !!doc && branch.documentId === doc.id;
+  const archived = !!state.room?.archivedAt;
+  const readOnly = viewingBranch || archived;
   const ref = viewingBranch ? branch.branch : 'main';
   const rev = viewingBranch ? branch.headSha : (doc?.headSha ?? null);
   const key = doc ? `${doc.id}|${ref}` : '';
@@ -64,7 +73,7 @@ export function Canvas(props: {
     getDocument(roomId, doc.id, ref)
       .then((r) => {
         if (cancelled) return;
-        setLoaded({ key, content: r.content });
+        setLoaded({ key, content: r.content, sha: r.sha });
         setError(null);
       })
       .catch(
@@ -76,31 +85,38 @@ export function Canvas(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, doc?.id, ref, rev]);
 
-  const content = loaded && loaded.key === key ? loaded.content : null;
+  const here = loaded && loaded.key === key ? loaded : null;
+  const content = here ? here.content : null;
   const lines = useMemo(() => (content === null ? [] : splitLines(content)), [content]);
+  const hashes = useMemo(() => hashLines(lines), [lines]);
 
-  // pending suggestion markers: documentId + startLine while headSha equals baseSha
-  const pendingLines = useMemo(() => {
-    const set = new Set<number>();
-    if (!doc || viewingBranch) return set;
-    for (const m of state.messages) {
-      const c = m.card;
-      if (
-        c &&
-        c.type === 'suggestion' &&
-        c.status === 'pending' &&
-        c.anchor.documentId === doc.id &&
-        c.anchor.baseSha === doc.headSha
-      ) {
-        set.add(c.anchor.startLine);
-      }
-    }
-    return set;
-  }, [state.messages, doc, viewingBranch]);
+  const shownSha = here?.sha ?? doc?.headSha ?? null;
+  const pendingLines = useMemo(
+    () =>
+      !doc || viewingBranch
+        ? new Set<number>()
+        : pendingSuggestionLines(state.messages, doc.id, shownSha, lines, hashes),
+    [state.messages, doc, viewingBranch, shownSha, lines, hashes],
+  );
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [floating, setFloating] = useState<{ line: number; x: number; y: number } | null>(null);
-  const [active, setActive] = useState<{ line: number; ask: boolean } | null>(null);
+  const [session, setSession] = useState<EditSession | null>(null);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const sessionIds = useRef(0);
+  const focusLine = useRef<number | null>(null);
+
+  // An editor belongs to one document and ref: looking at another closes it.
+  useEffect(() => {
+    setSession((cur) => (cur && cur.key !== key ? null : cur));
+  }, [key]);
+  const active = !readOnly && session && session.key === key ? session : null;
+
+  const where = useMemo(
+    () => (active ? locateAnchor(lines, hashes, active.anchor) : null),
+    [active, lines, hashes],
+  );
 
   // Floating "Ask" button for text selections inside rendered blocks.
   useEffect(() => {
@@ -129,23 +145,83 @@ export function Canvas(props: {
     return () => document.removeEventListener('selectionchange', onSel);
   }, []);
 
-  function makeAnchor(l: Line): Anchor {
-    return {
-      documentId: (doc as Document).id,
-      baseSha: doc?.headSha ?? '',
-      startLine: l.line,
-      endLine: l.line,
-      textHash: textHash(l.text),
-      text: l.text,
-    };
+  // After the editor closes, keyboard focus goes back to the paragraph it was on.
+  useEffect(() => {
+    if (active || focusLine.current === null) return;
+    const line = focusLine.current;
+    focusLine.current = null;
+    containerRef.current
+      ?.querySelector<HTMLElement>(`[data-testid="block-${line}"] .block-view`)
+      ?.focus();
+  }, [active]);
+
+  function openEditor(l: Line, ask: boolean) {
+    if (!doc || !here || readOnly) return;
+    setSession({
+      id: ++sessionIds.current,
+      key,
+      anchor: makeAnchor(doc.id, here.sha, l),
+      ask,
+      draft: l.text,
+      question: '',
+      error: null,
+    });
   }
 
-  const readOnly = viewingBranch;
+  function closeEditor() {
+    focusLine.current = where?.line ?? null;
+    setSession(null);
+  }
+
+  const patch = (changes: Partial<EditSession>) =>
+    setSession((cur) => (cur ? { ...cur, ...changes } : cur));
+
+  /** Sends the editor's command; if the server rejects it the editor comes back with the person's text and the reason. */
+  function submit(s: EditSession, command: ClientCommand) {
+    const sent = send(command, {
+      onError: (e) => {
+        // another editor was opened meanwhile: do not replace it, say it on the banner
+        if (sessionRef.current) reportError(e.message);
+        else setSession({ ...s, id: ++sessionIds.current, error: e.message });
+      },
+    });
+    if (sent) closeEditor();
+  }
+
   const floatLine = floating ? lines.find((l) => l.line === floating.line) : null;
+  const editor = active ? (
+    <Editor
+      key={active.id}
+      original={active.anchor.text}
+      value={active.draft}
+      asking={active.ask}
+      question={active.question}
+      error={active.error}
+      changed={where ? !where.unchanged : false}
+      onValue={(draft) => patch({ draft, error: null })}
+      onAsking={() => patch({ ask: true })}
+      onQuestion={(question) => patch({ question, error: null })}
+      onClose={closeEditor}
+      onSuggest={() =>
+        submit(active, {
+          type: 'suggestion.create',
+          anchor: active.anchor,
+          replacement: active.draft,
+        })
+      }
+      onAsk={() =>
+        submit(active, {
+          type: 'ask.create',
+          anchor: active.anchor,
+          question: active.question.trim(),
+        })
+      }
+    />
+  ) : null;
 
   return (
     <section className="pane canvas" aria-label="Document">
-      <DocTabs docs={docs} selectedId={doc?.id ?? null} onSelect={onSelect} send={send} />
+      <DocTabs docs={docs} selectedId={doc?.id ?? null} onSelect={onSelect} readOnly={archived} />
       {viewingBranch && branch && (
         <div className="banner info" data-testid="branch-banner">
           <span>
@@ -180,25 +256,21 @@ export function Canvas(props: {
               raw={l.raw}
               readOnly={readOnly}
               pending={pendingLines.has(l.line)}
-              active={active?.line === l.line}
-              startWithAsk={active?.line === l.line && active.ask}
-              onActivate={() => setActive({ line: l.line, ask: false })}
-              onClose={() => setActive((cur) => (cur?.line === l.line ? null : cur))}
-              onSuggest={(replacement) => {
-                if (send({ type: 'suggestion.create', anchor: makeAnchor(l), replacement }))
-                  setActive(null);
-              }}
-              onAsk={(question) => {
-                if (send({ type: 'ask.create', anchor: makeAnchor(l), question })) setActive(null);
-              }}
+              editor={active && where?.line === l.line ? editor : null}
+              onActivate={() => openEditor(l, false)}
             />
           ))}
-          {floating && floatLine && !readOnly && active === null && (
+          {active && where?.line == null && (
+            <div className="block editing" data-testid="editor-orphan">
+              {editor}
+            </div>
+          )}
+          {floating && floatLine && !readOnly && !active && (
             <FloatingAsk
               x={floating.x}
               y={floating.y}
               onAsk={() => {
-                setActive({ line: floatLine.line, ask: true });
+                openEditor(floatLine, true);
                 setFloating(null);
                 window.getSelection()?.removeAllRanges();
               }}

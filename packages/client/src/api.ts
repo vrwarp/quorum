@@ -44,6 +44,8 @@ const enc = encodeURIComponent;
 export interface Me {
   userId: string;
   displayName: string;
+  /** true for the first registered user, who alone may sign the agent in; absent on servers that predate the field */
+  isAdmin?: boolean;
 }
 export interface DocumentContent {
   path: string;
@@ -100,9 +102,26 @@ export const claudeLoginCancel = (loginId: string) =>
   post<{ ok: true }>('/api/claude/login/cancel', { loginId });
 export const claudeLogout = () => post<ClaudeStatus>('/api/claude/logout');
 
-/** What gets pasted back is either the bare code or the whole redirect URL; both work. */
+/** Value of `name` in the query string or fragment of a pasted address, percent-decoded; null when absent or empty. */
+function addressParam(text: string, name: string): string | null {
+  const m = new RegExp(`[?&#]${name}=([^&\\s#]+)`).exec(text);
+  if (!m?.[1]) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return m[1]; // not valid percent-encoding: take it as written
+  }
+}
+
+/**
+ * What gets pasted back is the code the sign-in page shows (`code#state`) or the whole address it redirects to. The
+ * CLI wants `code#state`, so an address with both parameters becomes exactly that; an address with only a code gives
+ * the bare code; anything else is passed on as typed (trimmed).
+ */
 export function normalizeCode(pasted: string): string {
   const trimmed = pasted.trim();
-  const fromUrl = /[?&]code=([^&\s#]+)/.exec(trimmed);
-  return (fromUrl?.[1] ?? trimmed).trim();
+  const code = addressParam(trimmed, 'code');
+  if (code === null) return trimmed;
+  const state = addressParam(trimmed, 'state');
+  return state === null ? code : `${code}#${state}`;
 }

@@ -22,3 +22,9 @@ export function formatTime(iso: string): string {
 export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
+
+/** A sha, or a revision such as `<sha>~1` (the parent of a change), in short form. */
+export function shortRef(ref: string): string {
+  const m = /^([0-9a-f]{7,40})([~^]\d*)$/i.exec(ref);
+  return m ? `${shortSha(m[1]!)}${m[2]}` : shortSha(ref);
+}

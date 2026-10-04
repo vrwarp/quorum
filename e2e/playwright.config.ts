@@ -1,7 +1,9 @@
 import { chromium, defineConfig } from '@playwright/test';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { hasManagedBrowser, newestChromium } from './browsers.js';
+import { PASSWORD } from './identity.js';
 
 const PORT = Number(process.env.QUORUM_E2E_PORT ?? 8799);
 const repoRoot = path.resolve(import.meta.dirname, '..');
@@ -21,35 +23,32 @@ for (const built of ['packages/server/dist/main.js', 'packages/client/dist/index
   }
 }
 
+// Headed or headless decides which Chromium the fallback below must find. Only the runner process sees `--headed` on
+// its command line, and the workers that launch the browsers load this config too: pass the answer on, as with the
+// data directory.
+if (process.env.QUORUM_E2E_HEADED === undefined) {
+  const headed = process.argv.includes('--headed') || process.argv.includes('--debug');
+  process.env.QUORUM_E2E_HEADED = headed || process.env.PWDEBUG ? '1' : '0';
+}
+const headed = process.env.QUORUM_E2E_HEADED === '1';
+
 /**
  * Playwright wants the exact Chromium revision it shipped with. Machines that preinstall a different revision under
  * PLAYWRIGHT_BROWSERS_PATH and cannot download (the sandbox image this repo is developed in) would fail to launch, so
- * fall back to any Chromium found there. QUORUM_E2E_CHROMIUM pins an explicit executable.
+ * fall back to the newest Chromium found there, of the kind this run needs (see e2e/browsers.ts). QUORUM_E2E_CHROMIUM
+ * pins an explicit executable.
  */
 function fallbackChromium(): string | undefined {
   if (process.env.QUORUM_E2E_CHROMIUM) return process.env.QUORUM_E2E_CHROMIUM;
-  try {
-    if (existsSync(chromium.executablePath())) return undefined;
-  } catch {
-    /* no managed browser: look around */
-  }
   const configured = process.env.PLAYWRIGHT_BROWSERS_PATH;
   const root =
     configured && configured !== '0' ? configured : path.join(homedir(), '.cache', 'ms-playwright');
-  if (!existsSync(root)) return undefined;
-  const candidates = readdirSync(root)
-    .filter((name) => /^chromium(_headless_shell)?-\d+$/.test(name))
-    .sort()
-    .reverse()
-    .flatMap((name) =>
-      [
-        'chrome-linux/chrome',
-        'chrome-linux/headless_shell',
-        'chrome-linux64/chrome',
-        'chrome-headless-shell-linux64/chrome-headless-shell',
-      ].map((rel) => path.join(root, name, rel)),
-    );
-  return candidates.find((file) => existsSync(file));
+  try {
+    if (hasManagedBrowser(root, chromium.executablePath(), headed)) return undefined;
+  } catch {
+    /* no managed browser for this platform: look around */
+  }
+  return newestChromium(root, headed);
 }
 
 const executablePath = fallbackChromium();
@@ -57,6 +56,8 @@ const executablePath = fallbackChromium();
 export default defineConfig({
   testDir: '.',
   testMatch: /.*\.spec\.ts/,
+  // registers the admin user (the server's first) before any spec logs in
+  globalSetup: './global-setup.ts',
   timeout: 90_000,
   expect: { timeout: 15_000 },
   retries: 0,
@@ -81,7 +82,7 @@ export default defineConfig({
       ...process.env,
       PORT: String(PORT),
       QUORUM_DATA_DIR: dataDir,
-      QUORUM_PASSWORD: 'e2e-password',
+      QUORUM_PASSWORD: PASSWORD,
       QUORUM_RUNTIME: 'fake',
       // Tunables are read by tunableEnvName() in packages/server/src/config.ts: QUORUM_ + SNAKE_CASE of the DEFAULTS key.
       QUORUM_DIGEST_ABSENCE_MS: '1500',

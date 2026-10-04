@@ -1,26 +1,36 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import type { ClientCommand } from '@quorum/shared';
+import { useCommand } from '../../store';
 import type { DocWithHead } from '../../store';
+
+/** After creating a document, the tab follows it only if it shows up within this long (not someone else's, later). */
+const AWAIT_CREATED_MS = 10_000;
 
 export function DocTabs(props: {
   docs: DocWithHead[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  send: (cmd: ClientCommand) => boolean;
+  /** the room is archived: nothing can be created, renamed or archived */
+  readOnly: boolean;
 }) {
-  const { docs, selectedId, onSelect, send } = props;
+  const { docs, selectedId, onSelect, readOnly } = props;
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState('');
   const [menu, setMenu] = useState(false);
   const [renaming, setRenaming] = useState('');
   const selected = docs.find((d) => d.id === selectedId);
-  const awaiting = useRef<Set<string> | null>(null);
+  const cmd = useCommand();
+  const awaiting = useRef<{ known: Set<string>; until: number } | null>(null);
 
   // select the document this user just created once it shows up
   useEffect(() => {
-    if (!awaiting.current) return;
-    const fresh = docs.find((d) => !awaiting.current!.has(d.id));
+    const waiting = awaiting.current;
+    if (!waiting) return;
+    if (Date.now() > waiting.until) {
+      awaiting.current = null;
+      return;
+    }
+    const fresh = docs.find((d) => !waiting.known.has(d.id));
     if (fresh) {
       awaiting.current = null;
       onSelect(fresh.id);
@@ -32,8 +42,14 @@ export function DocTabs(props: {
     const t = title.trim();
     if (!t) return;
     const known = new Set(docs.map((d) => d.id));
-    if (send({ type: 'document.create', title: t })) {
-      awaiting.current = known;
+    const sent = cmd.run({ type: 'document.create', title: t }, () => {
+      // rejected: nothing is coming, so do not follow whatever appears next; bring the form back with the title
+      awaiting.current = null;
+      setTitle(t);
+      setCreating(true);
+    });
+    if (sent) {
+      awaiting.current = { known, until: Date.now() + AWAIT_CREATED_MS };
       setTitle('');
       setCreating(false);
     }
@@ -62,6 +78,7 @@ export function DocTabs(props: {
           type="button"
           className="btn small"
           data-testid="doc-create"
+          disabled={readOnly}
           onClick={() => setCreating((v) => !v)}
         >
           New document
@@ -73,6 +90,7 @@ export function DocTabs(props: {
             aria-label="Document menu"
             aria-expanded={menu}
             data-testid="doc-menu"
+            disabled={readOnly}
             onClick={() => {
               setRenaming(selected.title);
               setMenu((v) => !v);
@@ -82,7 +100,7 @@ export function DocTabs(props: {
           </button>
         )}
       </div>
-      {creating && (
+      {creating && !readOnly && (
         <form className="inline-form" onSubmit={create}>
           <input
             data-testid="doc-create-title"
@@ -102,7 +120,7 @@ export function DocTabs(props: {
           </button>
         </form>
       )}
-      {menu && selected && (
+      {menu && selected && !readOnly && (
         <div className="menu" data-testid="doc-menu-panel">
           <form
             className="inline-form"
@@ -112,7 +130,9 @@ export function DocTabs(props: {
               if (
                 t &&
                 t !== selected.title &&
-                send({ type: 'document.rename', documentId: selected.id, title: t })
+                cmd.run({ type: 'document.rename', documentId: selected.id, title: t }, () =>
+                  setMenu(true),
+                )
               )
                 setMenu(false);
             }}
@@ -132,12 +152,20 @@ export function DocTabs(props: {
             className="btn small danger"
             data-testid="doc-archive"
             onClick={() => {
-              if (send({ type: 'document.archive', documentId: selected.id })) setMenu(false);
+              if (
+                cmd.run({ type: 'document.archive', documentId: selected.id }, () => setMenu(true))
+              )
+                setMenu(false);
             }}
           >
             Archive document
           </button>
         </div>
+      )}
+      {cmd.error && (
+        <p className="error small-text field-error" role="alert" data-testid="doc-error">
+          {cmd.error}
+        </p>
       )}
     </div>
   );

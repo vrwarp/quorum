@@ -1,12 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import { useRoom } from '../../store';
+import { useCommand, useRoom } from '../../store';
 import { MessageView } from './MessageView';
 
 export function Chat() {
-  const { state, send, loadEarlier } = useRoom();
+  const { state, loadEarlier } = useRoom();
+  const cmd = useCommand();
+  const archived = !!state.room?.archivedAt;
   const [text, setText] = useState('');
+  const [earlierError, setEarlierError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
 
   const connected = state.presence.filter((p) => p.connected);
@@ -25,8 +29,16 @@ export function Chat() {
 
   function submit() {
     const body = text.trim();
-    if (!body) return;
-    if (send({ type: 'chat.send', body })) setText('');
+    if (!body || archived) return;
+    const restore = () => {
+      // the server refused it: the message comes back, in front of anything typed since, with the reason below
+      setText((cur) => (cur.trim() ? `${body}\n${cur}` : body));
+      inputRef.current?.focus();
+    };
+    if (cmd.run({ type: 'chat.send', body }, restore)) {
+      setText('');
+      inputRef.current?.focus(); // Send disables itself with the empty box: keep the keyboard where it was
+    }
   }
   function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -64,22 +76,39 @@ export function Chat() {
         <button
           type="button"
           className="btn small link"
-          onClick={() => void loadEarlier().catch(() => {})}
+          onClick={() => {
+            setEarlierError(null);
+            loadEarlier().catch((e) =>
+              setEarlierError(e instanceof Error ? e.message : 'Could not load earlier messages'),
+            );
+          }}
         >
           Load earlier messages
         </button>
+        {earlierError && (
+          <p className="error small-text" role="alert">
+            {earlierError}
+          </p>
+        )}
         {state.messages.map((m) => (
           <MessageView key={m.id} message={m} />
         ))}
       </div>
       <div className="chat-input">
         <textarea
+          ref={inputRef}
           data-testid="chat-input"
           aria-label="Message"
           rows={2}
-          placeholder="Say something. The agent is listening."
+          placeholder={
+            archived ? 'This room is archived.' : 'Say something. The agent is listening.'
+          }
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          disabled={archived}
+          onChange={(e) => {
+            setText(e.target.value);
+            if (cmd.error) cmd.clearError();
+          }}
           onKeyDown={onKey}
         />
         <button
@@ -87,11 +116,16 @@ export function Chat() {
           className="btn primary"
           data-testid="chat-send"
           onClick={submit}
-          disabled={!text.trim()}
+          disabled={!text.trim() || archived}
         >
           Send
         </button>
       </div>
+      {cmd.error && (
+        <p className="error small-text field-error" role="alert" data-testid="chat-error">
+          {cmd.error}
+        </p>
+      )}
     </section>
   );
 }

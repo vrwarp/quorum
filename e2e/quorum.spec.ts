@@ -1,4 +1,4 @@
-import { expect, test, type WebSocketRoute } from '@playwright/test';
+import { type WebSocketRoute } from '@playwright/test';
 import {
   apiGet,
   blockWith,
@@ -6,9 +6,10 @@ import {
   chatCards,
   createDocument,
   createRoom,
-  login,
+  expect,
   openRoom,
   say,
+  test,
   userIdOf,
 } from './helpers.js';
 
@@ -20,16 +21,22 @@ import {
  *   "rewrite the whole document"          -> Review proposal
  * Suggestions are applied at once, asks are answered from `git log -L`, and the rejoin digest lists notable events.
  * Server tunables (e2e/playwright.config.ts): digest absence 1.5 s, review window 4 s, listener debounce 200 ms.
+ *
+ * This file is the end-to-end scenarios and the document/reconnect basics. The others: canvas.spec.ts (markers, the
+ * editor, concurrent edits), governance.spec.ts (proposals and tallies), room.spec.ts (archiving, rejected commands,
+ * banners, layout, long absences), settings.spec.ts (Claude sign-in) and browsers.spec.ts (the Chromium fallback of
+ * the config). Every spec uses the `app` fixture of helpers.ts: it closes the browsers when the test ends and fails the
+ * test on browser console errors that were not declared.
  */
 
 test('canonical scenario: direct request, divergence vote, suggestion, ask, revert, rejoin digest', async ({
-  browser,
+  app,
 }) => {
-  const alice = await login(browser, 'Alice');
+  const alice = await app.login('Alice');
   const roomId = await createRoom(alice.page, 'Design review');
   await createDocument(alice.page, 'Architecture');
 
-  const bob = await login(browser, 'Bob');
+  const bob = await app.login('Bob');
   await openRoom(bob.page, roomId);
   const [aliceId, bobId] = [await userIdOf(alice.page), await userIdOf(bob.page)];
   const both = [alice.page, bob.page];
@@ -49,10 +56,21 @@ test('canonical scenario: direct request, divergence vote, suggestion, ask, reve
         canvas(page).getByRole('heading', { name: 'Latency Requirements' }),
       ).toBeVisible();
     }
+    // the card says on behalf of which messages the agent made the change (PRD 7.1)
+    for (const page of both) {
+      await expect(chatCards(page, 'change').first().getByTestId('change-triggers')).toContainText(
+        'Alice: We should add a section on latency requirements',
+      );
+    }
     // the card links the diff: word-level by default, raw git diff on request
     await chatCards(bob.page, 'change').first().getByRole('button', { name: 'View diff' }).click();
     const drawer = bob.page.getByTestId('diff-drawer');
     await expect(drawer.getByTestId('word-diff')).toContainText('Latency Requirements');
+    // the header names two different revisions, not the same one twice
+    const [from, to] = (await drawer.getByTestId('diff-range').innerText())
+      .split('·')[1]!
+      .split('→');
+    expect(from!.trim()).not.toBe(to!.trim());
     await expect(drawer.locator('ins').first()).toBeVisible();
     await drawer.getByTestId('diff-raw-toggle').click();
     await expect(drawer).toContainText('+## Latency Requirements');
@@ -65,15 +83,18 @@ test('canonical scenario: direct request, divergence vote, suggestion, ask, reve
     await expect(bob.page.getByText("Let's use PostgreSQL for the storage layer")).toBeVisible();
     await say(bob.page, 'ClickHouse makes more sense for this write volume');
 
-    await expect(chatCards(alice.page, 'exploration')).toContainText('PostgreSQL vs ClickHouse');
+    for (const page of both) {
+      await expect(chatCards(page, 'exploration')).toContainText('PostgreSQL vs ClickHouse');
+      await expect(chatCards(page, 'quorum')).toHaveCount(1, { timeout: 30_000 });
+      const options = chatCards(page, 'quorum').locator('[data-testid^="option-"]');
+      await expect(options).toHaveCount(3);
+      await expect(chatCards(page, 'quorum').locator('[data-testid^="vote-"]')).toHaveCount(3);
+      const c = options.filter({ hasText: 'Option C' });
+      await expect(c).toContainText('PostgreSQL');
+      await expect(c).toContainText('ClickHouse');
+    }
     const quorum = chatCards(alice.page, 'quorum');
-    await expect(quorum).toHaveCount(1, { timeout: 30_000 });
-    await expect(quorum.locator('[data-testid^="vote-"]')).toHaveCount(3);
-
-    await expect(quorum.locator('[data-testid^="option-"]')).toHaveCount(3);
     const optionC = quorum.locator('[data-testid^="option-"]', { hasText: 'Option C' });
-    await expect(optionC).toContainText('PostgreSQL');
-    await expect(optionC).toContainText('ClickHouse');
     const optionCId = (await optionC.getAttribute('data-testid'))!.replace('option-', '');
     // the chat follows the new card to its end: the last option's vote button is on screen without scrolling
     await expect(alice.page.getByTestId(`vote-${optionCId}`)).toBeInViewport();
@@ -180,6 +201,10 @@ test('canonical scenario: direct request, divergence vote, suggestion, ask, reve
       await expect(chatCards(page, 'change').nth(1)).toContainText('reverted');
       await expect(chatCards(page, 'change').last()).toContainText('Reverted');
       await expect(chatCards(page, 'change').last()).toContainText('Bob');
+      // every Change card carries Revert (PRD 4.6), a revert's too: it puts the change back
+      await expect(
+        chatCards(page, 'change').last().getByRole('button', { name: 'Revert', exact: true }),
+      ).toBeEnabled();
       await expect(canvas(page)).toContainText('Placeholder text about Latency Requirements');
       await expect(canvas(page)).not.toContainText('Draft text');
     }
@@ -221,15 +246,12 @@ test('canonical scenario: direct request, divergence vote, suggestion, ask, reve
   });
 
   for (const page of both) await expect(page.getByTestId('agent-status')).toContainText('idle');
-  expect([...alice.errors, ...bob.errors]).toEqual([]);
-  await alice.ctx.close();
-  await bob.ctx.close();
 });
 
 test('review proposal: a rejection archives it, the rail lists it and can show its branch', async ({
-  browser,
+  app,
 }) => {
-  const carol = await login(browser, 'Carol');
+  const carol = await app.login('Carol');
   await createRoom(carol.page, 'Review room');
   await createDocument(carol.page, 'PRD');
   await say(carol.page, 'add a section on goals');
@@ -246,8 +268,15 @@ test('review proposal: a rejection archives it, the rail lists it and can show i
 
   await review.getByTestId('review-reject').click();
   await expect(review).toContainText(/rejected/i, { timeout: 20_000 });
+  // an archived proposal's card collapses and says why (PRD 7.4); its buttons are behind the toggle
+  await expect(review.getByTestId('card-collapsed-label')).toContainText('Archived (rejected)');
+  await expect(review.getByTestId('review-approve')).toHaveCount(0);
+  await review.getByTestId('card-toggle').click();
+  await expect(review.getByTestId('card-toggle')).toHaveAttribute('aria-expanded', 'true');
   await expect(review.getByTestId('review-approve')).toBeDisabled();
   await expect(review.getByTestId('review-reject')).toBeDisabled();
+  await review.getByTestId('card-toggle').click();
+  await expect(review.getByTestId('review-approve')).toHaveCount(0);
   await expect(carol.page.getByText(/was rejected/).first()).toBeVisible();
 
   // the rail is open by default; the rejected proposal is listed under Archived and main is untouched
@@ -270,13 +299,10 @@ test('review proposal: a rejection archives it, the rail lists it and can show i
   await carol.page.getByTestId('branch-exit').click();
   await expect(carol.page.getByTestId('branch-banner')).toHaveCount(0);
   await expect(canvas(carol.page)).not.toContainText('rewritten end to end');
-
-  expect(carol.errors).toEqual([]);
-  await carol.ctx.close();
 });
 
-test('review proposal: with no objection it merges when the window closes', async ({ browser }) => {
-  const erin = await login(browser, 'Erin');
+test('review proposal: with no objection it merges when the window closes', async ({ app }) => {
+  const erin = await app.login('Erin');
   await createRoom(erin.page, 'Window room');
   await createDocument(erin.page, 'Plan');
   await say(erin.page, 'rewrite the entire document please');
@@ -303,18 +329,15 @@ test('review proposal: with no objection it merges when the window closes', asyn
   await expect(canvas(erin.page).getByRole('heading', { name: 'Plan' })).toBeVisible();
   await expect(chatCards(erin.page, 'change')).toHaveCount(1); // the revert, as a Change card of its own
   await expect(chatCards(erin.page, 'change')).toContainText('Reverted');
-
-  expect(erin.errors).toEqual([]);
-  await erin.ctx.close();
 });
 
 test('documents and rules: rename, create and archive reach everyone; only the owner sets the voting rule', async ({
-  browser,
+  app,
 }) => {
-  const owner = await login(browser, 'Olga');
+  const owner = await app.login('Olga');
   const roomId = await createRoom(owner.page, 'Docs room');
   await createDocument(owner.page, 'Notes');
-  const guest = await login(browser, 'Gus');
+  const guest = await app.login('Gus');
   await openRoom(guest.page, roomId);
   const both = [owner.page, guest.page];
 
@@ -358,16 +381,38 @@ test('documents and rules: rename, create and archive reach everyone; only the o
     await expect(guest.page.getByTestId('rule-label')).toContainText('majority');
     await expect(guest.page.getByText(/changed the voting rule to majority/)).toBeVisible();
   });
+});
 
-  expect([...owner.errors, ...guest.errors]).toEqual([]);
-  await owner.ctx.close();
-  await guest.ctx.close();
+test('a change keeps its diff after its document was renamed, and the header names two different revisions', async ({
+  app,
+}) => {
+  const alice = await app.login('Alice');
+  await createRoom(alice.page, 'Rename room');
+  await createDocument(alice.page, 'Notes');
+  await say(alice.page, 'add a section on caching');
+  await expect(chatCards(alice.page, 'change')).toHaveCount(1, { timeout: 20_000 });
+
+  await alice.page.getByTestId('doc-menu').click();
+  await alice.page.getByTestId('doc-rename-input').fill('Journal');
+  await alice.page.getByTestId('doc-rename-submit').click();
+  await expect(alice.page.getByRole('tab', { name: 'Journal' })).toBeVisible();
+
+  await chatCards(alice.page, 'change').first().getByRole('button', { name: 'View diff' }).click();
+  const drawer = alice.page.getByTestId('diff-drawer');
+  await expect(drawer.getByTestId('word-diff')).toContainText('Caching');
+  await expect(drawer).not.toContainText('No changes.');
+  const [from, to] = (await drawer.getByTestId('diff-range').innerText()).split('·')[1]!.split('→');
+  expect(from!.trim()).toMatch(/^[0-9a-f]{7}/);
+  expect(to!.trim()).toMatch(/^[0-9a-f]{7}/);
+  expect(from!.trim()).not.toBe(to!.trim());
+  await drawer.getByTestId('diff-raw-toggle').click();
+  await expect(drawer).toContainText('+## Caching');
 });
 
 test('reconnect: a dropped socket comes back, catches up, and the time away earns a private digest', async ({
-  browser,
+  app,
 }) => {
-  const fay = await login(browser, 'Fay');
+  const fay = await app.login('Fay');
   // Pass the page's WebSocket through to the server; during an "outage" refuse it instead. Playwright installs the
   // interception as an init script, so it applies from the next document on: reload once.
   let outage = false;
@@ -383,7 +428,7 @@ test('reconnect: a dropped socket comes back, catches up, and the time away earn
   await fay.page.reload();
   const roomId = await createRoom(fay.page, 'Flaky network');
   await createDocument(fay.page, 'Notes');
-  const gus = await login(browser, 'Gus');
+  const gus = await app.login('Gus');
   await openRoom(gus.page, roomId);
   const fayId = await userIdOf(fay.page);
   await expect(gus.page.getByTestId(`presence-${fayId}`)).toBeVisible();
@@ -430,40 +475,4 @@ test('reconnect: a dropped socket comes back, catches up, and the time away earn
     await say(fay.page, 'add a section on retries');
     await expect(canvas(gus.page).getByRole('heading', { name: 'Retries' })).toBeVisible();
   });
-
-  expect([...fay.errors, ...gus.errors]).toEqual([]);
-  await fay.ctx.close();
-  await gus.ctx.close();
-});
-
-test('settings: the Claude sign-in screen loads and reports not signed in', async ({ browser }) => {
-  const dave = await login(browser, 'Dave');
-
-  await dave.page.getByTestId('settings-link').click();
-  await expect(dave.page).toHaveURL(/\/settings$/);
-  await expect(dave.page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-  await expect(dave.page.getByTestId('claude-status')).toHaveText('Not signed in', {
-    timeout: 30_000,
-  });
-  await expect(dave.page.getByTestId('claude-signin')).toBeVisible();
-  await expect(dave.page.getByTestId('claude-signout')).toHaveCount(0);
-
-  // a direct load of /settings is served by the SPA fallback and keeps the session
-  await dave.page.goto('/settings');
-  await expect(dave.page.getByTestId('claude-status')).toHaveText('Not signed in', {
-    timeout: 30_000,
-  });
-  await expect(dave.page.getByTestId('claude-signin')).toBeVisible();
-
-  // the API agrees with the screen
-  const status = await apiGet<{ signedIn: boolean; method: string }>(
-    dave.page,
-    '/api/claude/status',
-  );
-  expect(status).toMatchObject({ signedIn: false, method: 'none' });
-  await dave.page.getByRole('link', { name: 'Back to rooms' }).click();
-  await expect(dave.page.getByTestId('room-create-name')).toBeVisible();
-
-  expect(dave.errors).toEqual([]);
-  await dave.ctx.close();
 });
