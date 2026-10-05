@@ -47,6 +47,11 @@ export interface Message {
   author: ActorRef;
   kind: MessageKind;
   body: string; // markdown; for cards, a plain-text fallback / caption
+  /**
+   * Agent messages: the gist, about 140 characters, shown in chat with `body` (the full text) behind an expander. Absent
+   * or null when `body` is short enough to show as it is (and on every message from before summaries existed).
+   */
+  summary?: string | null;
   card: Card | null;
   /** present when the message is anchored to a passage (suggestion, ask, agent answer) */
   anchor: Anchor | null;

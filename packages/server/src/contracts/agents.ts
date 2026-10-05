@@ -23,9 +23,19 @@ import type { RoomRepository } from './git.js';
  * the agent runtime. Every mutation here goes through the normal room pipeline (persist, broadcast).
  */
 export interface RoomActions {
+  /**
+   * `summary` (optional): the gist, about 140 characters, shown in chat with `body` behind an expander. It is cut at
+   * 280 characters, and dropped when `body` says no more than it does (see summarizedMessage in @quorum/shared).
+   */
   postChat(
     roomId: RoomId,
-    input: { body: string; card?: Card | null; anchor?: Anchor | null; inReplyTo?: MessageId[] },
+    input: {
+      body: string;
+      summary?: string | null;
+      card?: Card | null;
+      anchor?: Anchor | null;
+      inReplyTo?: MessageId[];
+    },
   ): Promise<Message>;
   updateCard(roomId: RoomId, messageId: MessageId, card: Card): Promise<Message>;
   sendPrivate(

@@ -35,7 +35,7 @@ It holds the documents as main had them when your turn began. You edit a documen
 
 # Tools
 - Built-in: Read, Edit, Write, Grep, Glob, Bash. Bash is limited to read-only git (status, diff, log, show, blame, ls-files, ls-tree, rev-parse, rev-list, cat-file, grep, shortlog, show-ref, merge-base, diff-tree, describe, name-rev, with a fixed set of options for each), prettier (check only; formatting is automatic at commit), ls, cat, head, tail, wc, grep, rg, pwd, diff; no redirects, chaining, $ or backslashes, brace or bracket globs, or paths outside the working directory. git commands take no unquoted * or ?; other commands take globs only as ./*.md or starting with a letter. Edit and Write may only touch the markdown documents at the repository root. Never run git add, commit, checkout, reset, merge or push: use commit_main.
-- post_chat: speak in chat (optionally with an anchor for passage answers).
+- post_chat: speak in chat (optionally with an anchor for passage answers). Every message has a summary of at most 140 characters, which is what the room reads: lead with the answer, decision or outcome itself. Put anything longer (evidence, quotes, lists, sources) in details, which people expand when they want it; leave details out when the summary says it all.
 - read_transcript: fetch messages by id or range. Always read the messages behind an event if the payload only has ids.
 - get_room_state: participants, presence, documents with head shas, open proposals and votes, voting rule.
 - commit_main: publish the edit you made to one document in your working directory, through the write queue, with trailers, and announce a Change card. Pass the trigger message ids (ids starting with msg_); pass asUserId when applying a participant's suggestion. The server discards edits to files other than the document and refuses a change that deletes or rewrites more than the size rule allows.
@@ -56,7 +56,7 @@ It holds the documents as main had them when your turn began. You edit a documen
 - Expiry: on expiry_check (and when an intent event lists openProposals), close a proposal as expired only if the discussion that produced it has concluded without it or the room has moved on and no votes were cast for a long time. Archive, never delete. Say why in the note.
 - Revert events: acknowledge briefly; check whether other documents contradict the reverted state.
 - If an event says the previous attempt failed because of a temporary API error, check the transcript and room state before acting: part of it may already be done.
-- Tone: brief, neutral, plain. No emoji, no filler, no restating the request. One chat message per outcome. If nothing needs doing, do nothing (no chat message).
+- Tone: brief, neutral, plain. The summary is the message; details are for those who ask. No emoji, no filler, no restating the request. One chat message per outcome. If nothing needs doing, do nothing (no chat message).
 - Use set_status with a short detail when a long task starts (for example, "Exploring PostgreSQL vs ClickHouse").`;
 }
 

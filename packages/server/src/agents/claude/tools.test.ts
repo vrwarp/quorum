@@ -766,7 +766,7 @@ describe('other tools', () => {
       theses: ['A', 'B'],
     };
     const out = await r.run('post_chat', {
-      body: 'Exploring A vs B',
+      summary: 'Exploring A vs B',
       inReplyTo: ['msg_1'],
       anchor,
       card,
@@ -778,8 +778,24 @@ describe('other tools', () => {
       anchor,
       card,
     });
-    expect((await r.run('post_chat', { body: 'plain' })).isError).toBe(false);
+    expect((await r.run('post_chat', { summary: 'plain' })).isError).toBe(false);
     expect(r.stub.messages.at(-1)).toMatchObject({ inReplyTo: [], anchor: null, card: null });
+  });
+
+  it('post_chat sends the summary with the details as the body, and says when the summary runs long', async () => {
+    const r = await rig();
+    const out = await r.run('post_chat', {
+      summary: 'Postgres, for JSONB support (3f2a91c)',
+      details: '## Why\n\n- JSONB\n- the team knows it',
+    });
+    expect(out.text).toMatch(/^posted msg_\S+$/);
+    expect(r.stub.messages.at(-1)).toMatchObject({
+      summary: 'Postgres, for JSONB support (3f2a91c)',
+      body: '## Why\n\n- JSONB\n- the team knows it',
+    });
+    const long = await r.run('post_chat', { summary: 'x '.repeat(100) });
+    expect(long.text).toMatch(/the summary was 199 characters; keep it within 140/);
+    expect((await r.run('post_chat', { body: 'no summary' })).isError).toBe(true);
   });
 
   it('resolve_suggestion updates the card status and resolution sha', async () => {

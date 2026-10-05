@@ -633,3 +633,27 @@ describe('archived rooms', () => {
     sock.close();
   });
 });
+
+describe('a client that hangs up mid-request', () => {
+  it('is not logged as a server error', async () => {
+    const app = await start();
+    const u = app.storage.users.create('Ann');
+    const { token } = app.storage.sessions.create(u.id);
+    // a POST whose body never fully arrives: the socket is destroyed after half of it
+    await new Promise<void>((resolve) => {
+      const req = http.request(`${app.base}/api/debug/client-log`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${token}`,
+          'content-type': 'application/json',
+          'content-length': '1000',
+        },
+      });
+      req.on('error', () => resolve());
+      req.write('{"entries":[');
+      setTimeout(() => req.destroy(), 50);
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(app.logs.filter((l) => l.msg === 'request failed')).toEqual([]);
+  });
+});

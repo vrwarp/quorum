@@ -863,3 +863,31 @@ a.btn {
 .card-diff[open] > summary {
   margin-bottom: 4px;
 }
+
+/* agent messages: the summary in chat, the full text behind an expander */
+.message-details > summary,
+.link-button {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.message-details > summary:hover,
+.link-button:hover {
+  color: var(--text);
+}
+.message-details[open] > summary {
+  margin-bottom: 4px;
+}
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.85rem;
+}
+.message-clamped {
+  max-height: 9em;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent);
+  mask-image: linear-gradient(to bottom, #000 60%, transparent);
+}

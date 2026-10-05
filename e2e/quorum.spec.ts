@@ -190,6 +190,17 @@ test('canonical scenario: direct request, divergence vote, suggestion, ask, reve
       // it quotes the chat message that caused the paragraph in the first place
       await expect(answer).toContainText('We should add a section on latency requirements');
     }
+    // the room reads the summary; the quoted history is folded behind Details until asked for
+    const answer = alice.page.locator('[data-testid^="message-"]', {
+      hasText: /Here is the history of line \d+ of Architecture/,
+    });
+    await expect(answer.getByTestId('msg-summary')).toHaveText(
+      /^Here is the history of line \d+ of Architecture: \d+ commits?, last [0-9a-f]{7}\.$/,
+    );
+    const quote = answer.getByText('We should add a section on latency requirements');
+    await expect(quote).toBeHidden();
+    await answer.getByTestId('msg-details').locator('summary').click();
+    await expect(quote).toBeVisible();
   });
 
   await test.step('5. a participant reverts the latest change', async () => {
