@@ -275,6 +275,7 @@ export function openStorage(filePath: string, opts: { now?: () => Date } = {}): 
     author: JSON.parse(r.author) as ActorRef,
     kind: r.kind,
     body: r.body,
+    ...(r.summary ? { summary: r.summary as string } : {}),
     card: r.card == null ? null : (JSON.parse(r.card) as Card),
     anchor: r.anchor == null ? null : (JSON.parse(r.anchor) as Anchor),
     privateTo: r.privateTo ?? null,
@@ -291,13 +292,14 @@ export function openStorage(filePath: string, opts: { now?: () => Date } = {}): 
   const messages: MessageRepo = {
     insert(m) {
       run(
-        `INSERT INTO messages (id, roomId, author, kind, body, card, anchor, privateTo, inReplyTo, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (id, roomId, author, kind, body, summary, card, anchor, privateTo, inReplyTo, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         m.id,
         m.roomId,
         json(m.author),
         m.kind,
         m.body,
+        m.summary ?? null,
         m.card ? json(m.card) : null,
         m.anchor ? json(m.anchor) : null,
         m.privateTo,
@@ -307,11 +309,12 @@ export function openStorage(filePath: string, opts: { now?: () => Date } = {}): 
     },
     update(m) {
       run(
-        `UPDATE messages SET author = ?, kind = ?, body = ?, card = ?, anchor = ?, privateTo = ?, inReplyTo = ?
-          WHERE id = ?`,
+        `UPDATE messages SET author = ?, kind = ?, body = ?, summary = ?, card = ?, anchor = ?, privateTo = ?,
+          inReplyTo = ? WHERE id = ?`,
         json(m.author),
         m.kind,
         m.body,
+        m.summary ?? null,
         m.card ? json(m.card) : null,
         m.anchor ? json(m.anchor) : null,
         m.privateTo,

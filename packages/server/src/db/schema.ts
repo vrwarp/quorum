@@ -143,4 +143,8 @@ export const migrations: string[] = [
   ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0;
   UPDATE users SET admin = 1 WHERE rowid = (SELECT MIN(rowid) FROM users);
   `,
+  // 3: agent messages carry a short summary shown in chat, with the body behind an expander
+  `
+  ALTER TABLE messages ADD COLUMN summary TEXT;
+  `,
 ];

@@ -251,7 +251,7 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 
 | Tool                | Purpose                                                                                             |
 | ------------------- | --------------------------------------------------------------------------------------------------- |
-| `post_chat`         | Speak in chat, optionally rendering a card                                                          |
+| `post_chat`         | Speak in chat, optionally rendering a card. A summary (about 140 characters) plus optional details |
 | `read_transcript`   | Fetch messages by id or range                                                                       |
 | `get_room_state`    | Participants, presence, documents, open proposals, votes, voting rule                               |
 | `commit_main`       | Apply the scratch worktree's edit to main through the write queue, with trailers                    |
@@ -259,6 +259,12 @@ chat message --> debounce 3 s (max wait 20 s) --> Listener (Sonnet) --> intents[
 | `open_proposal`     | Register a branch as a Review or Quorum proposal and post its card; validates single-document scope |
 | `close_proposal`    | Archive a proposal as expired or rejected                                                           |
 | `request_merge`     | Hand a passed proposal to the merge driver                                                          |
+
+Every agent chat message leads with a summary of about 140 characters, the answer or outcome itself, which is what
+the chat shows; the full text (evidence, quotes, lists, sources) sits behind a Details expander. The target is loose:
+the tool reminds the agent when a summary runs long, and the server cuts one past 280 characters. A summary with no
+details, or details that say no more, makes a plain message. Agent messages without a summary (older ones, digests)
+that are longer than 600 characters are shown clamped with "Show more".
 
 - Memory: the SDK compacts automatically; a PreCompact hook reminds the session to re-read room state after compaction. Durable state is never only in the session: the transcript, proposals, and votes are in SQLite, so a crashed session is restarted and rehydrated from `get_room_state` and the recent transcript.
 - A CLAUDE.md in the room workspace carries the house rules: formatting discipline, trailers, scope, the size rule, when to open which proposal kind, and tone in chat.

@@ -599,6 +599,8 @@ export function createHttpServer(opts: HttpOptions): Server {
           throw new HttpError(404, 'not_found', 'not found');
         await serveStatic(req, res, url.pathname);
       } catch (err) {
+        // the client hung up mid-request (a closed tab, a cancelled upload): nobody to answer, nothing went wrong here
+        if (req.destroyed && (err as Error)?.message === 'aborted') return void res.destroy();
         let status = 500;
         let code = 'internal';
         let message = 'internal error';

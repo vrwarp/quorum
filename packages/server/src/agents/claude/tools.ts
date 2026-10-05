@@ -16,7 +16,7 @@ import type {
   RoomId,
   RoomState,
 } from '@quorum/shared';
-import { DEFAULTS } from '@quorum/shared';
+import { DEFAULTS, SUMMARY_TARGET_CHARS } from '@quorum/shared';
 import type { RoomActions, RoomRepository } from '../../contracts/index.js';
 import {
   ORCHESTRATOR_ACTOR,
@@ -207,21 +207,36 @@ export function orchestratorTools(ctx: ToolContext) {
 
   const postChat = tool(
     'post_chat',
-    'Post a message to the room chat as the agent. Optionally anchor it to a passage (answers to Ask) or attach an exploration_started card.',
+    `Post a message to the room chat as the agent. Every message has a summary, shown in chat, and optional details, shown when someone expands it. Optionally anchor it to a passage (answers to Ask) or attach an exploration_started card.`,
     {
-      body: z.string().min(1).describe('markdown message body; keep it short'),
+      summary: z
+        .string()
+        .min(1)
+        .describe(
+          `the gist in at most ${SUMMARY_TARGET_CHARS} characters, plain text: the answer, decision or outcome itself, not a preamble ("Postgres: the team chose it for JSONB support in 3f2a91c", not "Here is what I found"). Often this is the whole message.`,
+        ),
+      details: z
+        .string()
+        .optional()
+        .describe(
+          'the full message in markdown, shown when someone expands the summary: evidence, quotes, lists, sources. Omit it when the summary says everything.',
+        ),
       inReplyTo: z.array(z.string()).optional().describe('ids of the messages this answers'),
       anchor: AnchorShape.optional(),
       card: ExplorationCardShape.optional(),
     },
     guard(ctx, 'post_chat', async (a) => {
       const m = await ctx.actions.postChat(ctx.roomId, {
-        body: a.body,
+        body: a.details ?? a.summary,
+        summary: a.summary,
         inReplyTo: a.inReplyTo ?? [],
         anchor: (a.anchor as Anchor | undefined) ?? null,
         card: (a.card as Card | undefined) ?? null,
       });
-      return textResult(`posted ${m.id}`);
+      const long = a.summary.trim().length > SUMMARY_TARGET_CHARS;
+      return textResult(
+        `posted ${m.id}${long ? ` (the summary was ${a.summary.trim().length} characters; keep it within ${SUMMARY_TARGET_CHARS} and put the rest in details)` : ''}`,
+      );
     }),
   );
 

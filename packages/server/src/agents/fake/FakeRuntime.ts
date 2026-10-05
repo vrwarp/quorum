@@ -772,7 +772,18 @@ export class FakeRuntime implements AgentRuntime {
       }
     }
     if (lastTouched) out.push('', `Last changed in \`${shortSha(lastTouched)}\`.`);
-    await this.actions.postChat(roomId, { body: out.join('\n'), anchor, inReplyTo: [m.id] });
+    // the summary is what the room reads; the commit list is behind the expander
+    const summary = `Here is the history of ${where} of ${doc.title}: ${
+      commits.length === 0
+        ? 'nothing since the initial draft'
+        : `${commits.length} commit${commits.length === 1 ? '' : 's'}${lastTouched ? `, last ${shortSha(lastTouched)}` : ''}`
+    }.`;
+    await this.actions.postChat(roomId, {
+      summary,
+      body: out.join('\n'),
+      anchor,
+      inReplyTo: [m.id],
+    });
   }
 
   // --- proposal lifecycle -----------------------------------------------------------------

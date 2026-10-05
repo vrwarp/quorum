@@ -217,6 +217,33 @@ describe('messages', () => {
     expect(forBob.recentMessages.some((m: Message) => m.body === 'secret digest')).toBe(true);
   });
 
+  it('stores an agent message with its summary, the details as the body', async () => {
+    const h = await setup();
+    const a = await h.connect(h.alice);
+    const m = await h.service.postChat(h.room.id, {
+      summary: 'Postgres, for JSONB support.',
+      body: '## Why\n\n- JSONB\n- the team knows it',
+    });
+    expect(m).toMatchObject({
+      summary: 'Postgres, for JSONB support.',
+      body: '## Why\n\n- JSONB\n- the team knows it',
+    });
+    expect(a.events).toContainEqual({ type: 'chat.message', message: m });
+    // nothing to expand: a summary alone, or details that say no more, make a plain message
+    const plain = await h.service.postChat(h.room.id, { summary: 'Done.', body: 'Done.' });
+    expect(plain.summary).toBeUndefined();
+    expect(plain.body).toBe('Done.');
+    expect((await h.service.postChat(h.room.id, { body: 'no summary' })).summary).toBeUndefined();
+    // the 140-character target is loose; 280 is the limit
+    const long = await h.service.postChat(h.room.id, {
+      summary: 'word '.repeat(80),
+      body: 'details',
+    });
+    expect(long.summary!.length).toBeLessThanOrEqual(280);
+    expect(long.summary).toMatch(/word…$/);
+    await expect(h.service.postChat(h.room.id, { body: '  ' })).rejects.toThrow(/empty/);
+  });
+
   it('survives a runtime that throws', async () => {
     const h = await setup();
     h.runtime.throwEverywhere = true;

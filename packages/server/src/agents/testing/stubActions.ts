@@ -76,6 +76,7 @@ export function createStubActions(opts: StubOptions): StubActions {
       const m = mk({
         author: { kind: 'agent', role: 'orchestrator' },
         body: input.body,
+        ...(input.summary ? { summary: input.summary } : {}),
         card: input.card ?? null,
         anchor: input.anchor ?? null,
         inReplyTo: input.inReplyTo ?? [],

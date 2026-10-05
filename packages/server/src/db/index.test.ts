@@ -197,6 +197,11 @@ describe('messages', () => {
     s.messages.update(updated);
     expect(s.messages.get('msg_1')).toEqual(updated);
     expect(s.messages.get('nope')).toBeNull();
+    const summarized: Message = { ...updated, summary: 'the gist' };
+    s.messages.update(summarized);
+    expect(s.messages.get('msg_1')).toEqual(summarized);
+    s.messages.insert({ ...m, id: 'msg_s', summary: 'short' });
+    expect(s.messages.get('msg_s')?.summary).toBe('short');
     expect(s.messages.getMany(['msg_1', 'nope']).map((x) => x.id)).toEqual(['msg_1']);
   });
 

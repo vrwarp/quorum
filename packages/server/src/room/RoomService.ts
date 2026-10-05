@@ -2,6 +2,7 @@ import { noopTracer, type Tracer } from '../debug/tracer.js';
 import {
   DEFAULTS,
   newId,
+  summarizedMessage,
   type ActorRef,
   type Anchor,
   type Card,
@@ -305,6 +306,7 @@ export class RoomService implements RoomActions, Hub {
       author: ActorRef;
       kind?: Message['kind'];
       body: string;
+      summary?: string | null;
       card?: Card | null;
       anchor?: Anchor | null;
       privateTo?: UserId | null;
@@ -317,6 +319,7 @@ export class RoomService implements RoomActions, Hub {
       author: input.author,
       kind: input.kind ?? (input.card ? 'card' : 'text'),
       body: input.body,
+      ...(input.summary ? { summary: input.summary } : {}),
       card: input.card ?? null,
       anchor: input.anchor ?? null,
       privateTo: input.privateTo ?? null,
@@ -833,12 +836,22 @@ export class RoomService implements RoomActions, Hub {
 
   async postChat(
     roomId: RoomId,
-    input: { body: string; card?: Card | null; anchor?: Anchor | null; inReplyTo?: MessageId[] },
+    input: {
+      body: string;
+      summary?: string | null;
+      card?: Card | null;
+      anchor?: Anchor | null;
+      inReplyTo?: MessageId[];
+    },
   ): Promise<Message> {
     this.requireRoom(roomId);
+    const { body, summary } = summarizedMessage({ summary: input.summary, details: input.body });
+    if (!body.trim() && !input.card) throw new RoomError('invalid', 'message is empty');
     return this.createMessage(roomId, {
       author: { kind: 'agent', role: 'orchestrator' },
       ...input,
+      body,
+      summary,
     });
   }
 
